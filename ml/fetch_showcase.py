@@ -23,15 +23,18 @@ THREE CATEGORIES, BECAUSE THEY TEST DIFFERENT THINGS
      Known mathematical ground truth from a non-CAD lineage. The Utah teapot is 28
      bicubic Bezier patches (verified: 28 `surface(` records, 448 `pt(` control
      points, 16 per patch); a correct model should segment it into roughly 28 spline
-     patches. The donut is exactly one torus of known major/minor radius - the single
-     cleanest test of whether Torus classification works at all, and one of the
-     classes ParSeNet and HPNet do not support.
+     patches. The generated tori are exactly one Torus of known major/minor radius -
+     the cleanest available test of whether Torus classification works at all, and a
+     class ParSeNet and HPNet do not support. They are PROBES, not donuts; nobody is
+     meant to recognise them.
 
   C. Never parametric.
-     Suzanne is a subdivision cage authored by hand. There is no "right answer" in
-     analytic terms. The interesting question is not accuracy but whether the
-     segmentation is COHERENT - patches that follow the form rather than shattering
-     into noise - and whether the resulting B-rep will open in a CAD kernel at all.
+     The Blender Guru donut - the actual one, subdivision cage plus displacement plus
+     a particle system scattering several hundred sprinkles - and Suzanne, a
+     hand-authored subdivision cage. There is no "right answer" in analytic terms.
+     The interesting question is not accuracy but whether the segmentation is
+     COHERENT - patches that follow the form rather than shattering into noise - and
+     whether the resulting B-rep will open in a CAD kernel at all.
 
 Category C is the stress test, but note that a good result there is not necessarily
 an analytic one: a subdivision surface is genuinely well approximated by NURBS, so
@@ -117,12 +120,26 @@ TEAPOT_TRIS = [
 ]
 TEAPOT_BASE = "https://users.cs.utah.edu/~dejohnso/models"
 
-# Donut geometry. Blender's default torus is R=1.0, r=0.25; the doughnut tutorial
-# fattens it. These values are arbitrary but FIXED, and they are the ground truth the
-# fitted torus is compared against.
-DONUT_R = 1.0      # major radius
-DONUT_r = 0.4      # minor radius
-DONUT_LODS = [("coarse", 48, 24), ("medium", 96, 48), ("fine", 192, 96)]
+# The REAL Blender Guru donut - subdivision cage, displaced, with a particle system
+# scattering six sprinkle meshes over the icing. Needs Blender to convert, since the
+# sprinkles only exist as depsgraph instances (see blend_to_stl.py).
+BLEND_DONUT = {
+    "name": "4_5.blend",
+    "url": "https://raw.githubusercontent.com/adcimon/blender-donut/master/4_5.blend",
+    "sha256": "785b4bba88343adf53bccdb29e90d66f9fcd41cbdbdba158a3b4ea58c2c7f975",
+    "license": "MIT",
+    "attribution": "Adrian Ciborro Montes (adcimon/blender-donut), (c) 2021",
+    "note": "Final state of the Blender Guru beginner tutorial. Converted locally by "
+            "blend_to_stl.py; the .blend itself is not an eval asset.",
+}
+
+# Exact analytic tori. These are NOT donuts and are not meant to look like one - they
+# are the ground-truth probe for Torus classification, which is a class ParSeNet and
+# HPNet do not support at all. Values are arbitrary but FIXED; the fitted radii are
+# compared against them.
+TORUS_R = 1.0      # major radius
+TORUS_r = 0.4      # minor radius
+TORUS_LODS = [("coarse", 48, 24), ("medium", 96, 48), ("fine", 192, 96)]
 
 
 # ----------------------------------------------------------------------------------
@@ -207,15 +224,50 @@ def fetch(url: str, dest: Path) -> bool:
     return rc == 0 and dest.exists() and dest.stat().st_size > 0
 
 
+_BLENDER_OVERRIDE: str | None = None
+
+
+def find_blender() -> str | None:
+    """Locate a Blender executable. Optional: only the donut conversion needs it."""
+    if _BLENDER_OVERRIDE:
+        return _BLENDER_OVERRIDE
+    from shutil import which
+    found = which("blender")
+    if found:
+        return found
+    roots = [
+        Path("C:/Program Files/Blender Foundation"),
+        Path("C:/Program Files (x86)/Steam/steamapps/common/Blender"),
+        Path("/Applications/Blender.app/Contents/MacOS"),
+        Path("/usr/share/blender"),
+    ]
+    candidates: list[Path] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for exe in ("blender.exe", "Blender", "blender"):
+            candidates.extend(root.glob(f"*/{exe}"))
+            direct = root / exe
+            if direct.exists():
+                candidates.append(direct)
+    # Newest install wins, so a machine with several versions uses the current one.
+    candidates.sort(key=lambda p: str(p), reverse=True)
+    return str(candidates[0]) if candidates else None
+
+
 # ----------------------------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", type=Path, default=Path("showcase"))
     ap.add_argument("--verify", action="store_true", help="re-hash existing files and stop on drift")
+    ap.add_argument("--blender", help="path to the Blender executable (only the donut needs it)")
     args = ap.parse_args(argv)
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
+    if args.blender:
+        global _BLENDER_OVERRIDE
+        _BLENDER_OVERRIDE = args.blender
 
     records: list[dict] = []
     failures = 0
@@ -270,27 +322,81 @@ def main(argv: list[str] | None = None) -> int:
             "sha256_actual": sha256_of(stl),
         })
 
-    # --- generated ----------------------------------------------------------------
-    print("\ngenerating donuts (exact torus, ground truth R=%.2f r=%.2f) ..." % (DONUT_R, DONUT_r))
-    for label, nu, nv in DONUT_LODS:
-        for lumpy, tag in ((0.0, "clean"), (0.035, "lumpy")):
-            name = f"donut_{tag}_{label}.stl"
+    # --- the real Blender donut ---------------------------------------------------
+    print("\nBlender Guru donut ...")
+    blend = out / BLEND_DONUT["name"]
+    if not blend.exists():
+        print(f"  fetching {BLEND_DONUT['name']} (16 MB) ...")
+        fetch(BLEND_DONUT["url"], blend)
+    if blend.exists():
+        digest = sha256_of(blend)
+        if digest != BLEND_DONUT["sha256"]:
+            print(f"  HASH MISMATCH on {blend.name} - upstream changed", file=sys.stderr)
+            failures += 1
+        blender = find_blender()
+        if not blender:
+            print("  Blender not found - skipping donut conversion.")
+            print("  Install Blender, or pass --blender <path to blender executable>.")
+            print("  Everything else in the showcase set is unaffected.")
+        else:
+            full = out / "blender_donut.stl"
+            plain = out / "blender_donut_plain.stl"
+            print(f"  converting with {blender} ...")
+            rc = subprocess.run(
+                [blender, "-b", str(blend), "-P", str(Path(__file__).with_name("blend_to_stl.py")),
+                 "--", str(full), str(plain)],
+                capture_output=True, text=True,
+            )
+            for line in rc.stdout.splitlines():
+                if line.startswith(("WROTE", "ERROR")):
+                    print("   ", line)
+            if full.exists() and plain.exists():
+                records.append({
+                    "name": full.name, "category": "C", "file": full.name,
+                    "license": BLEND_DONUT["license"], "attribution": BLEND_DONUT["attribution"],
+                    "note": "Donut + icing + sprinkles, scaled to ~90 mm across. Sprinkles "
+                            "are particle instances realised at export; a naive export "
+                            "silently produces a bald donut.",
+                    "tests": "The recognisable one. Subdivision cage plus displacement plus "
+                             "several hundred tiny disconnected sprinkle solids - tests "
+                             "whether segmentation stays coherent when most connected "
+                             "components are noise-sized.",
+                    "sha256_actual": sha256_of(full),
+                })
+                records.append({
+                    "name": plain.name, "category": "C", "file": plain.name,
+                    "license": BLEND_DONUT["license"], "attribution": BLEND_DONUT["attribution"],
+                    "note": "Donut + icing only, no sprinkles.",
+                    "tests": "Same shape without the sprinkle confetti, so a poor result on "
+                             "the full donut can be attributed to the sprinkles or not.",
+                    "sha256_actual": sha256_of(plain),
+                })
+            else:
+                print("  conversion produced no output", file=sys.stderr)
+                failures += 1
+
+    # --- generated analytic tori ---------------------------------------------------
+    print(f"\ngenerating exact tori (ground truth R={TORUS_R} r={TORUS_r}) ...")
+    print("  note: these are probes, not donuts - see MANIFEST.md")
+    for label, nu, nv in TORUS_LODS:
+        for lumpy, tag in ((0.0, "exact"), (0.035, "lumpy")):
+            name = f"torus_{tag}_{label}.stl"
             dest = out / name
-            tris = torus_mesh(DONUT_R, DONUT_r, nu, nv, lumpy)
+            tris = torus_mesh(TORUS_R, TORUS_r, nu, nv, lumpy)
             write_binary_stl(dest, tris)
             print(f"  {name:24} {len(tris):>10,} triangles")
             records.append({
                 "name": name, "category": "B", "file": name,
                 "license": "CC0 (generated by this script)",
                 "attribution": "generated - fetch_showcase.py",
-                "note": (f"Exact torus, R={DONUT_R}, r={DONUT_r}, {nu}x{nv} segments."
+                "note": (f"Exact torus, R={TORUS_R}, r={TORUS_r}, {nu}x{nv} segments."
                          if not lumpy else
                          f"Same torus displaced along the normal by a fixed sum of "
-                         f"sinusoids (amplitude {lumpy}), simulating sculpted lumpiness."),
+                         f"sinusoids (amplitude {lumpy})."),
                 "tests": ("Ground truth is exactly one Torus. Does the model predict "
                           "Torus, and does the fitted radius match?" if not lumpy else
-                          "Does Torus classification survive organic displacement, or "
-                          "does it fall back to spline?"),
+                          "Does Torus classification survive displacement, or fall back "
+                          "to spline?"),
                 "sha256_actual": sha256_of(dest),
             })
 
