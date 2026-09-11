@@ -135,25 +135,58 @@ Required filters before training: deduplicate, drop single-primitive and trivial
 models, drop broken boundaries, and enforce a minimum patch count. Expect to discard a
 meaningful fraction. The `statistics` YAML per model is there to make this cheap.
 
-## Class balance is the main open risk
+## Class balance — MEASURED
 
-The paper shows the patch-type distribution in Figure 3 but **publishes no numerical
-breakdown**, so this has to be measured, not assumed. The expected shape — planes and
-cylinders dominating, torus/Revolution/Extrusion/BSpline rare — is the classic setup for
-a model that scores well on mean IoU while never predicting the classes you actually
-care about.
+The ABC paper shows the patch-type distribution as a figure with no numbers, so Stage 0
+measured it. First pass, 22,617 models / 1,582,809 patches (chunks 0–2):
 
-Worse, tori in mechanical parts are usually **fillets**: numerous, but tiny in area and
-facet count. Area-weighted or point-level metrics will hide failure on exactly the class
-that motivated this whole direction.
+| type | % of patches | % of models with ≥1 | verdict |
+|---|---|---|---|
+| Plane | 52.94% | 98.78% | |
+| Cylinder | 29.77% | 85.86% | |
+| BSpline | 5.44% | 17.73% | healthy |
+| **Torus** | 3.86% | **22.46%** | abundant — better than feared |
+| Extrusion | 3.38% | 6.61% | clustered: few models, many patches each |
+| Cone | 2.97% | 22.31% | |
+| Sphere | 1.29% | 10.43% | |
+| **Revolution** | **0.24%** | **2.05%** | the binding constraint |
+| Other | 0.10% | 1.18% | deferred, see below |
 
-Mitigations, all cheap, all decided up front:
+**Torus is in nearly a quarter of all models.** The class this direction exists to
+cover, and the one ParSeNet and HPNet do not support at all, turns out to be cheap to
+sample for. Revolution is the real problem at 106 usable models per chunk — roughly 19
+chunks to reach a 2,000-model quota.
 
-- Measure the histogram during Stage 0 indexing and publish it in this doc.
-- Build the training subset by **stratified sampling on rare types**, the way ABCParts
-  was built by selecting models with at least one B-spline.
-- Per-class loss weighting, inverse to frequency.
-- Report **per-class** face recovery, never just the mean.
+Tori in mechanical parts are usually **fillets**: numerous, but tiny in area and facet
+count. Area-weighted or point-level metrics will hide failure on exactly the class that
+motivated this. Report **per-class** face recovery, never the mean.
+
+### `Other` is deliberately deferred
+
+`Other` is usually a nontrivial fillet out of Onshape, but it is a catch-all and can be
+almost anything, so each distinct element under it is a separate classification fight.
+It needs ~43 chunks to reach quota against ~19 for Revolution — more than double the
+corpus for the least useful class.
+
+This is a deferral, not an exclusion. `Other` patches occur inside training models
+regardless, so they can only be left untargeted, which means the model needs sane
+**fallback** behaviour rather than a prediction. The converter already has one: the
+NURBS fallback in `surfaceFitter.js` for when no primitive fits. Treat `Other` as
+"route to fallback", not as a class, and revisit after something useful ships.
+`stage0_report.py --no-quota` defaults to it.
+
+### Two corrections Stage 0 forced
+
+1. **A chunk yields ~7,539 feature files, not 10,000.** About 25% of model directories
+   ship no `feat` file. Every "N chunks = 10N models" estimate was 25% optimistic.
+2. **42.2% of parts share a structural fingerprint** (9,550 duplicates in 1,979 groups),
+   so the usable pool was 12,972 of 22,617. ABC's duplicate problem is materially worse
+   than the paper's "many duplicate models" implies — and that is before geometric
+   dedup, which Stage 1 will catch more of.
+
+Mitigations, unchanged: stratified sampling on rare types (as ABCParts was built by
+selecting models with at least one B-spline), per-class loss weighting derived from the
+**selected** subset rather than the corpus histogram, and per-class reporting.
 
 ---
 

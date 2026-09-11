@@ -50,6 +50,21 @@ REJECT_FLAGS = (
 # The classes this experiment exists to cover, which the published benchmarks drop.
 RARE_TYPES = ("Torus", "Revolution", "Extrusion", "BSpline")
 
+# Types not worth sampling FOR, though models containing them are still fine to use.
+#
+# `Other` in ABC is usually a nontrivial fillet out of Onshape, but it is a catch-all
+# and can be almost anything, so each distinct element under it would be a separate
+# classification fight. Chasing it to quota costs ~43 chunks against ~19 for
+# Revolution - more than double the corpus for the least useful class.
+#
+# The decision is to defer it, and it is a deferral rather than an exclusion: `Other`
+# patches occur inside models we train on regardless, so they cannot be avoided, only
+# left untargeted. The model therefore needs sane FALLBACK behaviour for them rather
+# than a prediction - which the converter already has, in the NURBS fallback path that
+# surfaceFitter.js uses when no primitive fits. Treat `Other` as "route to fallback",
+# not as a class, and revisit these edge cases after something useful ships.
+NO_QUOTA_DEFAULT = "Other"
+
 
 def bar(frac: float, width: int = 28) -> str:
     filled = int(round(frac * width))
@@ -73,6 +88,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="models containing each surface type to try to reach")
     ap.add_argument("--min-patches", type=int, default=4,
                     help="reject parts with fewer patches than this")
+    ap.add_argument("--no-quota", default=NO_QUOTA_DEFAULT,
+                    help=f"comma-separated types to not sample FOR, though models "
+                         f"containing them are still used (default: {NO_QUOTA_DEFAULT}; "
+                         f"pass '' to target every type)")
     ap.add_argument("--keep-duplicates", action="store_true",
                     help="do not collapse parts sharing a structural fingerprint")
     ap.add_argument("--emit-manifest", type=Path,
@@ -192,14 +211,23 @@ def main(argv: list[str] | None = None) -> int:
         print("\n  Nothing survives the filters. Loosen --min-patches or check the flags above.")
         return 1
 
+    no_quota = {t.strip() for t in args.no_quota.split(",") if t.strip()}
     pool_contains = {t: sum(1 for r in rows if r[f"s_{t.lower()}"] > 0) for t in SURFACE_TYPES}
     print(f"\n  {'type':<12} {'available':>12}  {'vs --min-per-type':>18}")
     for t in SURFACE_TYPES:
         have = pool_contains[t]
-        verdict = "ok" if have >= args.min_per_type else f"SHORT by {args.min_per_type - have:,}"
+        if t in no_quota:
+            verdict = "not targeted"
+        elif have >= args.min_per_type:
+            verdict = "ok"
+        else:
+            verdict = f"SHORT by {args.min_per_type - have:,}"
         star = " *" if t in RARE_TYPES else "  "
         print(f"  {t:<12}{star}{have:>11,}  {verdict:>18}")
     print("\n  * = a class the published benchmarks (ParSeNet, HPNet) do not support at all.")
+    if no_quota:
+        print(f"  not targeted: {', '.join(sorted(no_quota))} - models containing these are")
+        print("  still used; they are just not sampled for. See NO_QUOTA_DEFAULT for why.")
 
     # ---------------------------------------------------------------- selection
     section("Stratified selection")
@@ -209,7 +237,8 @@ def main(argv: list[str] | None = None) -> int:
         return sum(weight[t] for t in SURFACE_TYPES if r[f"s_{t.lower()}"] > 0)
 
     ranked = sorted(rows, key=score, reverse=True)
-    quota = {t: min(args.min_per_type, pool_contains[t]) for t in SURFACE_TYPES}
+    quota = {t: 0 if t in no_quota else min(args.min_per_type, pool_contains[t])
+             for t in SURFACE_TYPES}
     have = {t: 0 for t in SURFACE_TYPES}
     selected: list = []
     taken: set[tuple[str, str]] = set()
@@ -245,13 +274,13 @@ def main(argv: list[str] | None = None) -> int:
     sel_patches = {t: sum(r[f"s_{t.lower()}"] for r in selected) for t in SURFACE_TYPES}
     sel_total = sum(sel_patches.values())
     for t in SURFACE_TYPES:
-        met = "ok" if have[t] >= quota[t] else "SHORT"
+        met = "-" if t in no_quota else ("ok" if have[t] >= quota[t] else "SHORT")
         print(f"  {t:<12} {have[t]:>10,} {met:>8} {sel_patches[t]:>14,} "
               f"{fmt_pct(sel_patches[t], sel_total)}")
 
     print("\n  Per-class loss weighting should be derived from the PATCH column above, not")
     print("  from the corpus-wide histogram - the selection has already rebalanced it.")
-    shortfalls = [t for t in SURFACE_TYPES if have[t] < quota[t]]
+    shortfalls = [t for t in SURFACE_TYPES if t not in no_quota and have[t] < quota[t]]
     if shortfalls:
         print(f"\n  Under quota: {', '.join(shortfalls)}. Index more chunks, or lower")
         print("  --min-per-type and accept weaker supervision on those classes.")
