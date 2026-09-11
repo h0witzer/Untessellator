@@ -188,6 +188,79 @@ Mitigations, unchanged: stratified sampling on rare types (as ABCParts was built
 selecting models with at least one B-spline), per-class loss weighting derived from the
 **selected** subset rather than the corpus histogram, and per-class reporting.
 
+## Rescuing the rare classes: what is actually label-preserving
+
+Revolution is scarce. The obvious move is to augment the models we have. The trap is
+that **most transforms silently destroy the type label**, and a corrupted label is worse
+than a missing one.
+
+| transform | effect on labels |
+|---|---|
+| rotation, translation, mirror, **uniform** scale | preserves every type. Free, but adds pose diversity only — not shape diversity |
+| **non-uniform** scale, general | **destroys most types.** Cylinder → elliptic cylinder (no longer a `Cylinder`), Sphere → ellipsoid, Cone and Torus likewise |
+| non-uniform scale **along a revolution's axis** | **preserves `Revolution`** — rotational symmetry about the axis survives; only the profile curve changes |
+| affine scale along *or* across an extrusion direction | **preserves `Extrusion`** — the profile becomes a different curve; it is still a linear extrusion |
+
+The lucky part: the two classes we are short on are the two with the most headroom.
+
+The unlucky part, and why this cannot be applied naively: **a transform applies to the
+whole model, not one patch.** A model containing a Revolution almost always also
+contains planes, cylinders and fillets, so axial scaling to rescue Revolution corrupts
+the majority classes in the same file. Rescuing 441 models by poisoning 18,000 is a bad
+trade, so whole-model non-uniform scaling is ruled out.
+
+### Tessellation-space augmentation is free — do it regardless
+
+Because Stage 1 re-tessellates from STEP, the *same* surface at different densities and
+deflection settings yields genuinely different meshes with identical labels. That
+teaches the invariance that matters most here — surface type is independent of
+triangulation — at zero labelling risk, and it is the axis the WatchStand measurement
+says is real (Coarse 24 vs Medium 26). Build this first.
+
+### The stronger move for Revolution: synthesise it
+
+Augmentation multiplies examples, not diversity. `Revolution` is defined by a
+*structural property* — a profile curve rotated about an axis — so 441 seed models in
+new poses teaches the network that those 441 shapes are revolutions, not what makes
+something a revolution. That is the classic small-sample overfit.
+
+We know the definition exactly, so we can generate unlimited, diverse, perfectly
+labelled examples: random profile (segments, arcs, splines), random axis, built as real
+B-reps through OCCT and tessellated by the same Stage 1 path. Same for `Extrusion`.
+
+Precedent: **CAD-Recode** (ICCV 2025) trained on **one million procedurally generated**
+CAD models as CadQuery scripts, explicitly because repository-scraped datasets are
+"restricted in scale" and do not "allow for control over the design features and
+patterns included in training". That is precisely our situation — Revolution is rare in
+ABC not because it is hard, but because Onshape users do not revolve much.
+
+**Proposed split:** ABC for the naturally abundant classes, synthesis for `Revolution`
+and `Extrusion`.
+
+**How to test it before committing:** hold out the *real* ABC Revolution models as an
+evaluation set and train on synthesised ones. If it transfers, synthesis is validated;
+if it does not, the synthetic distribution is wrong and more of it will not help. Same
+structure as the showcase holdout, and measurable early.
+
+### A caveat on the few-shot analogy
+
+Corridor's chroma-key result came from fine-tuning a large **pretrained image model** —
+it already knew what edges, hair and people looked like, so they were teaching a narrow
+mapping on top of a strong prior, and their synthetic cases varied actual content. Here
+there is no pretrained prior for "surface of revolution"; the network learns geometry
+from scratch. Few-shot works when a prior does the heavy lifting. Without one, diversity
+has to come from the data — which is the argument for synthesis over pose augmentation.
+
+### Roughness ladder
+
+ParSeNet's published recipe is the starting point: sample points on the surface, add
+noise uniform in **[-0.01, 0.01] along the normal**, perturb normals uniformly in
+**[-3, 3] degrees**. Extend with the axes that matter for STL specifically and that no
+scan-oriented paper covers: tessellation density, non-uniform density, decimation,
+remeshing that destroys the original triangulation, a real STL export round trip, and
+edge erosion (see Part 3). Training only on clean OCCT tessellation produces a model
+that scores well and fails on a downloaded file.
+
 ---
 
 # Part 2 — Training setup on the 3090
