@@ -295,6 +295,62 @@ Reference model sizes from the ABC paper's own benchmark table: PointNet++ 1,402
 parameters, DGCNN 1,724,100. These are *small* — ~7 MB at fp32, and the 3090's 24 GB is
 nowhere near the binding constraint. Activation memory is.
 
+## Can we hotrod a pretrained model?
+
+Yes — and the obvious candidate is the wrong one to ship.
+
+**HPNet publishes a pretrained checkpoint**, trained on ABCParts, DGCNN-derived
+backbone. That is a zero-domain-gap warm start: same task, same dataset family. Swap
+the 6-class type head for our 9 and fine-tune.
+
+But licences decide this, and they invert the ranking:
+
+| model | licence | pretrained on | shippable |
+|---|---|---|---|
+| **HPNet** checkpoint | **none** | ABCParts — exact match | research only |
+| ParSeNet | **none** | ABCParts | research only |
+| SED-Net | **none** | ABC | research only |
+| CAD-Recode | **CC-BY-NC-4.0** | 1M synthetic CAD | non-commercial only; also Qwen2-1.5B, far too large for a browser |
+| UV-Net | MIT | ABC / Fusion 360 | wrong direction — consumes B-rep, which we do not have at inference |
+| Sonata | Apache-2.0 | indoor scenes (PTv3) | no — depends on `spconv`, which has no browser path |
+| Point2CAD | Apache-2.0 | n/a (test-time optimisation) | yes, but there are no weights to inherit |
+| **Point-MAE** | **MIT** | ShapeNet objects | **yes** |
+| **Point-BERT** | **MIT** | ShapeNet objects | **yes** |
+
+"No licence" means default copyright: the code can be read and the method reproduced,
+but no rights to copy, modify or redistribute are granted — so derived weights cannot
+be shipped in the converter. Worth a proper look before anything ships; the point here
+is only that it is a real constraint and not a detail.
+
+### The two-track split this implies
+
+**Track A — measure, do not ship.** Warm-start from HPNet's checkpoint purely to answer
+*does pretraining help this task at all?* Zero domain gap means it is the **upper
+bound** on what any pretrained prior can buy here. If it barely beats from-scratch,
+Point-MAE (bigger domain gap) will not do better either, and the whole question is
+closed cheaply.
+
+**Track B — ship.** If Track A shows real gains, pay for a clean-licensed version:
+Point-MAE or Point-BERT (MIT), pretrained on ShapeNet. The domain gap is real — chairs
+and lamps, not brackets — but masked-autoencoder features are largely local geometry,
+so some transfer is plausible. No published Point-MAE → CAD-primitive-segmentation
+numbers were found, so this is untested, which is exactly why Track A comes first.
+
+### The tension with going mesh-native
+
+Every pretrained model in that table is point-cloud shaped, while the architecture
+recommendation above is a dual graph over triangles. Hotrodding means accepting point
+cloud input.
+
+It is a smaller loss than it looks: HPNet, ParSeNet and Point-MAE all take points **plus
+normals**, and we can feed *exact* facet normals instead of estimated ones — keeping the
+advantage the ablations price at 3–10 IoU while gaining the prior. What is given up is
+exact adjacency. That is a measurable trade, not a matter of taste: run mesh-native
+from-scratch against point-cloud warm-start and compare on `oracle.mjs` face recovery.
+
+Whatever wins still has to reach ONNX Runtime Web — which keeps Sonata out regardless
+of its licence, and means DGCNN's dynamic KNN needs an early latency measurement.
+
 ## Pipeline stages
 
 ### Stage 0 — index the corpus (CPU, hours)
