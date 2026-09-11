@@ -31,17 +31,40 @@ Stage 0 needs **only the `feat` chunks** — not STEP, not OBJ, not Parasolid. T
 the entire reason it comes first: it is the cheapest possible way to decide what to
 download and tessellate later.
 
-Chunks and per-format manifest files are at <https://deep-geometry.github.io/abc-dataset/>.
-Each chunk holds 10,000 models; roughly 750k of ABC's 1M models have feature files
-(the format was added after the initial release). Download a few chunks with the
-manifest and `curl`/`wget`, then extract — they ship as `.7z`:
-
 ```bash
-7z x abc_0000_feat_v00.7z -o./abc/feat
+python fetch_abc.py --format feat --chunks 0-2 --out D:/abc-data/archives
 ```
 
-Start with two or three chunks. The histogram stabilises quickly and you can always
-index more later — the index resumes rather than rescanning.
+`fetch_abc.py` reads ABC's per-format manifests and verifies every archive against
+the published `size.yml` (`--verify md5` for the stronger check). Downloads resume,
+so interrupting is safe. `--plan-only` prints the budget without downloading.
+
+**Measured sizes**, per chunk of 10,000 models, compressed:
+
+| format | per chunk | all 100 | needed? |
+|---|---|---|---|
+| `stl2` | 6.59 GB | 659 GB | no |
+| `obj`  | 6.36 GB | 636 GB | no |
+| `feat` | 3.62 GB | 362 GB | **Stage 0** |
+| `para` | 1.97 GB | 198 GB | no |
+| `step` | 1.07 GB | 107 GB | **Stage 1** |
+| `stat`, `meta` | <2 MB | 0.3 GB | no |
+
+Three chunks of `feat` + `step` is 16.4 GB of download for 30,000 models — enough to
+fill the default 25k Stage 1 target. Feature files decompress roughly 3.7×, so budget
+~40 GB extracted for three chunks. The histogram stabilises quickly and the index
+resumes rather than rescanning, so start small and add chunks if a rare class comes
+up short.
+
+Note that the two largest formats are the two we deliberately do not want: we
+re-tessellate from STEP so mesh density is a controlled variable rather than a fixed
+property of the download.
+
+Extract with 7-Zip:
+
+```bash
+7z x D:/abc-data/archives/abc_0000_feat_v00.7z -oD:/abc-data/feat
+```
 
 > **Licensing:** copyright stays with the model creators; use is governed by Onshape
 > Terms of Use 1.g.ii. Worth reading before any trained weights are published.
@@ -75,12 +98,35 @@ python test_stage0.py
 
 ---
 
+## Validated against real ABC data
+
+ABC publishes one sample model on its site. The scanner was cross-checked against a
+full PyYAML parse (`CSafeLoader`) of
+`00000050_80d90bfdd2e74e709956122a_features_000.yml`, 1.66 MB for a single model:
+
+| | PyYAML | line scanner |
+|---|---|---|
+| time | 751 ms | **24 ms** (31× faster) |
+| curves | `BSpline 7, Circle 47, Line 52` | identical |
+| surfaces | `Cylinder 23, Plane 20` | identical |
+| sharp curves | 77 | 77 |
+
+Exact match on every count. That one file also demonstrates the hazard the design
+exists to avoid: it contains **7 B-spline curves and zero B-spline surfaces**, so a
+naive global `type:` count would report 7 spline surfaces that are not there — an
+error in the worst possible direction, inflating one of the rare classes the
+experiment is built to measure.
+
+Extrapolated to the ~750k models with feature files, the parser choice is the
+difference between roughly 5 hours and 6 days of single-threaded scanning.
+
 ## How the scanner works, and why
 
 **It does not parse YAML.** ABC feature files carry full control nets, knot vectors and
-per-vertex `(u,v)` parameters, so they run to megabytes each. A conforming parse
-materialises all of it to count nine strings. `stage0_index.py` reads each file once,
-line by line, in constant memory, looking only at `type:` and `sharp:` lines.
+per-vertex `(u,v)` parameters, so they run to megabytes each — the sample model above
+is 1.66 MB on its own. A conforming parse materialises all of it to count nine
+strings. `stage0_index.py` reads each file once, line by line, in constant memory,
+looking only at `type:` and `sharp:` lines.
 
 **Section roles are detected, not hardcoded.** The ABC supplementary documents both
 taxonomies but not the YAML key names, and the two vocabularies overlap:
@@ -97,9 +143,25 @@ section each `type:` sits in and infers each section's role from the unambiguous
 it contains. The detected names are written to `scan_meta` so the inference is
 auditable rather than assumed, and the report prints them.
 
-**Nested `type:` fields are excluded.** A `Revolution` patch has a profile curve with
-its own `type:`. Counts are bucketed by (has-dash, indent) and reduced to the
-shallowest dashed level per section, so a child object cannot be mistaken for a patch.
+**Entry level is the effective column, not the dash.** ABC emits keys in
+**alphabetical** order, so the dash usually carries `location:` and `type:` arrives
+undashed a few lines later:
+
+```yaml
+curves:
+- location: [0.0, -3.175, 0.0]
+  radius: 17.5145949
+  sharp: true
+  type: Circle          # indent 2, no dash
+```
+
+An entry whose other keys all sort after `"type"` puts it on the dash instead. Both
+are the same entry level, so counts are bucketed by the column the key starts at
+(counting the dash as indentation) and reduced to the shallowest column per section.
+A nested `type:` — a `Revolution` patch's profile curve, say — is strictly deeper and
+drops out. An earlier version preferred dashed lines outright, which on real data
+would have discarded every undashed entry in a section the moment one entry happened
+to sort `type` first.
 
 **Parts are keyed separately from models.** One ABC model can contain several solids,
 each with its own `..._features_001.yml`, `..._002.yml`. The primary key is

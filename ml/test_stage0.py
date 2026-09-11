@@ -120,6 +120,52 @@ surfaces:
 - type: Other
 """
 
+# The REAL ABC layout, trimmed from
+# 00000050_80d90bfdd2e74e709956122a_features_000.yml. Two properties of it broke an
+# earlier version of the scanner and are the reason this fixture exists:
+#
+#   1. Keys are emitted in ALPHABETICAL order, so the dash carries `location:` and
+#      `type:` arrives undashed two lines later - except in the third curve below,
+#      whose remaining keys all sort after "type", putting it on the dash. Both are
+#      the same entry level and must land in the same bucket.
+#   2. Index arrays are flow-style and wrap across lines, so continuation lines are
+#      indented and full of numbers. None may be mistaken for a key.
+#
+# The real file has 7 BSpline CURVES and 0 BSpline surfaces - the exact case a global
+# `type:` count gets wrong, in the direction that invents spline surfaces that are
+# not there.
+REAL_LAYOUT = """\
+curves:
+- location: [0.0, -3.175, 0.0]
+  radius: 17.5145949
+  sharp: true
+  type: Circle
+  vert_indices: [1, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87,
+    88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 1]
+  vert_parameters: [0.0, 51.92715129900495, 103.8543025980099, 155.78145389701484,
+    207.7086051960198, 259.63575649502474]
+- direction: [0.0, 1.0, 0.0]
+  location: [17.5145949, -3.175, 0.0]
+  sharp: true
+  type: Line
+  vert_indices: [1, 2, 3]
+- type: BSpline
+  vert_indices: [4, 5, 6]
+surfaces:
+- coefficients: [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -3.175]
+  face_indices: [0, 1, 2, 3]
+  location: [0.0, -3.175, 0.0]
+  type: Plane
+  vert_indices: [0, 1, 2]
+  x_axis: [1.0, 0.0, 0.0]
+- face_indices: [4, 5]
+  location: [0.0, 0.0, 0.0]
+  radius: 17.5145949
+  type: Cylinder
+  vert_indices: [3, 4, 5]
+  z_axis: [0.0, 1.0, 0.0]
+"""
+
 
 class ScannerTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -161,6 +207,42 @@ class ScannerTest(unittest.TestCase):
         surfaces, curves, _ = classify_sections(res["sections"])
         self.assertEqual(surfaces, {"Cone": 1, "Sphere": 1})
         self.assertEqual(curves, {"Line": 1})
+
+    def test_real_abc_layout(self):
+        """Alphabetical keys, undashed `type:`, wrapped flow-style arrays.
+
+        Cross-checked against a full PyYAML parse of the published sample model
+        00000050_80d90bfdd2e74e709956122a_features_000.yml: the scanner matched it
+        exactly (curves BSpline 7 / Circle 47 / Line 52, surfaces Cylinder 23 /
+        Plane 20, 77 sharp) while running 31x faster.
+        """
+        path = self.write("00000050_80d90bfd_features_000.yml", REAL_LAYOUT)
+        res = scan_file(path)
+        surfaces, curves, flags = classify_sections(res["sections"])
+
+        self.assertEqual(sorted(res["sections"]), ["curves", "surfaces"])
+        self.assertEqual(curves, {"Circle": 1, "Line": 1, "BSpline": 1})
+        self.assertEqual(surfaces, {"Plane": 1, "Cylinder": 1})
+        self.assertEqual(flags, set())
+        # The whole point: a global count would put this BSpline in the surfaces bin.
+        self.assertNotIn("BSpline", surfaces)
+
+    def test_dashed_and_undashed_type_are_one_entry_level(self):
+        """`- type:` at indent 0 and `  type:` at indent 2 are the same level.
+
+        Regression: an earlier version preferred dashed lines outright, so a single
+        entry whose keys happened to sort `type` first would discard every undashed
+        entry in the section. On real ABC data that silently drops most patches.
+        """
+        path = self.write("00000099_deadbeef_features_000.yml", REAL_LAYOUT)
+        res = scan_file(path)
+        # The third curve is dashed (`- type: BSpline`), the first two are not.
+        self.assertEqual(sum(res["sections"]["curves"].values()), 3)
+
+    def test_wrapped_flow_arrays_are_not_parsed_as_keys(self):
+        path = self.write("00000100_deadbeef_features_000.yml", REAL_LAYOUT)
+        res = scan_file(path)
+        self.assertEqual(sorted(res["sections"]), ["curves", "surfaces"])
 
     def test_sharp_curves_are_counted(self):
         path = self.write("00000004_deadbeef_features_001.yml", BASIC)

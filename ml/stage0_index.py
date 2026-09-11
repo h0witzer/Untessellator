@@ -116,11 +116,24 @@ def scan_file(path: Path) -> dict:
     assigned here so that the worker stays pure and roles can be decided once, in the
     parent, with corpus-wide evidence.
 
-    Counts are keyed by (section, has_dash, indent) so that a nested `type:` field
-    cannot be mistaken for a list entry. YAML list entries carry their first key on
-    the dash line, and every entry in a list sits at the same indent; anything deeper
-    is a child of an entry, not an entry. The reduction below keeps only the
-    shallowest dashed level per section.
+    Counts are keyed by (section, effective column) so that a nested `type:` field
+    cannot be mistaken for a list entry.
+
+    "Effective column" is the column the KEY starts at, counting the dash as
+    indentation: `- type:` at indent 0 and `  type:` at indent 2 are both at column 2
+    and belong to the same entry level. That distinction is load-bearing on real ABC
+    data, where keys are emitted in ALPHABETICAL order, so the dash usually carries
+    `location:` and `type:` arrives undashed a few lines later:
+
+        curves:
+        - location: [0.0, -3.175, 0.0]
+          radius: 17.5145949
+          sharp: true
+          type: Circle          <- indent 2, no dash
+
+    but an entry whose other keys all sort after "type" puts it on the dash instead.
+    Both forms are the same level, and a child object's `type:` is strictly deeper,
+    so the reduction below simply keeps the shallowest column per section.
     """
     result = {
         "path": str(path),
@@ -136,7 +149,7 @@ def scan_file(path: Path) -> dict:
         pass
 
     section = None
-    buckets: dict[str, dict[tuple[bool, int], Counter]] = defaultdict(lambda: defaultdict(Counter))
+    buckets: dict[str, dict[int, Counter]] = defaultdict(lambda: defaultdict(Counter))
 
     try:
         # errors="replace": a handful of ABC files carry stray bytes. A mangled comment
@@ -153,8 +166,9 @@ def scan_file(path: Path) -> dict:
                 m = _TYPE_RE.match(line.rstrip("\n"))
                 if m:
                     indent = len(m.group(1).expandtabs(2))
-                    has_dash = m.group(2) is not None
-                    buckets[section or "<root>"][(has_dash, indent)][m.group(3)] += 1
+                    dash = m.group(2)
+                    column = indent + (len(dash.expandtabs(2)) if dash else 0)
+                    buckets[section or "<root>"][column][m.group(3)] += 1
                     continue
                 m = _SHARP_RE.match(line.rstrip("\n"))
                 if m and m.group(1).lower() in ("true", "yes"):
@@ -164,16 +178,12 @@ def scan_file(path: Path) -> dict:
         result["flags"].add("read_error")
         return result
 
-    # Reduce each section to its entry level: prefer dashed lines, then shallowest.
+    # Reduce each section to its entry level: the shallowest effective column.
+    # Anything deeper is a field of an entry, not an entry.
     for name, levels in buckets.items():
         if not levels:
             continue
-        dashed = {k: v for k, v in levels.items() if k[0]}
-        pool = dashed or levels
-        entry_level = min(pool)
-        counter = pool[entry_level]
-        # Anything deeper than the entry level is a nested field, not an entry.
-        result["sections"][name] = dict(counter)
+        result["sections"][name] = dict(levels[min(levels)])
 
     if not result["sections"]:
         result["flags"].add("no_sections")
