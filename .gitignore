@@ -1,1 +1,8 @@
 assets/
+
+# ML experiment artifacts
+ml/*.sqlite
+ml/*.sqlite-wal
+ml/*.sqlite-shm
+ml/*.jsonl
+ml/__pycache__/
