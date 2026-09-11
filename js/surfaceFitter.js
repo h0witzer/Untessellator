@@ -613,3 +613,98 @@ export function classifyGroupAs(forcedType, group, geometry) {
   // Last resort: return auto classification
   return classifyGroup(group, geometry);
 }
+
+// ── Gauss-map classifier bridge ──────────────────────────────────────────────
+//
+// classifyRegion() in gaussMap.js reports { type, params, residual }. Everything
+// downstream here (brepVisualizer, brepBuilder, the sidebar list) expects the
+// legacy { type, params, rms } shape, and expects NURBS groups to carry raw
+// vertices/normals. This adapts between the two so the new classifier can be
+// swapped in without touching any consumer.
+
+import { classifyRegion, fitRegionAs } from './gaussMap.js';
+import { buildFacets } from './meshCore.js';
+import { positionsOf } from './faceGrouper.js';
+
+function adaptResult(result, group, geometry) {
+  if (result.type === 'nurbs' || !result.params) {
+    return {
+      type: 'nurbs',
+      params: {
+        vertices: extractGroupVertices(geometry, group.triangleIndices),
+        normals:  extractGroupNormals(geometry, group.triangleIndices),
+      },
+      rms: Infinity,
+    };
+  }
+  return { type: result.type, params: result.params, rms: result.residual };
+}
+
+/**
+ * Classify every group with the Gauss-map classifier, writing the result to
+ * `group[key]` in the legacy surface shape.
+ *
+ * @param {Array<{triangleIndices:Set<number>}>} groups
+ * @param {object} geometry
+ * @param {string} [key='surface']
+ */
+export function fitAllGroupsGauss(groups, geometry, key = 'surface') {
+  const facets = buildFacets(positionsOf(geometry));
+  for (const group of groups) {
+    group[key] = adaptResult(classifyRegion(group.triangleIndices, facets), group, geometry);
+  }
+}
+
+/**
+ * Classify every group with the original classifier, writing to `group[key]`.
+ * Kept separate from fitAllGroups() so both can be run for side-by-side compare.
+ */
+export function fitAllGroupsLegacy(groups, geometry, key = 'surface') {
+  for (const group of groups) {
+    group[key] = classifyGroup(group, geometry);
+  }
+}
+
+/**
+ * Best-fit a user-chosen surface type to one group, using the Gauss-map fitters
+ * with multi-start axis refinement.
+ *
+ * Unlike classifyGroupAs(), this NEVER fabricates parameters. If the requested
+ * primitive genuinely cannot be fitted, it returns `degenerate: true` and a
+ * human-readable `reason` so the caller can say so instead of drawing a shape
+ * that has nothing to do with the selected faces.
+ *
+ * @param {'plane'|'cylinder'|'cone'|'sphere'|'nurbs'} forcedType
+ * @param {{triangleIndices:Set<number>}} group
+ * @param {object} geometry
+ * @returns {{type,params,rms,relResidual?,degenerate?,reason?}}
+ */
+export function classifyGroupAsGauss(forcedType, group, geometry) {
+  const facets = buildFacets(positionsOf(geometry));
+  const r = fitRegionAs(forcedType, group.triangleIndices, facets);
+
+  if (forcedType === 'nurbs' || r.degenerate || !r.params) {
+    // Report the surface as NURBS so every downstream consumer (visualizer,
+    // boundary builder, STEP writer) receives the payload shape it expects.
+    // `requestedType` carries what the user actually asked for, purely for the
+    // UI to label the row — the alternative, tagging this object with the
+    // requested type, hands the visualizer cone params it does not have.
+    return {
+      type: 'nurbs',
+      params: {
+        vertices: extractGroupVertices(geometry, group.triangleIndices),
+        normals:  extractGroupNormals(geometry, group.triangleIndices),
+      },
+      rms: Infinity,
+      degenerate: forcedType !== 'nurbs',
+      requestedType: forcedType,
+      reason: r.reason,
+    };
+  }
+  return {
+    type: r.type,
+    params: r.params,
+    rms: r.residual,
+    relResidual: r.relResidual,
+  };
+}

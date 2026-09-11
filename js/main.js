@@ -19,7 +19,8 @@ import {
 import { loadModelFile, computeBounds, getTriangleCount } from './stlLoader.js';
 import { t, initLang, setLang, getLang, applyTranslations } from './i18n.js';
 import { groupFaces } from './faceGrouper.js';
-import { fitAllGroups, classifyGroupAs } from './surfaceFitter.js';
+import { fitAllGroups, classifyGroupAs, classifyGroupAsGauss,
+         fitAllGroupsGauss, fitAllGroupsLegacy } from './surfaceFitter.js';
 import { initOC, buildAndExportSTEP, downloadSTEP, BUILD_VERSION,
          buildGroupAdjacencyMap, computeAnalyticalBoundaries } from './brepBuilder.js';
 import { buildBrepOverlay, buildAnalyticalFacesMesh } from './brepVisualizer.js';
@@ -55,6 +56,8 @@ const groupCount    = document.getElementById('group-count');
 
 // Surface fitting panel
 const fitBtn        = document.getElementById('fit-btn');
+const classifierMode = document.getElementById('classifier-mode');
+const classifierDiff = document.getElementById('classifier-diff');
 const surfaceList   = document.getElementById('surface-list');
 
 // Export panel
@@ -221,27 +224,13 @@ async function handleFit() {
   await yieldToUI();
 
   try {
-    fitAllGroups(currentGroups, currentGeometry);
-    renderSurfaceList();
+    // Run BOTH classifiers and stash each result, so switching between them is
+    // instant and every row can show what the other one said.
+    fitAllGroupsLegacy(currentGroups, currentGeometry, '_legacy');
+    fitAllGroupsGauss(currentGroups, currentGeometry, '_gauss');
+
+    applyClassifier();
     exportBtn.disabled = false;
-
-    // Compute analytical boundaries (pure JS — no OCCT needed)
-    const { boundaries } = computeAnalyticalBoundaries(currentGroups, currentGeometry);
-
-    // Wireframe shape indicator overlay (always built first)
-    const overlay = buildBrepOverlay(currentGroups, currentGeometry, TYPE_COLORS);
-    setBrepOverlay(overlay);
-    if (brepOverlayToggle) {
-      brepOverlayToggle.checked = true;
-      setBrepOverlayVisible(true);
-    }
-
-    // Analytical face-mesh preview (semi-transparent solid shapes)
-    const facesOverlay = buildAnalyticalFacesMesh(
-      currentGroups, currentGeometry, boundaries, TYPE_COLORS,
-    );
-    setBrepFacesOverlay(facesOverlay);
-    setBrepFacesVisible(true);
   } catch (err) {
     console.error('Surface fitting failed:', err);
     alert(`Surface fitting failed: ${err.message}`);
@@ -250,8 +239,76 @@ async function handleFit() {
   }
 }
 
+/** Which stashed classification is live, per the Classifier dropdown. */
+function activeClassifierKey() {
+  return (classifierMode?.value === 'legacy') ? '_legacy' : '_gauss';
+}
+
+/**
+ * Point every group at the selected classifier's result, then re-render the
+ * sidebar and rebuild the viewport overlays. Cheap — no refitting.
+ */
+function applyClassifier() {
+  if (!currentGroups) return;
+  const key = activeClassifierKey();
+  for (const g of currentGroups) g.surface = g[key] ?? g.surface;
+
+  renderSurfaceList();
+  renderClassifierDiff();
+  rebuildFitOverlays();
+}
+
+/** Summarise how many groups the two classifiers disagree about. */
+function renderClassifierDiff() {
+  if (!classifierDiff || !currentGroups) return;
+  const changed = currentGroups.filter(
+    g => g._legacy && g._gauss && g._legacy.type !== g._gauss.type).length;
+  const active = activeClassifierKey() === '_gauss' ? 'Gauss map' : 'Legacy';
+
+  if (!changed) {
+    classifierDiff.textContent = `${active} — both classifiers agree on all ${currentGroups.length} groups.`;
+    classifierDiff.classList.remove('diff-hot');
+    return;
+  }
+  classifierDiff.textContent =
+    `${active} — the two classifiers disagree on ${changed} of ${currentGroups.length} groups.`;
+  classifierDiff.classList.add('diff-hot');
+}
+
+/** Rebuild the analytic wireframe + face overlays from the live classification. */
+function rebuildFitOverlays() {
+  // Compute analytical boundaries (pure JS — no OCCT needed)
+  const { boundaries } = computeAnalyticalBoundaries(currentGroups, currentGeometry);
+
+  // Wireframe shape indicator overlay (always built first)
+  const overlay = buildBrepOverlay(currentGroups, currentGeometry, TYPE_COLORS);
+  setBrepOverlay(overlay);
+  if (brepOverlayToggle) {
+    brepOverlayToggle.checked = true;
+    setBrepOverlayVisible(true);
+  }
+
+  // Analytical face-mesh preview (semi-transparent solid shapes)
+  const facesOverlay = buildAnalyticalFacesMesh(
+    currentGroups, currentGeometry, boundaries, TYPE_COLORS,
+  );
+  setBrepFacesOverlay(facesOverlay);
+  setBrepFacesVisible(true);
+}
+
 const TYPE_LABELS = { plane: 'Plane', cylinder: 'Cylinder', cone: 'Cone', sphere: 'Sphere', nurbs: 'NURBS' };
 const TYPE_COLORS = { plane: '#4a9eff', cylinder: '#ff9a3c', cone: '#f97316', sphere: '#7dd67d', nurbs: '#c084fc' };
+
+/** Human-readable defining parameter for a fitted surface, e.g. " 45.0°" or " r=4.00". */
+function describeSurface(surface) {
+  const p = surface?.params;
+  if (!p) return '';
+  if (surface.type === 'cone' && typeof p.halfAngle === 'number')
+    return ` ${(p.halfAngle * 180 / Math.PI).toFixed(1)}°`;
+  if ((surface.type === 'cylinder' || surface.type === 'sphere') && typeof p.radius === 'number')
+    return ` r=${p.radius.toFixed(2)}`;
+  return '';
+}
 
 /** Re-render just the summary chips at the top of the surface list. */
 function updateChips() {
@@ -299,7 +356,19 @@ function renderSurfaceList() {
 
     const name = document.createElement('span');
     name.className = 'surface-name';
-    name.textContent = `Group ${i + 1} — ${label}`;
+    name.textContent = `Group ${i + 1} — ${label}${describeSurface(g.surface)}`;
+
+    // When the two classifiers disagree about this group, say what the other
+    // one called it — this is the whole point of the A/B.
+    const other = activeClassifierKey() === '_gauss' ? g._legacy : g._gauss;
+    if (other && g.surface && other.type !== g.surface.type) {
+      const was = document.createElement('span');
+      was.className = 'surface-rms';
+      was.style.color = '#f97316';
+      was.textContent = `was ${TYPE_LABELS[other.type] ?? other.type}`;
+      name.appendChild(document.createTextNode('  '));
+      name.appendChild(was);
+    }
 
     const rmsEl = document.createElement('span');
     rmsEl.className = 'surface-rms';
@@ -324,9 +393,11 @@ function renderSurfaceList() {
       } else {
         g._autoSurface = g._autoSurface ?? g.surface;
         g._override    = val;
-        // classifyGroupAs always returns the forced type with appropriate params
-        // (or plane-derived fallback params when the analytic fit is degenerate).
-        g.surface = classifyGroupAs(val, g, currentGeometry);
+        // Best-fit the requested primitive. This never fabricates parameters —
+        // if the surface genuinely cannot be fitted it comes back flagged
+        // degenerate with a reason, and we say so rather than drawing a shape
+        // unrelated to the selected faces.
+        g.surface = classifyGroupAsGauss(val, g, currentGeometry);
       }
       // Refresh the row's RMS display
       const newRms = g.surface?.rms ?? 0;
@@ -336,7 +407,25 @@ function renderSurfaceList() {
       // Update the colour dot and label for this row
       const newColor = TYPE_COLORS[g.surface?.type] ?? '#aaa';
       dot.style.background = newColor;
-      name.textContent = `Group ${i + 1} — ${TYPE_LABELS[g.surface?.type] ?? g.surface?.type}`;
+      // A degenerate forced fit is stored as NURBS but still labelled with the
+      // type the user asked for, so the row reflects their selection.
+      const shownType = g.surface?.degenerate
+        ? (g.surface.requestedType ?? g.surface.type)
+        : g.surface?.type;
+      name.textContent =
+        `Group ${i + 1} — ${TYPE_LABELS[shownType] ?? shownType}` +
+        describeSurface(g.surface);
+
+      // A forced type that cannot be fitted is reported, not faked.
+      row.classList.toggle('fit-degenerate', !!g.surface?.degenerate);
+      if (g.surface?.degenerate) {
+        rmsEl.textContent = 'cannot fit';
+        rmsEl.style.color = '#f97316';
+        row.title = g.surface.reason || 'This surface type cannot be fitted to these faces.';
+      } else {
+        rmsEl.style.color = '';
+        row.title = '';
+      }
       // Re-render the tally chips at the top of the surface list to reflect
       // the updated type counts across all groups.
       updateChips();
@@ -471,6 +560,7 @@ function wireEvents() {
   // Action buttons
   detectBtn.addEventListener('click', handleDetect);
   fitBtn.addEventListener('click', handleFit);
+  classifierMode?.addEventListener('change', applyClassifier);
   exportBtn.addEventListener('click', handleExport);
 
   // Sewing tolerance display

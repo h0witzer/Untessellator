@@ -1379,3 +1379,15 @@ input[type="number"].val:focus { outline: none; border-color: var(--accent); }
   font-family: inherit;
 }
 .license-link:hover { color: var(--accent); }
+
+/* Classifier A/B readout — highlights when the two classifiers disagree. */
+#classifier-diff.diff-hot {
+  color: #f97316;
+  font-weight: 600;
+}
+
+/* A forced surface type that cannot be fitted to the selected faces. */
+.surface-row.fit-degenerate {
+  outline: 1px solid #f97316;
+  outline-offset: -1px;
+}

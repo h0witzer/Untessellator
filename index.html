@@ -130,7 +130,18 @@
       <!-- 3. Surface Fitting -->
       <section class="panel-section">
         <h2>Surface Fitting</h2>
-        <p class="section-hint">Classifies each group as Plane, Cylinder, Sphere, or NURBS.</p>
+        <p class="section-hint">Classifies each group as Plane, Cylinder, Cone, Sphere, or NURBS.</p>
+
+        <div class="form-row">
+          <label for="classifier-mode"
+            title="Legacy: original PCA fitter. Gauss map: normal-space hypothesis + positional verification.">
+            Classifier &#9432;
+          </label>
+          <select id="classifier-mode">
+            <option value="gauss" selected>Gauss map (new)</option>
+            <option value="legacy">Legacy</option>
+          </select>
+        </div>
 
         <button id="fit-btn" class="action-btn" disabled>
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -140,6 +151,7 @@
           Fit Surfaces
         </button>
 
+        <div id="classifier-diff" class="status-line"></div>
         <div id="surface-list" class="surface-list"></div>
       </section>
 

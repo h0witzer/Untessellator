@@ -1,34 +1,50 @@
 /**
  * faceGrouper.js — mesh face segmentation by dihedral angle
  *
- * Reuses the adjacency graph and BFS flood fill already built in exclusion.js.
  * Segments every triangle in the mesh into groups where adjacent triangles share
  * an edge whose dihedral angle is ≤ creaseAngleDeg.
+ *
+ * Adjacency comes from meshCore rather than exclusion.js so that this module —
+ * and everything downstream of it — carries no three.js dependency and can run
+ * headlessly under node. meshCore also recomputes geometric face normals from
+ * vertex winding instead of trusting the source file's normals.
  */
 
-import { buildAdjacency, bucketFill } from './exclusion.js';
+import { buildFacets, buildAdjacency, segment } from './meshCore.js';
+
+/**
+ * Flat position array for a BufferGeometry, without requiring three.js.
+ * Accepts either a real BufferAttribute (which exposes `.array`) or any
+ * accessor-shaped stand-in.
+ *
+ * @param {object} geometry  non-indexed source geometry
+ * @returns {ArrayLike<number>}
+ */
+export function positionsOf(geometry) {
+  const attr = geometry.attributes.position;
+  if (attr.array) return attr.array;
+  const out = new Float64Array(attr.count * 3);
+  for (let i = 0; i < attr.count; i++) {
+    out[i * 3] = attr.getX(i);
+    out[i * 3 + 1] = attr.getY(i);
+    out[i * 3 + 2] = attr.getZ(i);
+  }
+  return out;
+}
 
 /**
  * Segment a non-indexed BufferGeometry into face groups.
  *
- * @param {THREE.BufferGeometry} geometry   non-indexed source geometry
- * @param {number} creaseAngleDeg           max dihedral angle within a group (0–180°)
+ * @param {object} geometry        non-indexed source geometry
+ * @param {number} creaseAngleDeg  max dihedral angle within a group (0–180°)
  * @returns {Array<{triangleIndices: Set<number>}>}
  */
 export function groupFaces(geometry, creaseAngleDeg = 30) {
-  const { adjacency } = buildAdjacency(geometry);
-  const triCount = geometry.attributes.position.count / 3;
-  const visited = new Uint8Array(triCount);
-  const groups = [];
-
-  for (let t = 0; t < triCount; t++) {
-    if (visited[t]) continue;
-    const region = bucketFill(t, adjacency, creaseAngleDeg);
-    for (const ti of region) visited[ti] = 1;
-    groups.push({ triangleIndices: region });
-  }
-
-  return groups;
+  const positions = positionsOf(geometry);
+  const facets = buildFacets(positions);
+  const adjacency = buildAdjacency(positions, facets);
+  return segment(adjacency, facets.count, creaseAngleDeg)
+    .map(region => ({ triangleIndices: region }));
 }
 
 /**
