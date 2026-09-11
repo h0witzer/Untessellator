@@ -138,24 +138,29 @@ meaningful fraction. The `statistics` YAML per model is there to make this cheap
 ## Class balance — MEASURED
 
 The ABC paper shows the patch-type distribution as a figure with no numbers, so Stage 0
-measured it. First pass, 22,617 models / 1,582,809 patches (chunks 0–2):
+measured it. **Final: chunks 0–19, 150,280 models, 9,490,332 patches.**
 
-| type | % of patches | % of models with ≥1 | verdict |
+| type | % of patches | % of models with ≥1 | after stratified selection |
 |---|---|---|---|
-| Plane | 52.94% | 98.78% | |
-| Cylinder | 29.77% | 85.86% | |
-| BSpline | 5.44% | 17.73% | healthy |
-| **Torus** | 3.86% | **22.46%** | abundant — better than feared |
-| Extrusion | 3.38% | 6.61% | clustered: few models, many patches each |
-| Cone | 2.97% | 22.31% | |
-| Sphere | 1.29% | 10.43% | |
-| **Revolution** | **0.24%** | **2.05%** | the binding constraint |
-| Other | 0.10% | 1.18% | deferred, see below |
+| Plane | 55.40% | 99.07% | 46.31% |
+| Cylinder | 28.51% | 82.81% | 26.33% |
+| Extrusion | 4.71% | 8.76% | **9.84%** |
+| BSpline | 3.79% | 13.93% | **6.28%** |
+| **Torus** | 3.24% | 19.05% | **5.22%** |
+| Cone | 3.08% | 19.33% | 3.19% |
+| Sphere | 1.01% | 8.52% | **2.23%** |
+| **Revolution** | **0.19%** | **1.64%** | 0.41% |
+| Other | 0.07% | 0.80% | 0.19% (not targeted) |
 
-**Torus is in nearly a quarter of all models.** The class this direction exists to
-cover, and the one ParSeNet and HPNet do not support at all, turns out to be cheap to
-sample for. Revolution is the real problem at 106 usable models per chunk — roughly 19
-chunks to reach a 2,000-model quota.
+**Stratified selection more than doubles every rare class's share** — Extrusion 4.71 →
+9.84%, Sphere 1.01 → 2.23%, Torus 3.24 → 5.22%, BSpline 3.79 → 6.28% — at a target of
+25,000 parts drawn from a usable pool of 69,680.
+
+Torus, the class this direction exists to cover and the one ParSeNet and HPNet do not
+support at all, is comfortably abundant. **Revolution is the only genuine shortage**:
+1,642 usable models, 12,413 patches in the selected set. Under the seeded-fill MVP that
+is far less alarming than it looks, since each patch yields many (seed, neighbourhood)
+samples rather than one — measure before building the synthesis pipeline.
 
 Tori in mechanical parts are usually **fillets**: numerous, but tiny in area and facet
 count. Area-weighted or point-level metrics will hide failure on exactly the class that
@@ -177,12 +182,15 @@ NURBS fallback in `surfaceFitter.js` for when no primitive fits. Treat `Other` a
 
 ### Two corrections Stage 0 forced
 
-1. **A chunk yields ~7,539 feature files, not 10,000.** About 25% of model directories
+1. **A chunk yields ~7,514 feature files, not 10,000.** About 25% of model directories
    ship no `feat` file. Every "N chunks = 10N models" estimate was 25% optimistic.
-2. **42.2% of parts share a structural fingerprint** (9,550 duplicates in 1,979 groups),
-   so the usable pool was 12,972 of 22,617. ABC's duplicate problem is materially worse
-   than the paper's "many duplicate models" implies — and that is before geometric
-   dedup, which Stage 1 will catch more of.
+2. **53.2% of parts share a structural fingerprint** — 79,891 duplicates in 10,984
+   groups, leaving 69,680 usable of 150,280. Note this *rose* with corpus size (42.2% at
+   three chunks, 53.2% at twenty) because more chunks expose more cross-chunk twins, so
+   expect it to climb further with more data. **Over half of ABC is structurally
+   duplicate**, which is materially worse than the paper's "many duplicate models"
+   implies — and that is before geometric dedup, which Stage 1 will catch more of.
+   Effective corpus size is roughly half the nominal count; plan downloads accordingly.
 
 Mitigations, unchanged: stratified sampling on rare types (as ABCParts was built by
 selecting models with at least one B-spline), per-class loss weighting derived from the
