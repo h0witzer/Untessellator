@@ -433,11 +433,70 @@ and linear decay, fitted **per surface at inference time** in "a few seconds on 
 GPU." No dataset to build. It reports residual 0.002 / coverage 0.999 on freeform
 patches, against ComplexGen's 0.021 / 0.938.
 
+## The MVP: a seeded fill assistant, not a whole-mesh segmenter
+
+**Decided.** The first model assists `paintFrom` — the user clicks a facet, the model
+proposes which facets belong to the same surface and what type it is. Everything above
+about whole-mesh segmentation is the long horizon; this is what gets built.
+
+This is a much smaller problem than it first appeared, and the simplifications are
+structural rather than cosmetic:
+
+| whole-mesh segmentation | seeded fill |
+|---|---|
+| how many faces? decided by the model | the user points at one |
+| mean-shift clustering post-process | **none** |
+| variable-length output | fixed-size, one seed |
+| whole mesh in memory | local neighbourhood, capped |
+| batch job | per click, interactive |
+
+Losing mean-shift matters more than it looks. It was a CPU post-process outside the
+ONNX graph that would have needed a JS reimplementation, and it was the least
+predictable part of the deployment story. Seeding deletes it.
+
+**Shape of the thing**
+
+- *Input*: k-ring neighbourhood of the seed facet, capped (512–1024 facets). Per facet:
+  position relative to the seed centroid (scale-normalised), unit normal, dot of that
+  normal with the seed's, area, ring index, dihedral across the edge to its parent.
+  All of it already computed in `meshCore.js` / `faceGrouper.js`.
+- *Output*: per-facet "same surface as seed?" plus the seed surface's type.
+- *Budget*: well under 1M parameters, a few MB of ONNX, tens of milliseconds per click.
+  Small next to the ~25 MB OCCT bundle already fetched from CDN.
+- *Fallback*: absent or slow, `paintFrom` behaves exactly as it does today.
+
+**Training data is the same bake.** Stage 1 is unchanged — the only difference is that
+samples are drawn as (seed facet, local neighbourhood) pairs, so one model yields
+hundreds of training examples instead of one. That makes the Revolution shortage much
+less acute than the model-count table suggests: 913 Revolution models is far more than
+913 examples.
+
+**It is not a dead end.** Run it from many seeds and merge the proposals and you have
+whole-mesh segmentation. The MVP is the primitive the full version would be built from,
+so the work carries forward rather than being thrown away.
+
 ## Kill criterion
 
-If the model does not beat region growing's 26/62 on a held-out model, stop. Do not tune,
-do not scale up. Record the negative result in the module header the way `regionGrow.js`
-records the RANSAC commit-order failure (14/77).
+The seeded framing gives a better one than 26/62, because `test/paint.mjs` already
+measures it and the numbers are already recorded:
+
+- **WatchStand conical faces: 0/4**, flat across seedSize 12–80 crossed with tolScale
+  0.5–1.5. Structural, not a tuning problem: `neighbourhood()` is a plain adjacency BFS,
+  so on a face small relative to its neighbours the seed patch crosses the boundary and
+  poisons the initial fit before growth begins. **A learned seed proposer attacks
+  exactly this.**
+- **tangent-fillet over-reach ~25%**: the cylinder and top face bleed into the tangent
+  blend, which near the junction genuinely lies within tolerance of both surfaces.
+
+Targets: recover more than 0/4 on the conical faces, and cut the over-reach, without
+regressing tangent-fillet's base plane (currently 100% purity and 100% recall) or its
+cylinder radius (19.986 against a true 20).
+
+If it does not beat the existing `paintFrom` on those measurements, stop. Do not tune,
+do not scale up. Record the negative result in the module header the way
+`regionGrow.js` records the RANSAC commit-order failure (14/77).
+
+Whole-mesh 26/62 stays as the long-horizon number, not the MVP bar.
 
 ---
 
