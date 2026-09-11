@@ -25,6 +25,27 @@
  * Follows the shape of Schnabel, Wahl & Klein, "Efficient RANSAC for
  * Point-Cloud Shape Detection" (2007), specialised to a connected mesh so
  * growth can use edge adjacency rather than a spatial index.
+ *
+ * STATUS: work in progress, harness-only — NOT wired into the browser app.
+ * Scored against test/fixtures/WatchStandTruth.step (77 faces, of which 62 are
+ * reachable with the primitives we have; test/oracle.mjs measures that ceiling):
+ *
+ *     crease-angle flood fill ............ 24/77
+ *     this module, best parameters ....... 26/77
+ *
+ * NEGATIVE RESULT, do not redo: restoring RANSAC's "propose against the whole
+ * mesh, then commit best-supported first" ordering was tried and scored WORSE
+ * (14/77). Proposals grown against an unclaimed mesh over-grow across face
+ * boundaries, so ranking by support hands the part to whichever candidate
+ * over-grew the most. Support-ranking needs an over-growth penalty (Schnabel
+ * uses an MDL-style score) before it can help here. Tightening the distance
+ * tolerance does not help either — the score is flat at ~26 across a sweep of
+ * tolScale 0.05-1.5 against angleTol 8-25.
+ *
+ * The remaining gap to 62 is commit order and seeding, not fitting: oracle.mjs
+ * shows every one of the 62 analytic faces has >=10 facets lying on its exact
+ * ground-truth surface, and the fitters recover a 0.5 mm radius to 1e-6 when
+ * handed the right facets.
  */
 
 import { fitRegionAs } from './gaussMap.js';
