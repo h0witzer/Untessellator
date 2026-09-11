@@ -290,3 +290,93 @@ export function growPrimitives(facets, adjacency, opts = {}) {
 
   return accepted.concat(leftovers);
 }
+
+// ── Interactive painting ─────────────────────────────────────────────────────
+
+/**
+ * Bucket-fill from a clicked triangle, bounded by SURFACE FIT rather than by
+ * crease angle.
+ *
+ * Crease-angle fill asks whether a triangle's neighbour is parallel to it, which
+ * is the wrong question at a tangent junction: a cone running into a tangent
+ * planar face has ~0 dihedral angle at the boundary, so the fill spills across
+ * no matter how tight the threshold. Asking instead whether each triangle lies
+ * on the surface BEING PAINTED stops the fill exactly at the junction, because
+ * the planar face's facets are not on the cone.
+ *
+ * This is the same growth used by growPrimitives(), but with the two things that
+ * make automatic segmentation hard supplied by the user: which primitive, and
+ * where to start.
+ *
+ * @param {number} seedTri   triangle index under the cursor
+ * @param {string} type      'plane' | 'cylinder' | 'cone' | 'sphere'
+ * @param {object} facets    from meshCore.buildFacets
+ * @param {Map} adjacency    from meshCore.buildAdjacency
+ * @param {object} [opts]
+ * @param {number} [opts.tolScale=0.5]  distance tolerance, in median facet sizes
+ * @param {number} [opts.angleTol=15]   max facet-to-surface normal deviation, deg
+ * @param {number} [opts.seedSize=12]   facets used for the first fit
+ * @param {number} [opts.iterations=4]  grow/refit rounds
+ * @param {Set<number>} [opts.seedRegion]  paint from an existing selection
+ *        instead of a single triangle (shift-click to extend)
+ * @returns {{region:Set<number>, type:string, params:object|null,
+ *           relResidual:number, degenerate?:boolean, reason?:string}}
+ *
+ * STATUS (test/paint.mjs): works where crease fill cannot, fails where the face
+ * is small relative to its neighbours.
+ *
+ *   tangent-fillet, which crease fill merges into one 4512-triangle blob
+ *   spanning three faces:
+ *     paint PLANE on the base ....... purity 100%, recall 100%
+ *     paint CYLINDER on the wall .... purity  75%, recall 100%, r=19.986 (true 20)
+ *     paint PLANE on the top ........ purity  73%, recall 100%
+ *   The ~25% over-reach is the tangent blend: near the junction the fillet
+ *   really is inside tolerance of the cylinder. Tightening tolScale trades
+ *   that purity back against recall.
+ *
+ *   WatchStandMedium conical faces .. 0/4, half-angles come back 22, 0.6, 0.57,
+ *   89 deg. NOT a tolerance problem: flat at 0/4 across seedSize 12-80 x
+ *   tolScale 0.5-1.5. The cause is the seed patch — neighbourhood() is a plain
+ *   adjacency BFS, so on a face that is small next to its neighbours it crosses
+ *   the boundary and the first fit is poisoned before growth starts.
+ *
+ * NEXT: seed from a CREASE-bounded patch (locally coherent, never crosses a
+ * sharp edge) and then switch to surface-bounded growth. Crease angle is the
+ * wrong tool for the boundary but the right one for picking a clean starting
+ * patch; this module currently uses it for neither.
+ */
+export function paintFrom(seedTri, type, facets, adjacency, opts = {}) {
+  const tolD = (opts.tolScale ?? 0.5) * medianFacetSize(facets);
+  const cosTolA = Math.cos((opts.angleTol ?? 15) * Math.PI / 180);
+  const iterations = opts.iterations ?? 4;
+  const none = new Uint8Array(facets.count);
+
+  let region = opts.seedRegion && opts.seedRegion.size
+    ? new Set(opts.seedRegion)
+    : neighbourhood(seedTri, adjacency, none, opts.seedSize ?? 12);
+
+  let fit = fitRegionAs(type, region, facets);
+  if (fit.degenerate || !fit.params) {
+    return { region: new Set([seedTri]), type, params: null,
+             relResidual: Infinity, degenerate: true, reason: fit.reason };
+  }
+
+  // A fit from a dozen triangles around the click is a poor estimate of a whole
+  // face, so alternate growing and refitting until the region stops changing.
+  // Each refit sees more of the surface and claims more of it in turn.
+  for (let i = 0; i < iterations; i++) {
+    const grown = growOn(region, facets, adjacency, type, fit.params,
+                         tolD, cosTolA, none);
+    if (grown.size === 0) break;
+
+    const refit = fitRegionAs(type, grown, facets);
+    if (refit.degenerate || !refit.params) break;
+
+    const stable = grown.size === region.size;
+    region = grown;
+    fit = refit;
+    if (stable) break;
+  }
+
+  return { region, type, params: fit.params, relResidual: fit.relResidual };
+}
