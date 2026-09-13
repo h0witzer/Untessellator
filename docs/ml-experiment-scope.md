@@ -677,6 +677,53 @@ do not scale up. Record the negative result in the module header the way
 
 Whole-mesh 26/62 stays as the long-horizon number, not the MVP bar.
 
+### Verdict: criterion NOT met — and the reason is not the model
+
+`test/paintnet.mjs`, v1 checkpoint against the recorded baseline:
+
+| WatchStand cone | baseline region | model region |
+|---|---|---|
+| 59.00° (30 facets) | 50.0% purity / 20.0% recall | **100% / 100%** |
+| 45.00° (50 facets) | **0.0% / 0.0%** | **90.6% / 96.0%** |
+| 9.85° (477 facets) | 100% / 1.9% | 100% / 14.7% |
+| 9.85° (244 facets) | 100% / 8.2% | 100% / 22.1% |
+
+The model does the job it was built for. On the 45° cone the BFS baseline captures
+*nothing* correct; the model captures 96% of it at 90.6% purity. Type prediction was
+Cone at 87% and 100% confidence on the two faces where a cone is well defined. Mean
+2.7 ms per call including the k-ring BFS, feature build and inference.
+
+**Cones recovered: 0/4 → 0/4.** The criterion says stop, so we stop.
+
+But the diagnosis moved, and `test/fitoracle.mjs` was written to pin it down — handing
+`fitRegionAs` the *exact* ground-truth facets:
+
+    cone   9.85°, 477 facets  ->  22.34°      (err 12.48)
+    cone   9.85°, 244 facets  ->  31.21°      (err 21.36)
+    cone  59.00°,  30 facets  ->  DEGENERATE  ("no measurable taper")
+    cone  45.00°,  50 facets  ->  86.00°      (err 41.00)
+    cylinders .....................  4/6, both misses a 5% relative tolerance
+                                     on sub-millimetre radii
+
+**0 of 4 cones, from perfect input.** So `paint.mjs`'s 0/4 was never a segmentation
+result on this fixture. The premise this entire experiment was scoped on — *"handed the
+right facets, the fitters recover a 0.5 mm cylinder radius to six significant
+figures"* — was measured on a **cylinder** and generalised. It does not hold for cones.
+
+Two further observations from the same run:
+
+- On tangent-fillet, model-seeded `paintFrom` is byte-identical to the baseline
+  (1536 facets, 75% purity). The model's own region is far tighter — 205 facets at
+  99.5% purity — but `growOn` expands it straight back out. **Over-reach is a property
+  of the growth loop, not the seed**, so a better seed cannot fix it.
+- Model-seeded sometimes scores *worse* than the model alone (59° cone: 30 facets → 1).
+  Good region → bad cone fit → `growOn` rejects almost everything → collapse. Another
+  consequence of the same defect.
+
+**Revised ordering.** Fix `fitCone`, then re-run `fitoracle.mjs`, then re-evaluate the
+model. Until a primitive passes the fit-from-truth oracle, no proposer can raise its
+score — which is a much cheaper thing to know before optimising a network than after.
+
 ---
 
 # Part 3 — the scan question

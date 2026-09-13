@@ -10,3 +10,5 @@ ml/__pycache__/
 # Stage 1 bake outputs / venv
 ml/*.npz
 ml/runs/
+node_modules/
+package-lock.json

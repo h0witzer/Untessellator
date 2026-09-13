@@ -46,6 +46,31 @@
  * shows every one of the 62 analytic faces has >=10 facets lying on its exact
  * ground-truth surface, and the fitters recover a 0.5 mm radius to 1e-6 when
  * handed the right facets.
+ *
+ * CORRECTION — that last sentence is true of CYLINDERS and false of CONES.
+ *
+ * It was measured on a cylinder and generalised to every primitive. test/fitoracle.mjs
+ * now measures it per type by handing fitRegionAs the EXACT ground-truth facet set:
+ *
+ *     cone   9.85 deg, 477 facets  ->  22.34 deg   (err 12.48)
+ *     cone   9.85 deg, 244 facets  ->  31.21 deg   (err 21.36)
+ *     cone  59.00 deg,  30 facets  ->  DEGENERATE  ("no measurable taper")
+ *     cone  45.00 deg,  50 facets  ->  86.00 deg   (err 41.00)
+ *     cylinders ........................  4/6, the two misses being a 5% relative
+ *                                         tolerance on sub-millimetre radii
+ *
+ * 0 of 4 cones, from perfect input. So paint.mjs's "0/4 conical faces" is NOT a
+ * segmentation result on this fixture — a perfect region fails too, and no proposer,
+ * learned or otherwise, can lift it. fitCone is the blocking defect.
+ *
+ * Demonstrated by test/paintnet.mjs: a trained seed proposer produced 100% purity and
+ * 100% recall on the 59 deg cone (30/30 facets) and 90.6%/96.0% on the 45 deg cone,
+ * where the plain-BFS baseline scores 50%/20% and 0%/0% respectively. Cones recovered
+ * still went 0/4 -> 0/4, because fitCone cannot use a correct region.
+ *
+ * Consequence for ordering: fix fitCone before spending anything further on
+ * segmentation. Re-run test/fitoracle.mjs first whenever a primitive underperforms —
+ * if it fails there, the region feeding it is not the problem.
  */
 
 import { fitRegionAs } from './gaussMap.js';

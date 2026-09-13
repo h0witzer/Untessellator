@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "onnxruntime-node": "^1.29.0"
+  },
+  "type": "module"
+}
