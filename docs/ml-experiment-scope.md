@@ -967,6 +967,54 @@ Every curved analytic class degrades once the same surfaces are meshed on a knot
 planes, which mesh identically either way, do not move. The torus control was not a
 special case.
 
+### Three meshers, identical parts
+
+`mesher_bake.py` over the validation split with two re-meshings, scored only on parts
+present in all three (`rescore.py --intersect`): 1,801–1,802 parts, ~29,800 patches each.
+
+- **nurbs:** 1,845 of 1,999 parts built. 25 genuine crashes and 129 OCCT exceptions.
+- **gmsh:** 1,951 built. 25 gmsh exceptions and 22 timeouts. Its median triangle count
+  is 1.10 / 1.51 / 1.40 × OCCT's at coarse / medium / fine (p90 3–4×). That sits within
+  the spacing of OCCT's own density ladder, which the models train on.
+
+| | native v2ctrl | native v3canon | native v3synth | nurbs v2ctrl | nurbs v3canon | nurbs v3synth | gmsh v2ctrl | gmsh v3canon | gmsh v3synth |
+|---|---|---|---|---|---|---|---|---|---|
+| membership IoU | 0.795 | 0.794 | 0.773 | 0.719 | 0.718 | 0.701 | **0.530** | **0.514** | **0.489** |
+| macro type acc (canonical) | 0.748 | 0.748 | 0.740 | 0.528 | 0.546 | 0.534 | **0.412** | **0.423** | **0.409** |
+| Plane | 0.963 | 0.965 | 0.945 | 0.962 | 0.964 | 0.939 | 0.837 | 0.827 | 0.844 |
+| Cylinder | 0.875 | 0.877 | 0.890 | 0.614 | 0.622 | 0.633 | **0.036** | **0.043** | 0.072 |
+| Cone | 0.909 | 0.906 | 0.818 | 0.714 | 0.721 | 0.566 | 0.623 | 0.600 | 0.425 |
+| Sphere | 0.943 | 0.938 | 0.953 | 0.540 | 0.592 | 0.613 | 0.482 | 0.467 | 0.538 |
+| Torus | 0.752 | 0.749 | 0.729 | 0.022 | 0.018 | 0.008 | 0.147 | 0.167 | 0.074 |
+| Revolution | 0.238 | 0.207 | 0.254 | 0.105 | 0.179 | 0.241 | 0.133 | 0.169 | 0.216 |
+| Extrusion | 0.780 | 0.781 | 0.686 | 0.606 | 0.607 | 0.495 | 0.584 | 0.586 | 0.480 |
+| BSpline | 0.691 | 0.719 | 0.780 | 0.694 | 0.715 | 0.783 | 0.552 | 0.587 | 0.671 |
+
+**The labels were checked before believing this.** Across 45,134 faces in 400 parts,
+every gmsh face's area-weighted centroid lies within 1% of the diagonal of the native
+mesh's face with the same id. Area agrees within 2% for 97.7% of cylinders and 96.3% of
+tori. The larger area gaps on spheres (5.6% within 2%) and cones (58%) are chordal
+approximation of doubly curved or apex-bound faces, not mislabeled faces, since their
+centroids agree too.
+
+**What the model sees instead** (v3canon, 300 parts, medium density):
+
+| seed | native mesh predicted as | gmsh mesh predicted as |
+|---|---|---|
+| Cylinder | Cylinder 88%, Extrusion 5% | **Cone 36%, BSpline 32%, Extrusion 20%, Cylinder 4%** |
+| Torus | Torus 79%, BSpline 8% | **BSpline 59%**, Torus 18%, Sphere 10% |
+| Plane | Plane 98% | Plane 83%, Extrusion 9%, Cone 7% |
+
+OCCT meshes a cylinder as long triangles running the length of its axis; gmsh fills it
+with near-equilateral ones. **The model learned the strips, not the cylinder.**
+On a mesher that is merely a different algorithm (not a scanner, not a decimator)
+membership IoU falls from 0.79 to 0.51 and cylinders, the most common curved surface in
+CAD, go from 88% to 4%. Neither corrected labels nor synthetic revolves changed this.
+
+This is the most important measurement in the experiment so far: every earlier accuracy
+figure is an accuracy on OCCT's meshes. The next step is training on several meshers,
+with one held out as a test of generalisation to a mesher never seen.
+
 ### Synthesis, and the statistic that has to match
 
 With disguised primitives removed, genuine revolves are 60 seeds in the 2,000-part
