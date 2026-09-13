@@ -12,3 +12,9 @@ ml/*.npz
 ml/runs/
 node_modules/
 package-lock.json
+
+# Third-party game assets: copyrighted, evaluation only, never commit.
+# Keep rips outside the repo (D:/abc-data/game); these are backstops.
+test/fixtures/masterchief.stl
+game-assets/
+*.fbx
