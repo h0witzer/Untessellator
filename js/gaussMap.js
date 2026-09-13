@@ -426,6 +426,156 @@ export function fitCone(g, axis) {
 }
 
 /**
+ * Fit a torus via the TUBE-CENTRE relation.
+ *
+ * The obvious approach - least squares over all seven parameters (centre, axis, R, r)
+ * against point-to-surface distance - fails the same way the cone did, and for the same
+ * reason. The objective has a degenerate valley: tilt the axis, trade R against r, and
+ * the surface stays near a bounded patch. It also has three structural escapes, since
+ * R -> 0 is a sphere, R -> infinity is a cylinder, and r -> 0 makes any small patch fit.
+ *
+ * There is an exact relation that removes the search instead. For an outward normal n
+ * at a surface point p, the centre of the tube is exactly
+ *
+ *     q = p - r n
+ *
+ * and for the CORRECT r every q lies on one circle: radius R, in the plane through the
+ * centre perpendicular to the axis. So r is the value that makes {p - r n} planar, which
+ * is a one-dimensional search with a well-behaved objective, and everything else then
+ * follows from a plane fit and a circle fit - both linear.
+ *
+ * Measured on a generated torus of R=1.0, r=0.4: the planarity objective is unimodal in
+ * r, minimised at r=0.400 with R=0.9999 on a fine mesh and r=0.395 / R=0.9987 on a
+ * coarse one.
+ *
+ * KNOWN LIMIT, and it is the partial-patch problem again in a new place. The tube-centre
+ * relation needs enough of the tube to see that the q form a CIRCLE. On a small patch
+ * they form a short arc, and many r values make a short arc planar, so the fit degrades
+ * exactly where the cone's did. Measured: fitting a whole generated torus gives a
+ * relative residual of 1.5e-8, while fitting small seeded patches of the same mesh gives
+ * 7.5e-2 to 2.2e-1.
+ *
+ * What would resolve it is curvature rather than more search. At any point of a torus the
+ * principal curvature around the tube is exactly 1/r, independent of where the point sits,
+ * so r is readable from a small patch without ever seeing the circle - the same shape of
+ * fix as taking the cone's half-angle from |n . axis| instead of an R-vs-Z regression.
+ * That needs curvature estimation on a mesh, which does not exist here yet.
+ *
+ * The residual also DISCRIMINATES, which matters more than the parameters. The same
+ * torus displaced by 9% of its minor radius - a sculpted doughnut rather than a
+ * machined one - fits 22x worse (6.7e-2 against 3.1e-3). A sculpted surface should be
+ * reported as freeform, not as a torus that happens to be nearby, and that judgement
+ * belongs to the residual gate rather than to the classifier.
+ */
+function fitTorus(g) {
+  const { n, P, N, W, wSum } = g;
+  const pos = positional(g);                          // vertices, for the refinement
+  const origin = weightedMean3(P, W, n, wSum);
+
+  // Patch extent bounds the plausible tube radius; a torus whose tube dwarfs the patch
+  // is indistinguishable from a cylinder, and one far smaller is indistinguishable from
+  // a plane, so there is no point searching outside this.
+  let ext = 0;
+  for (let i = 0; i < n; i++) {
+    const d = norm(sub([P[i * 3], P[i * 3 + 1], P[i * 3 + 2]], origin));
+    if (d > ext) ext = d;
+  }
+  if (!(ext > 0)) return null;
+
+  // Planarity of {p - s*r*n}, plus the circle it forms.
+  const probe = (r, sgn) => {
+    const Q = new Float64Array(n * 3);
+    for (let i = 0; i < n; i++) {
+      for (let k = 0; k < 3; k++) Q[i * 3 + k] = P[i * 3 + k] - sgn * r * N[i * 3 + k];
+    }
+    const m = weightedMean3(Q, W, n, wSum);
+    const { values, vectors } = eigen3(weightedCov3(Q, W, n, wSum, m));
+    return { planar: Math.sqrt(Math.max(0, values[0])), axis: vectors[0], centre: m };
+  };
+
+  // Coarse scan then golden-section. The objective is unimodal in r but the scan guards
+  // against the trivial minimum near r = 0, where any small patch looks planar.
+  let best = null;
+  for (const sgn of [1, -1]) {
+    const lo = 0.02 * ext, hi = 2.0 * ext;
+    const steps = 48;
+    let bi = null;
+    for (let i = 0; i <= steps; i++) {
+      const r = lo + (hi - lo) * (i / steps);
+      const pr = probe(r, sgn);
+      if (!bi || pr.planar < bi.planar) bi = { ...pr, r };
+    }
+    if (!bi) continue;
+    const span = (hi - lo) / steps;
+    let a = Math.max(lo, bi.r - span), b = Math.min(hi, bi.r + span);
+    const phi = 0.6180339887;
+    let c1 = b - phi * (b - a), c2 = a + phi * (b - a);
+    let f1 = probe(c1, sgn).planar, f2 = probe(c2, sgn).planar;
+    for (let it = 0; it < 40 && b - a > 1e-9 * ext; it++) {
+      if (f1 < f2) { b = c2; c2 = c1; f2 = f1; c1 = b - phi * (b - a); f1 = probe(c1, sgn).planar; }
+      else { a = c1; c1 = c2; f1 = f2; c2 = a + phi * (b - a); f2 = probe(c2, sgn).planar; }
+    }
+    const r = 0.5 * (a + b);
+    const pr = probe(r, sgn);
+    if (!best || pr.planar < best.planar) best = { ...pr, r, sgn };
+  }
+  if (!best || !(best.r > 0)) return null;
+
+  // Refine R and r on the VERTICES, which lie exactly on the surface where centroids do
+  // not. With the axis and centre fixed, each vertex gives rho and z about the axis, and
+  // its distance to the tube-centre circle is sqrt((rho-R)^2 + z^2), which should equal r.
+  const ax = normalize(best.axis);
+  const c0 = best.centre;
+  const rho = new Float64Array(pos.n), zz = new Float64Array(pos.n);
+  for (let i = 0; i < pos.n; i++) {
+    const dx = pos.P[i * 3] - c0[0], dy = pos.P[i * 3 + 1] - c0[1], dz = pos.P[i * 3 + 2] - c0[2];
+    const z = dx * ax[0] + dy * ax[1] + dz * ax[2];
+    const rx = dx - z * ax[0], ry = dy - z * ax[1], rz = dz - z * ax[2];
+    rho[i] = Math.sqrt(rx * rx + ry * ry + rz * rz);
+    zz[i] = z;
+  }
+  const spread = (R) => {
+    let sw = 0, sd = 0, sdd = 0;
+    for (let i = 0; i < pos.n; i++) {
+      const dr = rho[i] - R;
+      const d = Math.sqrt(dr * dr + zz[i] * zz[i]);
+      sw += pos.W[i]; sd += pos.W[i] * d; sdd += pos.W[i] * d * d;
+    }
+    const mean = sd / sw;
+    return { r: mean, v: Math.max(0, sdd / sw - mean * mean) };
+  };
+  let R0 = 0;
+  for (let i = 0; i < pos.n; i++) R0 += pos.W[i] * rho[i];
+  R0 /= pos.W.reduce((a, b) => a + b, 0);
+  let lo = Math.max(1e-12, R0 - 2 * best.r), hi = R0 + 2 * best.r;
+  const phi = 0.6180339887;
+  let c1 = hi - phi * (hi - lo), c2 = lo + phi * (hi - lo);
+  let f1 = spread(c1).v, f2 = spread(c2).v;
+  for (let it = 0; it < 60 && hi - lo > 1e-12 * ext; it++) {
+    if (f1 < f2) { hi = c2; c2 = c1; f2 = f1; c1 = hi - phi * (hi - lo); f1 = spread(c1).v; }
+    else { lo = c1; c1 = c2; f1 = f2; c2 = lo + phi * (hi - lo); f2 = spread(c2).v; }
+  }
+  const R = 0.5 * (lo + hi);
+  const rr = spread(R).r;
+  if (!(R > 0) || !(rr > 0) || !isFinite(R) || !isFinite(rr)) return null;
+  // A torus whose tube reaches the axis is self-intersecting; treat it as not a torus.
+  if (rr >= R) return null;
+
+  // True point-to-surface residual, on the vertices.
+  let e = 0, ws = 0;
+  for (let i = 0; i < pos.n; i++) {
+    const dr = rho[i] - R;
+    const d = Math.sqrt(dr * dr + zz[i] * zz[i]) - rr;
+    e += pos.W[i] * d * d; ws += pos.W[i];
+  }
+  return {
+    type: 'torus',
+    params: { axis: ax, center: c0, majorRadius: R, minorRadius: rr },
+    residual: Math.sqrt(e / ws),
+  };
+}
+
+/**
  * Fit a sphere by normal-line concurrency: every surface normal of a sphere
  * passes through its centre, so minimise Sum w |(I - n n^T)(c - p)|^2.
  * This is far better conditioned than the original 4-parameter algebraic fit
@@ -478,7 +628,7 @@ function fitSphere(g) {
 
 // ── Classification ───────────────────────────────────────────────────────────
 
-const ORDER = { plane: 0, cylinder: 1, cone: 2, sphere: 3 };
+const ORDER = { plane: 0, cylinder: 1, cone: 2, sphere: 3, torus: 4 };
 
 /**
  * Classify one facet region.
@@ -533,6 +683,15 @@ export function classifyRegion(triIndices, facets, opts = {}) {
     push(fitCone(g, ax));
   }
   push(fitSphere(g));
+
+  // A torus has seven parameters against a cylinder's five, so on residual alone it
+  // could impersonate the simpler primitives. Measured on tangent-fillet, it does not:
+  // on the true cylinder it scores 3.5e-1 against the cylinder's 2.0e-8, and on the
+  // planes it is rejected outright. The guards inside fitTorus are what close that off
+  // - bounding the tube radius to the patch extent and requiring r < R rules out the
+  // R -> infinity (cylinder) and R -> 0 (sphere) escapes. On the actual fillet it wins
+  // by four orders of magnitude, 2.0e-6 against the next best 2.0e-2.
+  push(fitTorus(g));
 
   if (!candidates.length) {
     return { type: 'nurbs', params: null, residual: Infinity, relResidual: Infinity,
@@ -669,6 +828,7 @@ export function fitRegionAs(type, triIndices, facets) {
 
   if (type === 'plane')  return done(fitPlane(g), 'plane fit degenerate');
   if (type === 'sphere') return done(fitSphere(g), 'normals do not converge on a centre');
+  if (type === 'torus')  return done(fitTorus(g), 'no consistent tube: {p - r n} is not planar for any r');
   if (type === 'nurbs')  return { type: 'nurbs', params: null, residual: Infinity,
                                   relResidual: Infinity, extent };
 

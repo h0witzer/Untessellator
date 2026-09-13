@@ -113,7 +113,16 @@
 import { fitRegionAs } from './gaussMap.js';
 import { dot, cross, sub, norm, normalize } from './meshCore.js';
 
-const TYPES = ['plane', 'cylinder', 'cone', 'sphere'];
+const TYPES = ['plane', 'cylinder', 'cone', 'sphere', 'torus'];
+
+/** Any unit vector perpendicular to a. Used only for the degenerate on-axis case. */
+function perpOf(a) {
+  const k = Math.abs(a[0]) < Math.abs(a[1])
+    ? (Math.abs(a[0]) < Math.abs(a[2]) ? 0 : 2)
+    : (Math.abs(a[1]) < Math.abs(a[2]) ? 1 : 2);
+  const e = [0, 0, 0]; e[k] = 1;
+  return normalize(cross(a, e));
+}
 
 /**
  * Signed distance to a primitive, and its unit normal at the closest point.
@@ -164,6 +173,35 @@ export function surfaceEval(type, p) {
           u[1] * ca - axis[1] * sa,
           u[2] * ca - axis[2] * sa,
         ]);
+      },
+    };
+  }
+
+  if (type === 'torus') {
+    const { axis, center, majorRadius, minorRadius } = p;
+    // Nearest point on the tube-centre circle, then distance to the tube around it.
+    const tube = (q) => {
+      const d = sub(q, center);
+      const z = dot(d, axis);
+      const r = [d[0] - z * axis[0], d[1] - z * axis[1], d[2] - z * axis[2]];
+      const rn = norm(r);
+      // On the axis itself the nearest tube point is not unique; pick any radial.
+      const u = rn > 1e-12 ? [r[0] / rn, r[1] / rn, r[2] / rn] : perpOf(axis);
+      const c = [center[0] + majorRadius * u[0],
+                 center[1] + majorRadius * u[1],
+                 center[2] + majorRadius * u[2]];
+      return { c, z, rn };
+    };
+    return {
+      distance: (q) => {
+        const t = tube(q);
+        return norm(sub(q, t.c)) - minorRadius;
+      },
+      normal: (q) => {
+        const t = tube(q);
+        const v = sub(q, t.c);
+        const vn = norm(v);
+        return vn > 1e-12 ? [v[0] / vn, v[1] / vn, v[2] / vn] : axis;
       },
     };
   }
@@ -371,7 +409,7 @@ export function growPrimitives(facets, adjacency, opts = {}) {
  * where to start.
  *
  * @param {number} seedTri   triangle index under the cursor
- * @param {string} type      'plane' | 'cylinder' | 'cone' | 'sphere'
+ * @param {string} type      'plane' | 'cylinder' | 'cone' | 'sphere' | 'torus'
  * @param {object} facets    from meshCore.buildFacets
  * @param {Map} adjacency    from meshCore.buildAdjacency
  * @param {object} [opts]
