@@ -483,6 +483,24 @@ less acute than the model-count table suggests: 913 Revolution models is far mor
 whole-mesh segmentation. The MVP is the primitive the full version would be built from,
 so the work carries forward rather than being thrown away.
 
+### The problem, measured
+
+On baked ABC data, a 512-facet adjacency BFS around a random seed contains, on average,
+**only 16.7% facets that actually share the seed's face**. That is the `paintFrom`
+failure stated numerically — `regionGrow.js` records it qualitatively as "the seed patch
+crosses the boundary and poisons the initial fit before growth begins". The BFS supplies
+a superset that is roughly 1 part signal to 5 parts noise, and the model's entire job is
+to cut it down. Two consequences for training: the positive class needs loss weighting
+at about 1:5, and patch size is a hyperparameter worth sweeping rather than fixing.
+
+Related, from the same bake: on a plane-and-cylinder ABC part, **26 cross-face edges stay
+invisible to crease angle at every density in the ladder** — identical count at coarse,
+medium and fine — confirming tangent junctions are structural geometry, not a
+tessellation artifact that a finer export could fix. Meanwhile the usable crease window
+moves with density (at 5° it falsely cuts 23.5% of within-face edges on the medium mesh;
+at 15° it misses 2% of real boundaries), which is the threshold-tuning treadmill the
+learned proposer is meant to get off.
+
 ## Kill criterion
 
 The seeded framing gives a better one than 26/62, because `test/paint.mjs` already

@@ -6,3 +6,6 @@ ml/*.sqlite-wal
 ml/*.sqlite-shm
 ml/*.jsonl
 ml/__pycache__/
+
+# Stage 1 bake outputs / venv
+ml/*.npz
