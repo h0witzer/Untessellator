@@ -79,10 +79,32 @@
  * converter behaves exactly as before. It helps by replacing the initial patch that
  * the NEGATIVE RESULT above names — neighbourhood()'s plain adjacency BFS.
  *
- * The remaining failure is the 45 deg cone: the proposed region is 90.6% pure and
- * 96.0% complete, yet the fit lands at 15.42 deg, while the same fitter given the
- * exact facets returns 44.99. Five foreign facets out of 53 are enough to wreck it, so
- * the next weakness is outlier sensitivity in the fit, not the region.
+ * Two further fixes followed from asking why cones were hard at all, given that a CAD
+ * tessellator puts its vertices exactly ON the surface:
+ *
+ *   - Positional terms now fit WELDED VERTICES rather than facet centroids. An
+ *     inscribed triangulation puts every centroid strictly inside a convex surface, by
+ *     0.69% of the radius at coarse tessellation and 0.06% at fine — a density-
+ *     dependent bias that does not average out. Fitting the tangent-fillet wall to
+ *     centroids gave r=19.990482 for a true 20; to vertices it gives 20.000000.
+ *   - The apex now comes from TANGENT-PLANE CONCURRENCY, a single 3x3 solve. Every
+ *     tangent plane of a cone contains the apex, and a tessellator's triangles each
+ *     carry an edge along a ruling, so their planes do too: measured |n . (apex - c)|
+ *     has median 8.3e-10 on a cleanly tessellated cone. Pinning the apex removes the
+ *     slide-to-infinity direction that made the positional objective degenerate.
+ *
+ * The apex fix mostly shows up in GROWTH, not in the final angle: because growOn now
+ * tests against a correct cone from the first iteration, one click recovers 65.4%,
+ * 80.7% and 100.0% of three cone faces at 100% purity, against 14.7%, 22.1% and 23.3%
+ * before.
+ *
+ * The axis criterion is also TRIMMED, dropping the worst 20% by deviation, because a
+ * variance has no resistance to outliers: a 90.6%-pure region — five foreign facets out
+ * of 53 — previously swung the axis by 68 degrees. Swept across 0.05-0.4 the result is
+ * flat, so the fraction only has to exceed the impurity a segmenter leaves behind.
+ *
+ * That 45 deg cone is still the open case: 29.58 deg of error before trimming, 6.38
+ * after, against a 2 deg bar. Everything else lands inside 0.15 deg.
  *
  * Method note worth keeping: run test/fitoracle.mjs before optimising any proposer.
  * If a primitive cannot be recovered from perfect input, nothing feeding it can help.

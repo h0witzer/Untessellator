@@ -236,6 +236,50 @@ function fitCylinder(g, axis) {
   };
 }
 
+/**
+ * Apex by tangent-plane concurrency — no axis, no search, one 3x3 solve.
+ *
+ * Every tangent plane of a cone contains the apex, because the ruling through the
+ * touch point passes through it. A standard tessellator samples a cone at constant
+ * angles and two heights, so every triangle has one edge lying ALONG a ruling, and a
+ * plane containing that edge contains the apex exactly. Measured on a cleanly
+ * tessellated 59 deg cone: |n . (apex - centroid)| has median 8.3e-10 and max 1.3e-8,
+ * i.e. the relation is exact, not approximate.
+ *
+ * So the apex is the common point of all facet planes:  n_j . x = n_j . p_j.
+ * Least squares gives the normal equations  (sum w n n^T) x = sum w (n.p) n.
+ *
+ * This matters because it removes the degeneracy that made cones hard. Fitting a cone
+ * by distance alone lets the axis tilt, the apex slide and the half-angle open together
+ * while the surface barely moves through a bounded patch — which is how a 45 deg cone
+ * was fitted as 86 deg with a LOWER residual than the truth. Pinning the apex first
+ * removes that whole direction from the problem.
+ *
+ * Conditioning note: cone normals lie on a plane in normal space that does not pass
+ * through the origin, so they span R^3 and the system is full rank — but on a narrow
+ * arc they are nearly collinear, and the solve degrades. Callers must check the result
+ * rather than assume it.
+ */
+export function coneApexFromPlanes(g) {
+  const { n, P, N, W } = g;
+  const A = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  const b = [0, 0, 0];
+  for (let i = 0; i < n; i++) {
+    const w = W[i];
+    const nx = N[i * 3], ny = N[i * 3 + 1], nz = N[i * 3 + 2];
+    const d = nx * P[i * 3] + ny * P[i * 3 + 1] + nz * P[i * 3 + 2];
+    const r = [nx, ny, nz];
+    for (let j = 0; j < 3; j++) {
+      b[j] += w * d * r[j];
+      for (let k = 0; k < 3; k++) A[j][k] += w * r[j] * r[k];
+    }
+  }
+  const x = solve3(A, b);
+  return x && isFinite(x[0]) && isFinite(x[1]) && isFinite(x[2]) ? x : null;
+}
+
+const TRIM_FRACTION = 0.2;
+
 export function fitCone(g, axis) {
   const { n, N, W, wSum } = g;                      // facets: exact normals
   const pos = positional(g);                        // vertices: on the surface
@@ -265,6 +309,11 @@ export function fitCone(g, axis) {
   // senses of the axis and keep whichever explains the region better. Cheaper and
   // more reliable than inferring it from a normal's sign, which flips on a mesh
   // whose winding is inconsistent.
+  // Apex candidates: the tangent-plane solve (exact where the tessellation is clean —
+  // measured 1.4e-9 on a 59 deg cone) and the axial average as a fallback for when the
+  // plane system is ill-conditioned on a narrow arc. Both are scored below.
+  const planeApex = coneApexFromPlanes(g);
+
   let ax = axis, apex = null, bestCost = Infinity;
   for (const s of [1, -1]) {
     const cand = [axis[0] * s, axis[1] * s, axis[2] * s];
@@ -273,7 +322,9 @@ export function fitCone(g, axis) {
     let z0 = 0;
     for (let i = 0; i < pos.n; i++) z0 += pos.W[i] * (fr.Z[i] - fr.R[i] / tanA);
     z0 /= pos.wSum;
-    const ap = [origin[0] + z0 * cand[0], origin[1] + z0 * cand[1], origin[2] + z0 * cand[2]];
+    const axialApex = [origin[0] + z0 * cand[0], origin[1] + z0 * cand[1],
+                       origin[2] + z0 * cand[2]];
+    for (const ap of (planeApex ? [planeApex, axialApex] : [axialApex])) {
     const ca = Math.cos(halfAngle), sa = Math.sin(halfAngle);
     const f2 = axialFrame(pos, cand, ap);
     let e = 0;
@@ -281,7 +332,8 @@ export function fitCone(g, axis) {
       const d = f2.R[i] * ca - f2.Z[i] * sa;
       e += pos.W[i] * d * d;
     }
-    if (e < bestCost) { bestCost = e; ax = cand; apex = ap; }
+      if (e < bestCost) { bestCost = e; ax = cand; apex = ap; }
+    }
   }
   if (!apex || !isFinite(apex[0])) return null;
 
@@ -300,6 +352,7 @@ export function fitCone(g, axis) {
 
   // Positional error, plus how far each facet normal is from the cone's own
   // normal there. See SCORE vs RESIDUAL below for why both are needed.
+  const NA = new Float64Array(n);
   let e = 0, eN = 0, sd = 0, sdd = 0;
   for (let i = 0; i < pos.n; i++) {
     const d = fr.R[i] * ca - fr.Z[i] * sa;
@@ -318,6 +371,7 @@ export function fitCone(g, axis) {
 
     // n . axis, whose SPREAD is the real axis discriminator (see below).
     const na = N[i * 3] * ax[0] + N[i * 3 + 1] * ax[1] + N[i * 3 + 2] * ax[2];
+    NA[i] = na;
     sd += W[i] * na;
     sdd += W[i] * na * na;
   }
@@ -334,7 +388,32 @@ export function fitCone(g, axis) {
   // TRUE one, so a position-only search actively prefers the wrong answer and walks
   // away from a correct Gauss-map seed. Adding the variance term makes the true axis
   // the minimum, which is what it should have been all along.
-  const varNA = Math.max(0, sdd / wSum - (sd / wSum) * (sd / wSum));
+  let varNA = Math.max(0, sdd / wSum - (sd / wSum) * (sd / wSum));
+
+  // TRIMMED, because a handful of foreign facets otherwise decide the axis.
+  //
+  // A region proposed by any real segmenter is not perfectly pure. Measured on
+  // WatchStand: a 45 deg cone region that is 90.6% pure — five foreign facets out of
+  // 53 — swung the fitted axis by 68 degrees, because those five inflate the variance
+  // at the TRUE axis and some other axis then scores lower. The criterion is a
+  // variance, so it has no resistance to outliers at all.
+  //
+  // Dropping the worst TRIM_FRACTION by deviation restores it. This is not a tuned
+  // constant in the sense the earlier AXIS_TRUST was: it only has to exceed the
+  // impurity a segmenter realistically leaves behind, and the result is flat across a
+  // wide range of values.
+  if (n >= 8) {
+    const mean = sd / wSum;
+    const order = Array.from(NA.subarray(0, n).keys())
+      .sort((i, j) => Math.abs(NA[i] - mean) - Math.abs(NA[j] - mean));
+    const keep = Math.max(4, Math.floor(n * (1 - TRIM_FRACTION)));
+    let tw = 0, ts = 0, tss = 0;
+    for (let k = 0; k < keep; k++) {
+      const i = order[k];
+      tw += W[i]; ts += W[i] * NA[i]; tss += W[i] * NA[i] * NA[i];
+    }
+    if (tw > 0) varNA = Math.max(0, tss / tw - (ts / tw) * (ts / tw));
+  }
 
   return {
     type: 'cone',
@@ -597,6 +676,7 @@ export function fitRegionAs(type, triIndices, facets) {
     const fitFn = type === 'cylinder' ? fitCylinder : fitCone;
     const cost = axisCost;
     let best = null;
+
     for (const seed of axisSeeds(g)) {
       const r = refineAxis(g, seed, fitFn);
       if (r && isFinite(r.residual) && cost(r) < cost(best)) best = r;
