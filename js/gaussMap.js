@@ -105,7 +105,20 @@ export function gather(triIndices, facets) {
       VP[j * 3] = e.x; VP[j * 3 + 1] = e.y; VP[j * 3 + 2] = e.z; VW[j] = e.w; j++;
     }
   }
-  return { n, P, N, W, wSum, vn, VP, VW };
+  // Curvature hint, when the caller has attached one to `facets` (see
+  // curvature.js attachCurvature). Medians rather than means, because curvature on a
+  // discrete mesh is noisy and a proposed region is never perfectly pure.
+  let kMajor = null;
+  if (facets.curvature && facets.curvature.valid) {
+    const a = [];
+    for (let i = 0; i < n; i++) {
+      const t = idx[i];
+      if (facets.curvature.valid[t]) a.push(Math.abs(facets.curvature.k1[t]));
+    }
+    if (a.length >= 3) { a.sort((x, y) => x - y); kMajor = a[a.length >> 1]; }
+  }
+
+  return { n, P, N, W, wSum, vn, VP, VW, kMajor };
 }
 
 /** Positional sample set: welded vertices when available, facet centroids otherwise. */
@@ -455,11 +468,18 @@ export function fitCone(g, axis) {
  * relative residual of 1.5e-8, while fitting small seeded patches of the same mesh gives
  * 7.5e-2 to 2.2e-1.
  *
- * What would resolve it is curvature rather than more search. At any point of a torus the
- * principal curvature around the tube is exactly 1/r, independent of where the point sits,
- * so r is readable from a small patch without ever seeing the circle - the same shape of
- * fix as taking the cone's half-angle from |n . axis| instead of an R-vs-Z regression.
- * That needs curvature estimation on a mesh, which does not exist here yet.
+ * Curvature (curvature.js) was built to resolve this and only PARTLY does, which is
+ * worth recording so it is not retried expecting more. The principal curvature around
+ * the tube is exactly 1/r everywhere, and the estimator recovers it well: r to 2.5% from
+ * a 66-facet patch, 0.4% of the surface. But r was not the binding constraint. R is, and
+ * R genuinely requires seeing enough of the tube to form a circle - no local quantity can
+ * supply it. End to end the hint moved seeded torus fits from 13/40 to 16/40 on a fine
+ * mesh and made a coarse one slightly worse.
+ *
+ * Nor can the residual arbitrate between a curvature-seeded fit and a free one: on a
+ * small patch a wrong (R, r) pair genuinely achieves the lower residual, which is the
+ * degeneracy restated rather than a scoring bug. Growth is what supplies R - a correct r
+ * at least lets growth start from something sane.
  *
  * The residual also DISCRIMINATES, which matters more than the parameters. The same
  * torus displaced by 9% of its minor radius - a sculpted doughnut rather than a
@@ -493,11 +513,22 @@ function fitTorus(g) {
     return { planar: Math.sqrt(Math.max(0, values[0])), axis: vectors[0], centre: m };
   };
 
+  // CURVATURE HINT. On a small patch the tube-centre relation is degenerate - the q form
+  // a short arc, and many r make a short arc planar - which is the same partial-patch
+  // failure the cone had. The principal curvature around the tube is exactly 1/r at
+  // every point of a torus, so it pins r from a patch far too small to show a circle.
+  // Measured on a generated torus: a 66-facet patch, 0.4% of the surface, gives r to
+  // 2.5%. Used to BRACKET the search rather than replace it, since the estimate is
+  // approximate and the planarity objective is still the more accurate of the two.
+  const hint = g.kMajor && g.kMajor > 1e-12 ? 1 / g.kMajor : null;
+
   // Coarse scan then golden-section. The objective is unimodal in r but the scan guards
   // against the trivial minimum near r = 0, where any small patch looks planar.
   let best = null;
   for (const sgn of [1, -1]) {
-    const lo = 0.02 * ext, hi = 2.0 * ext;
+    const lo = hint ? Math.max(0.02 * ext, 0.5 * hint) : 0.02 * ext;
+    const hi = hint ? Math.min(4.0 * ext, 2.0 * hint) : 2.0 * ext;
+    if (!(hi > lo)) continue;
     const steps = 48;
     let bi = null;
     for (let i = 0; i <= steps; i++) {
@@ -521,45 +552,87 @@ function fitTorus(g) {
   }
   if (!best || !(best.r > 0)) return null;
 
-  // Refine R and r on the VERTICES, which lie exactly on the surface where centroids do
-  // not. With the axis and centre fixed, each vertex gives rho and z about the axis, and
-  // its distance to the tube-centre circle is sqrt((rho-R)^2 + z^2), which should equal r.
+  // Refine on the VERTICES, which lie exactly on the surface where centroids do not.
+  // With the axis and centre fixed, each vertex gives rho and z about the axis, and its
+  // distance to the tube-centre circle is sqrt((rho-R)^2 + z^2), which should equal r.
   const ax = normalize(best.axis);
   const c0 = best.centre;
   const rho = new Float64Array(pos.n), zz = new Float64Array(pos.n);
+  let wAll = 0;
   for (let i = 0; i < pos.n; i++) {
     const dx = pos.P[i * 3] - c0[0], dy = pos.P[i * 3 + 1] - c0[1], dz = pos.P[i * 3 + 2] - c0[2];
     const z = dx * ax[0] + dy * ax[1] + dz * ax[2];
     const rx = dx - z * ax[0], ry = dy - z * ax[1], rz = dz - z * ax[2];
     rho[i] = Math.sqrt(rx * rx + ry * ry + rz * rz);
     zz[i] = z;
+    wAll += pos.W[i];
   }
+  const tubeDist = (R, i) => {
+    const dr = rho[i] - R;
+    return Math.sqrt(dr * dr + zz[i] * zz[i]);
+  };
+  // Free r: R is wherever the tube distances are most consistent, r their mean.
   const spread = (R) => {
-    let sw = 0, sd = 0, sdd = 0;
+    let sd = 0, sdd = 0;
     for (let i = 0; i < pos.n; i++) {
-      const dr = rho[i] - R;
-      const d = Math.sqrt(dr * dr + zz[i] * zz[i]);
-      sw += pos.W[i]; sd += pos.W[i] * d; sdd += pos.W[i] * d * d;
+      const d = tubeDist(R, i);
+      sd += pos.W[i] * d; sdd += pos.W[i] * d * d;
     }
-    const mean = sd / sw;
-    return { r: mean, v: Math.max(0, sdd / sw - mean * mean) };
+    const mean = sd / wAll;
+    return { r: mean, v: Math.max(0, sdd / wAll - mean * mean) };
+  };
+  // Fixed r: R is wherever the tube distances sit closest to the given r.
+  const misfit = (R, rFix) => {
+    let e = 0;
+    for (let i = 0; i < pos.n; i++) {
+      const d = tubeDist(R, i) - rFix;
+      e += pos.W[i] * d * d;
+    }
+    return e / wAll;
+  };
+  const golden = (lo0, hi0, f) => {
+    let a = lo0, b = hi0;
+    const phi = 0.6180339887;
+    let c1 = b - phi * (b - a), c2 = a + phi * (b - a);
+    let f1 = f(c1), f2 = f(c2);
+    for (let it = 0; it < 60 && b - a > 1e-12 * ext; it++) {
+      if (f1 < f2) { b = c2; c2 = c1; f2 = f1; c1 = b - phi * (b - a); f1 = f(c1); }
+      else { a = c1; c1 = c2; f1 = f2; c2 = a + phi * (b - a); f2 = f(c2); }
+    }
+    return 0.5 * (a + b);
   };
   let R0 = 0;
   for (let i = 0; i < pos.n; i++) R0 += pos.W[i] * rho[i];
-  R0 /= pos.W.reduce((a, b) => a + b, 0);
-  let lo = Math.max(1e-12, R0 - 2 * best.r), hi = R0 + 2 * best.r;
-  const phi = 0.6180339887;
-  let c1 = hi - phi * (hi - lo), c2 = lo + phi * (hi - lo);
-  let f1 = spread(c1).v, f2 = spread(c2).v;
-  for (let it = 0; it < 60 && hi - lo > 1e-12 * ext; it++) {
-    if (f1 < f2) { hi = c2; c2 = c1; f2 = f1; c1 = hi - phi * (hi - lo); f1 = spread(c1).v; }
-    else { lo = c1; c1 = c2; f1 = f2; c2 = lo + phi * (hi - lo); f2 = spread(c2).v; }
+  R0 /= wAll;
+
+  // TWO CANDIDATES, CHOSEN BY EVIDENCE rather than by a size threshold.
+  //
+  // The planarity route estimates r globally and is the more accurate of the two when
+  // the patch shows enough of the tube to form a circle. The curvature route estimates
+  // r locally and is the only one that works when it does not. Rather than guess where
+  // the crossover is, fit both and keep whichever explains the vertices better.
+  //
+  // This matters because the refinement below re-derives r from the axis and centre,
+  // so on a small patch a bad axis produces a bad r no matter how the planarity search
+  // was bracketed - bracketing alone was measured to change nothing at all.
+  const candidates = [];
+  {
+    const R = golden(Math.max(1e-12, R0 - 2 * best.r), R0 + 2 * best.r, (x) => spread(x).v);
+    candidates.push({ R, r: spread(R).r });
   }
-  const R = 0.5 * (lo + hi);
-  const rr = spread(R).r;
-  if (!(R > 0) || !(rr > 0) || !isFinite(R) || !isFinite(rr)) return null;
-  // A torus whose tube reaches the axis is self-intersecting; treat it as not a torus.
-  if (rr >= R) return null;
+  if (hint) {
+    const R = golden(Math.max(1e-12, R0 - 2 * hint), R0 + 2 * hint, (x) => misfit(x, hint));
+    candidates.push({ R, r: hint });
+  }
+
+  let R = null, rr = null, bestE = Infinity;
+  for (const cand of candidates) {
+    if (!(cand.R > 0) || !(cand.r > 0) || !isFinite(cand.R) || !isFinite(cand.r)) continue;
+    if (cand.r >= cand.R) continue;   // self-intersecting tube: not a torus
+    const e = misfit(cand.R, cand.r);
+    if (e < bestE) { bestE = e; R = cand.R; rr = cand.r; }
+  }
+  if (R === null) return null;
 
   // True point-to-surface residual, on the vertices.
   let e = 0, ws = 0;

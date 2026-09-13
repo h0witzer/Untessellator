@@ -33,6 +33,7 @@ import { createRequire } from 'node:module';
 import { buildFacets, buildAdjacency, segment } from '../js/meshCore.js';
 import { paintFrom } from '../js/regionGrow.js';
 import { proposeRegion, TYPE_NAMES, fitterFor } from '../js/seedNet.js';
+import { attachCurvature } from '../js/curvature.js';
 
 const require = createRequire(import.meta.url);
 const ort = require('onnxruntime-node');
@@ -86,6 +87,7 @@ for (const name of files) {
   let deg = 0;
   for (let t = 0; t < facets.count; t++) if (facets.degenerate[t]) deg++;
   const adjacency = buildAdjacency(P, facets);
+  attachCurvature(P, facets);   // one pass per mesh; gives fitTorus a local handle on r
 
   // connected components, to expose meshes that are secretly in pieces
   const seenC = new Uint8Array(facets.count);
