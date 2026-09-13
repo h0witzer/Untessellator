@@ -310,13 +310,91 @@ export function fitCone(g, axis) {
   // |n . a| = sin(halfAngle), independently of where the facet sits. That holds on
   // any patch, however narrow, and needs no axial extent at all. It is the Gauss-map
   // relation this module is named for, applied per facet rather than to the mean.
+  // TWO ESTIMATES OF THE HALF-ANGLE, scored against each other rather than ranked a
+  // priori, because each is better than the other in a different regime.
+  //
+  //   from NORMALS   |n . axis| = sin(halfAngle). Needs no apex, so it cannot inherit
+  //                  an apex error - robust on a contaminated region. But it uses the
+  //                  normal of a SECANT facet, tilted from the true surface normal by
+  //                  O(theta^2), so it eats the sagitta: measured error fell exactly 4x
+  //                  per density step, 7.09e-3 at 384 facets to 1.11e-4 at 24,576.
+  //
+  //   from VERTICES  every vertex lies exactly on the cone, so the angle between
+  //                  (v - apex) and the axis IS the half-angle, with no approximation -
+  //                  1.5e-15 on a synthetic cone at every density. But it DEPENDS on the
+  //                  apex, and on a real region a slightly wrong apex makes it worse
+  //                  than the normals: adopting it outright took fitoracle's cones from
+  //                  4/4 to 2/4 and paint.mjs from 1/4 to 0/4.
+  //
+  // So compute both and keep whichever explains the points better. Recorded because the
+  // obvious reading - "vertices are on the surface, therefore always prefer them" - is
+  // exactly the conclusion that regressed.
   let sAbs = 0;
   for (let i = 0; i < n; i++) {
     sAbs += W[i] * Math.abs(N[i * 3] * axis[0] + N[i * 3 + 1] * axis[1] + N[i * 3 + 2] * axis[2]);
   }
-  const halfAngle = Math.asin(Math.min(1, Math.max(0, sAbs / wSum)));
-  if (!(halfAngle > 1e-4) || halfAngle > 1.5533) return null;    // (0, 89 deg)
-  const tanA = Math.tan(halfAngle);
+  const angles = [Math.asin(Math.min(1, Math.max(0, sAbs / wSum)))];
+
+  const planeApex = coneApexFromPlanes(g);
+
+  // GATE THE VERTEX ESTIMATE ON WHETHER THE PLANES ACTUALLY CONCUR.
+  //
+  // It is only exact when the mesh really is an inscribed tessellation of a cone, with
+  // an edge of every triangle lying along a ruling. That is true of a CAD tessellator's
+  // output and false of a downloaded mesh scored against a reconstructed STEP, and the
+  // difference is directly measurable as how nearly the facet planes pass through the
+  // solved apex. Measured, relative to patch extent:
+  //
+  //     synthetic inscribed cone .......... 8.4e-16
+  //     WatchStand 59 deg, clean patch .... 2.1e-6
+  //     WatchStand 45 deg ................. 8.8e-3
+  //     WatchStand 9.85 deg ............... 3.9e-2 / 6.0e-2
+  //
+  // Three orders of magnitude of daylight, so the exact cut hardly matters; 1e-4 sits in
+  // the gap. Without this gate the vertex estimate is offered everywhere and the
+  // residual picks it on the 45 deg cone, giving 47.08 where the normals give 44.98.
+  let concur = Infinity;
+  if (planeApex) {
+    const gp = g.P;
+    let acc = 0, accw = 0;
+    for (let i = 0; i < n; i++) {
+      acc += W[i] * Math.abs(
+        N[i * 3] * (planeApex[0] - gp[i * 3]) +
+        N[i * 3 + 1] * (planeApex[1] - gp[i * 3 + 1]) +
+        N[i * 3 + 2] * (planeApex[2] - gp[i * 3 + 2]));
+      accw += W[i];
+    }
+    let ext = 0;
+    for (let i = 0; i < n; i++) {
+      const d = norm(sub([gp[i * 3], gp[i * 3 + 1], gp[i * 3 + 2]], origin));
+      if (d > ext) ext = d;
+    }
+    if (accw > 0 && ext > 0) concur = (acc / accw) / ext;
+  }
+
+  if (planeApex && pos.n >= 3 && concur < 1e-4) {
+    for (const sgn of [1, -1]) {
+      let acc = 0, accw = 0;
+      for (let i = 0; i < pos.n; i++) {
+        const dx = pos.P[i * 3] - planeApex[0], dy = pos.P[i * 3 + 1] - planeApex[1],
+              dz = pos.P[i * 3 + 2] - planeApex[2];
+        const L = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (!(L > 1e-14)) continue;
+        const c = sgn * (dx * axis[0] + dy * axis[1] + dz * axis[2]) / L;
+        acc += pos.W[i] * Math.acos(Math.min(1, Math.max(-1, c)));
+        accw += pos.W[i];
+      }
+      if (accw > 0) {
+        const a = acc / accw;
+        if (a > 1e-4 && a < 1.5533) { angles.push(a); break; }
+      }
+    }
+  }
+
+  let halfAngle = null, ax = null, apex = null, bestCost = Infinity;
+  for (const cand of angles) {
+    if (!(cand > 1e-4) || cand > 1.5533) continue;          // (0, 89 deg)
+    const tanA = Math.tan(cand);
 
   // Orientation is not determined by the half-angle, so place the apex for both
   // senses of the axis and keep whichever explains the region better. Cheaper and
@@ -325,30 +403,29 @@ export function fitCone(g, axis) {
   // Apex candidates: the tangent-plane solve (exact where the tessellation is clean —
   // measured 1.4e-9 on a 59 deg cone) and the axial average as a fallback for when the
   // plane system is ill-conditioned on a narrow arc. Both are scored below.
-  const planeApex = coneApexFromPlanes(g);
 
-  let ax = axis, apex = null, bestCost = Infinity;
-  for (const s of [1, -1]) {
-    const cand = [axis[0] * s, axis[1] * s, axis[2] * s];
-    const fr = axialFrame(pos, cand, origin);
+  for (const sg of [1, -1]) {
+    const cnd = [axis[0] * sg, axis[1] * sg, axis[2] * sg];
+    const fr = axialFrame(pos, cnd, origin);
     // On the cone, R = tan(a) * (Z - z0), so each sample votes for an apex position.
     let z0 = 0;
     for (let i = 0; i < pos.n; i++) z0 += pos.W[i] * (fr.Z[i] - fr.R[i] / tanA);
     z0 /= pos.wSum;
-    const axialApex = [origin[0] + z0 * cand[0], origin[1] + z0 * cand[1],
-                       origin[2] + z0 * cand[2]];
+    const axialApex = [origin[0] + z0 * cnd[0], origin[1] + z0 * cnd[1],
+                       origin[2] + z0 * cnd[2]];
     for (const ap of (planeApex ? [planeApex, axialApex] : [axialApex])) {
-    const ca = Math.cos(halfAngle), sa = Math.sin(halfAngle);
-    const f2 = axialFrame(pos, cand, ap);
+      const ca = Math.cos(cand), sa = Math.sin(cand);
+      const f2 = axialFrame(pos, cnd, ap);
     let e = 0;
     for (let i = 0; i < pos.n; i++) {
       const d = f2.R[i] * ca - f2.Z[i] * sa;
       e += pos.W[i] * d * d;
     }
-      if (e < bestCost) { bestCost = e; ax = cand; apex = ap; }
+      if (e < bestCost) { bestCost = e; ax = cnd; apex = ap; halfAngle = cand; }
+    }
     }
   }
-  if (!apex || !isFinite(apex[0])) return null;
+  if (!apex || !isFinite(apex[0]) || halfAngle === null) return null;
 
   // Perpendicular distance from (r, z) to the cone surface in the half-plane.
   const ca = Math.cos(halfAngle), sa = Math.sin(halfAngle);
@@ -677,26 +754,74 @@ function fitSphere(g) {
     }
   }
 
-  const centre = solve3(A, b);
+  let centre = solve3(A, b);
   if (!centre) return null;
 
-  let signedR = 0;
-  for (let i = 0; i < n; i++) {
-    signedR += W[i] * (
-      (P[i * 3] - centre[0]) * N[i * 3] +
-      (P[i * 3 + 1] - centre[1]) * N[i * 3 + 1] +
-      (P[i * 3 + 2] - centre[2]) * N[i * 3 + 2]);
+  // REFINE ON THE VERTICES. Normal concurrency above is well conditioned and gives a
+  // good centre, but it is driven by facet CENTROIDS, and for a triangle inscribed in a
+  // sphere the foot of the perpendicular from the centre is the circumcentre, not the
+  // centroid. That mismatch is O(theta^2), so it shrank by exactly 4x per density step
+  // and left the radius 2.5% short on a coarse mesh (0.8289 for a true 0.85).
+  //
+  // The vertices carry no such error - a tessellator puts them exactly on the surface -
+  // so finish with the standard algebraic fit over them, which is exact for points on a
+  // sphere: |v|^2 - 2 c.v + |c|^2 = R^2 is linear in (c, k) with k = |c|^2 - R^2.
+  const pos = positional(g);
+  if (pos.n >= 4) {
+    const M = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]];
+    const rhs = [0, 0, 0, 0];
+    for (let i = 0; i < pos.n; i++) {
+      const w = pos.W[i];
+      const x = pos.P[i * 3], y = pos.P[i * 3 + 1], z = pos.P[i * 3 + 2];
+      const row = [2 * x, 2 * y, 2 * z, 1];
+      const val = x * x + y * y + z * z;
+      for (let r = 0; r < 4; r++) {
+        rhs[r] += w * val * row[r];
+        for (let c = 0; c < 4; c++) M[r][c] += w * row[r] * row[c];
+      }
+    }
+    const sol = solve4(M, rhs);
+    if (sol) {
+      const r2 = sol[3] + sol[0] * sol[0] + sol[1] * sol[1] + sol[2] * sol[2];
+      if (r2 > 0 && isFinite(r2)) centre = [sol[0], sol[1], sol[2]];
+    }
   }
-  signedR /= wSum;
-  const radius = Math.abs(signedR);
+
+  // Radius from the vertices too, for the same reason.
+  let radius = 0, rw = 0;
+  for (let i = 0; i < pos.n; i++) {
+    radius += pos.W[i] * norm(sub([pos.P[i * 3], pos.P[i * 3 + 1], pos.P[i * 3 + 2]], centre));
+    rw += pos.W[i];
+  }
+  radius = rw > 0 ? radius / rw : 0;
   if (!(radius > 1e-9) || !isFinite(radius)) return null;
 
-  let e = 0;
-  for (let i = 0; i < n; i++) {
-    const d = norm(sub([P[i * 3], P[i * 3 + 1], P[i * 3 + 2]], centre)) - radius;
-    e += W[i] * d * d;
+  let e = 0, ew = 0;
+  for (let i = 0; i < pos.n; i++) {
+    const d = norm(sub([pos.P[i * 3], pos.P[i * 3 + 1], pos.P[i * 3 + 2]], centre)) - radius;
+    e += pos.W[i] * d * d; ew += pos.W[i];
   }
-  return { type: 'sphere', params: { center: centre, radius }, residual: Math.sqrt(e / wSum) };
+  return { type: 'sphere', params: { center: centre, radius }, residual: Math.sqrt(e / Math.max(ew, 1e-30)) };
+}
+
+/** Gauss-Jordan on a 4x4, for the algebraic sphere fit. */
+function solve4(A, b) {
+  const m = A.map((row, i) => [...row, b[i]]);
+  let scale = 0;
+  for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) scale = Math.max(scale, Math.abs(m[i][j]));
+  if (!(scale > 0)) return null;
+  for (let i = 0; i < 4; i++) {
+    let piv = i;
+    for (let r = i + 1; r < 4; r++) if (Math.abs(m[r][i]) > Math.abs(m[piv][i])) piv = r;
+    if (Math.abs(m[piv][i]) < 1e-14 * scale) return null;
+    if (piv !== i) { const t = m[i]; m[i] = m[piv]; m[piv] = t; }
+    for (let r = 0; r < 4; r++) {
+      if (r === i) continue;
+      const f = m[r][i] / m[i][i];
+      for (let c = i; c < 5; c++) m[r][c] -= f * m[i][c];
+    }
+  }
+  return [m[0][4] / m[0][0], m[1][4] / m[1][1], m[2][4] / m[2][2], m[3][4] / m[3][3]];
 }
 
 // ── Classification ───────────────────────────────────────────────────────────
