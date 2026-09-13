@@ -1015,6 +1015,31 @@ This is the most important measurement in the experiment so far: every earlier a
 figure is an accuracy on OCCT's meshes. The next step is training on several meshers,
 with one held out as a test of generalisation to a mesher never seen.
 
+### Real hand-made meshes: the baseline to beat
+
+Game and prop meshes are the far end of the mesher axis. They have no STEP, so they are
+scored without ground truth by `test/meshReport.mjs` (see `game-assets-scope.md`),
+using 60 seeds per file with the model's curvature columns zeroed as trained. A **bogus
+fit** is one whose own relative residual exceeds 1e-2: the predicted surface is not there.
+Rips are evaluation-only; CC0 sources may be trained on.
+
+| set | checkpoint | top predicted types | Cone share | bogus / fitted | failed / attempted | mean claimed |
+|---|---|---|---|---|---|---|
+| Kenney Blaster Kit, 39 low-poly OBJs (deduplicated) | v2ctrl | Plane 82%, Cone 15% | 15% | 35% | 661 / 2,283 | 61.5% |
+| | v3canon | Plane 85%, Cone 13% | 13% | 34% | 617 / 2,304 | 62.7% |
+| Poly Haven, 5 quad-modelled props | v2ctrl | Cone 50%, Plane 25% | 50% | 63% | 15 / 253 | 59.6% |
+| | v3canon | Cone 49%, Plane 26% | 49% | 61% | 10 / 260 | 58.9% |
+| Master Chief (rip, evaluation only) | v2ctrl | Cone 62%, BSpline 15% | 62% | 98% | 0 / 42 | 6.2% |
+| | v3canon | Cone 57%, Revolution 13% | 57% | 100% | 0 / 43 | 6.2% |
+
+The more hand-made the mesh, the more the type head falls back to Cone, and the fits
+behind it do not hold. Corrected labels change nothing here, as expected of a model
+trained only on OCCT meshes.
+
+Queued next: `v4all` (native plus NURBS, gmsh and game-art copies of training parts, from
+`game_bake.py`) and `v4nogmsh` (gmsh held out). Both will be scored on this table and on
+the four labelled mesh sets.
+
 ### Synthesis, and the statistic that has to match
 
 With disguised primitives removed, genuine revolves are 60 seeds in the 2,000-part
