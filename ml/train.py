@@ -181,6 +181,11 @@ def main(argv=None) -> int:
                     help="synthetic bake to mix into TRAINING only; validation stays real")
     ap.add_argument("--synth-frac", type=float, default=0.15,
                     help="fraction of training files drawn from --synth")
+    ap.add_argument("--extra-bake", type=Path, nargs="*", default=[],
+                    help="re-meshed bakes of the same parts (mesher_bake.py); their copies of "
+                         "TRAINING-split parts are added to training, never validation")
+    ap.add_argument("--extra-frac", type=float, default=0.5,
+                    help="fraction of training files drawn from --extra-bake, all dirs together")
     ap.add_argument("--no-curvature", action="store_true",
                     help="zero the two curvature columns. The control arm: any gain from "
                          "curvature has to be measured against an otherwise identical run, "
@@ -215,11 +220,35 @@ def main(argv=None) -> int:
         n_synth = len(synth)
         train_files = list(train_files) + list(synth)
         rng.shuffle(train_files)
+
+    # Re-meshed copies of the same TRAINING parts (NURBS-converted, gmsh, ...). The model
+    # measurably reads OCCT's triangulation pattern, so showing it one part meshed several
+    # ways is the point. Only parts from this run's own training split are taken, so no
+    # validation part reaches training under another mesher; relabel sidecars apply as usual.
+    n_extra = {}
+    if args.extra_bake and args.extra_frac > 0:
+        real_train = [f for f in train_files if args.bake in f.parents]
+        pool = []
+        for extra in args.extra_bake:
+            got = [extra / f.relative_to(args.bake) for f in real_train]
+            got = [g for g in got if g.exists()]
+            n_extra[str(extra)] = len(got)
+            pool.extend(got)
+        rng.shuffle(pool)
+        want = int(len(train_files) * args.extra_frac / max(1e-9, 1 - args.extra_frac))
+        pool = pool[:want]
+        n_extra = {k: sum(1 for g in pool if str(g).startswith(k)) for k in n_extra}
+        train_files = list(train_files) + pool
+        rng.shuffle(train_files)
     print(f"device      {device}"
           + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
     print(f"baked files {len(files):,}  ->  train {len(train_files):,}  val {len(val_files):,}"
           "   (split by model, never by patch)")
     print(f"labels      {'canonical (relabel sidecars)' if args.relabel else 'stored B-rep types'}")
+    if n_extra:
+        print("re-meshed   " + ", ".join(f"{Path(k).name} {v:,}" for k, v in n_extra.items())
+              + f" training copies ({100 * sum(n_extra.values()) / len(train_files):.1f}% of "
+              "training files); validation is native only")
     if n_synth:
         print(f"synthetic   {n_synth:,} parts mixed into training "
               f"({100 * n_synth / len(train_files):.1f}% of training files); validation is real-only")
