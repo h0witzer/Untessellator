@@ -531,26 +531,66 @@ about data volume:
 | Extrusion | 0.59 | direction is local, profile is not |
 | **Revolution** | **0.05** | **rotational symmetry about an axis — global** |
 
-Revolution never learns. Across eight evaluations spanning 16,000 steps it reads
-0.00, 0.00, 0.09, 0.02, 0.01, 0.00, 0.11, 0.05, while every other class climbs — and
-that is *with* `--balance-seeds` deliberately oversampling it.
+Revolution never learns. Across the run it reads 0.00, 0.00, 0.09, 0.02, 0.01, 0.00,
+0.11, 0.05 … 0.11, 0.09, while every other class climbs — and that is *with*
+`--balance-seeds` oversampling it.
 
-**This is not the scarcity problem we planned for.** The hypothesis is that a
-512-facet patch does not contain the information: Plane, Sphere, Cone, Cylinder and
-Torus are all fixed by local curvature, so a small neighbourhood suffices, whereas a
-surface of revolution is defined by a *global* property. Locally, a patch on a revolve
-looks like a generic curved patch — which is to say, like a B-spline. Extrusion sits
-between the two, consistent with its direction being locally visible while its profile
-is not.
+### Why — and it is not what it looked like
 
-**If this holds, the synthesis pipeline would have been the wrong fix.** More Revolution
-examples cannot help if the distinguishing information is absent from the input. See the
-patch-size ablation below for the decisive test; do not build synthesis until it reports.
+The first hypothesis was locality: that a 512-facet patch cannot see the rotational
+symmetry that defines a revolve, so it would look like a generic curved patch, i.e. a
+B-spline. **The confusion matrix refutes that**, and so does the coverage data.
 
-Options if confirmed, in increasing cost: let Revolution route to the NURBS fallback the
-way `Other` does; enlarge the patch; add explicit global context (patch extent relative
-to the whole mesh, or a coarse second-scale summary) so the network can see beyond the
-k-ring.
+Where Revolution seeds actually get predicted (n=50, v1 checkpoint):
+
+| predicted | share |
+|---|---|
+| **Cylinder** | **56%** |
+| Sphere | 16% |
+| Revolution | 12% |
+| Other | 8% |
+| BSpline | 4% |
+
+Not B-spline. **Cylinder and Sphere** — and that is geometrically correct. A surface of
+revolution whose profile is a line parallel to the axis *is* a cylinder; one whose
+profile is an arc centred on the axis *is* a sphere. The network is not failing to see
+the surface; it is naming it by its geometry.
+
+And the patch is not information-starved. Mean facets of a 512-patch lying on the seed's
+own face:
+
+    Sphere 211   Torus 294   Revolution 187   BSpline 174
+    Cone 79      Plane 53    Extrusion 49     Cylinder 43
+
+Revolution patches have **four times the coverage of Cylinder patches**. Starvation was
+the wrong story.
+
+### What this actually means
+
+`SurfaceOfRevolution` is substantially a **provenance label, not a geometric one**. It
+records that the modeller built the face with a revolve tool, and the CAD kernel stored
+it that way — not that the resulting surface is distinguishable from a cylinder or
+sphere. A classifier trained on geometry cannot recover an authoring decision that left
+no geometric trace.
+
+For this project that reframes the result entirely: **predicting `Cylinder` on a face
+STEP calls `Revolution` is the better answer**, provided the cylinder fits within
+tolerance. The converter wants the simplest analytic surface that fits, not the one the
+original modeller happened to click. An analytic cylinder is more useful downstream than
+a general surface of revolution.
+
+Same pattern explains BSpline at 0.57 — its errors go to Cone 17%, Plane 9%, Sphere 6%,
+i.e. spline patches that are locally conical or planar. Again arguably correct answers.
+
+**Consequences:**
+
+1. **Do not build the Revolution synthesis pipeline.** Right conclusion, wrong original
+   reason. More examples cannot teach a distinction that is not in the geometry.
+2. **Label-match accuracy is the wrong metric for type.** Score by whether the predicted
+   primitive *fits within tolerance* — which `oracle.mjs` already does, since it tests
+   facets against real surfaces rather than comparing enum values.
+3. Revolution and Extrusion fitters are still worth having for the cases where no
+   simpler primitive fits; they just should not be forced when one does.
 
 ## Label noise: STEP translation splits periodic surfaces
 
