@@ -125,7 +125,11 @@ def extract_patch(facets: dict, indptr, indices, face_id: np.ndarray,
     ring_n = rings.astype(np.float64) / max(1.0, float(rings.max()))
     dot_seed = nrm @ seed_nrm
 
-    feats = np.empty((ids.size, N_FEATURES), np.float32)
+    # zeros, not empty: the curvature columns are only written when curvature is passed,
+    # and the control arm trained with them at exactly zero. np.empty left whatever was
+    # in memory there, which never bit training (curvature was always passed) but would
+    # have fed garbage to any caller that omitted it.
+    feats = np.zeros((ids.size, N_FEATURES), np.float32)
     feats[:, 0:3] = d
     feats[:, 3:6] = n
     feats[:, 6] = dot_seed
