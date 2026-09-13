@@ -29,6 +29,7 @@ import { fileURLToPath } from 'node:url';
 
 import { buildFacets, buildAdjacency } from '../js/meshCore.js';
 import { buildFeatures, kRing, N_FEATURES } from '../js/seedNet.js';
+import { attachCurvature } from '../js/curvature.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIX = join(HERE, 'fixtures');
@@ -50,7 +51,7 @@ const PY_DRIVER = `
 import sys, json
 import numpy as np
 sys.path.insert(0, r"${ML.replace(/\\/g, '\\\\')}")
-from meshcore import build_facets, build_adjacency, adjacency_csr, k_ring
+from meshcore import build_facets, build_adjacency, adjacency_csr, facet_curvature, k_ring
 from patches import extract_patch
 
 cfg = json.load(open(sys.argv[1]))
@@ -58,12 +59,13 @@ pos = np.array(cfg["positions"], dtype=np.float64).reshape(-1, 9)
 facets = build_facets(pos)
 pairs, ang = build_adjacency(pos, facets, cfg["quant"])
 indptr, indices = adjacency_csr(pairs, facets["count"])
+curv = facet_curvature(pos, facets)
 fid = np.zeros(facets["count"], np.int32)
 fty = np.zeros(facets["count"], np.uint8)
 out = []
 for seed in cfg["seeds"]:
     p = extract_patch(facets, indptr, indices, fid, fty, int(seed),
-                      cfg["max_facets"], rng=None, spin=False)
+                      cfg["max_facets"], rng=None, spin=False, curv=curv)
     out.append({"ids": p["ids"].tolist(), "features": p["features"].ravel().tolist()}
                if p is not None else None)
 json.dump(out, open(sys.argv[2], "w"))
@@ -85,6 +87,7 @@ function pythonFeatures(positions, seeds, maxFacets, quant) {
 function compare(label, positions, seeds, maxFacets, quant) {
   const facets = buildFacets(positions);
   const adjacency = buildAdjacency(positions, facets, quant);
+  attachCurvature(positions, facets);
   const py = pythonFeatures(positions, seeds, maxFacets, quant);
 
   let worstFeat = 0, idMismatch = 0, sizeMismatch = 0, checked = 0, worstCol = -1;

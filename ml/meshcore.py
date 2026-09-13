@@ -185,3 +185,88 @@ def k_ring(seed: int, indptr: np.ndarray, indices: np.ndarray,
         total += nbrs.size
         frontier = nbrs
     return np.concatenate(out), np.concatenate(rings)
+
+
+# ── curvature ────────────────────────────────────────────────────────────────────
+#
+# Port of js/curvature.js. Same warning as the rest of this module: it is a deliberate
+# duplicate, checked against the JS by test/netparity.mjs, not an independent
+# implementation. Rusinkiewicz (2004) — each triangle edge samples the map from a tangent
+# direction to the rate of change of the normal, so three edges give six equations in the
+# three unknowns of the symmetric second fundamental form.
+
+def vertex_normals(positions: np.ndarray, facets: dict):
+    """Area-weighted vertex normals, welded on EXACT coordinates (see js/curvature.js)."""
+    p = np.asarray(positions, dtype=np.float64).reshape(-1, 3, 3)
+    ntri = p.shape[0]
+    live = ~facets["degenerate"] if "degenerate" in facets else np.ones(ntri, bool)
+    flat = p.reshape(-1, 3)
+    _, vid = np.unique(flat, axis=0, return_inverse=True)
+    vid = vid.reshape(ntri, 3)
+    nv = int(vid.max()) + 1 if ntri else 0
+    acc = np.zeros((nv, 3))
+    w = (facets["areas"] * live)[:, None]
+    contrib = facets["normals"] * w
+    for k in range(3):
+        np.add.at(acc, vid[:, k], contrib)
+    L = np.linalg.norm(acc, axis=1)
+    out = np.zeros_like(acc)
+    ok = L > 1e-20
+    out[ok] = acc[ok] / L[ok, None]
+    return out, vid
+
+
+def facet_curvature(positions: np.ndarray, facets: dict):
+    """Principal curvatures per facet. k1 is the larger-magnitude one."""
+    p = np.asarray(positions, dtype=np.float64).reshape(-1, 3, 3)
+    ntri = p.shape[0]
+    k1 = np.zeros(ntri)
+    k2 = np.zeros(ntri)
+    valid = np.zeros(ntri, bool)
+    if ntri == 0:
+        return {"k1": k1, "k2": k2, "valid": valid}
+
+    VN, vid = vertex_normals(positions, facets)
+    nrm = facets["normals"]
+    live = ~facets["degenerate"] if "degenerate" in facets else np.ones(ntri, bool)
+
+    u = p[:, 1] - p[:, 0]
+    uL = np.linalg.norm(u, axis=1)
+    good = live & (uL > 1e-20)
+    u = np.where(good[:, None], u / np.maximum(uL, 1e-300)[:, None], 0.0)
+    v = np.cross(nrm, u)
+
+    n0, n1, n2 = VN[vid[:, 0]], VN[vid[:, 1]], VN[vid[:, 2]]
+    edges = [(p[:, 2] - p[:, 1], n2 - n1),
+             (p[:, 0] - p[:, 2], n0 - n2),
+             (p[:, 1] - p[:, 0], n1 - n0)]
+
+    A = np.zeros((ntri, 3, 3))
+    b = np.zeros((ntri, 3))
+    for e, dn in edges:
+        eu = np.einsum("ij,ij->i", e, u)
+        ev = np.einsum("ij,ij->i", e, v)
+        du = np.einsum("ij,ij->i", dn, u)
+        dv = np.einsum("ij,ij->i", dn, v)
+        for row, rhs in ((np.stack([eu, ev, np.zeros_like(eu)], 1), du),
+                         (np.stack([np.zeros_like(eu), eu, ev], 1), dv)):
+            A += row[:, :, None] * row[:, None, :]
+            b += row * rhs[:, None]
+
+    scale = np.abs(A).reshape(ntri, 9).max(axis=1)
+    solvable = good & (scale > 0) & (np.abs(np.linalg.det(A)) > 1e-14 * scale ** 3)
+    if solvable.any():
+        sol = np.linalg.solve(A[solvable], b[solvable][:, :, None])[:, :, 0]
+        a_, b_, c_ = sol[:, 0], sol[:, 1], sol[:, 2]
+        tr = a_ + c_
+        det = a_ * c_ - b_ * b_
+        rt = np.sqrt(np.maximum(0.0, tr * tr / 4 - det))
+        e1, e2 = tr / 2 + rt, tr / 2 - rt
+        big = np.where(np.abs(e1) >= np.abs(e2), e1, e2)
+        small = np.where(np.abs(e1) >= np.abs(e2), e2, e1)
+        fin = np.isfinite(big) & np.isfinite(small)
+        idx = np.flatnonzero(solvable)[fin]
+        k1[idx] = big[fin]
+        k2[idx] = small[fin]
+        valid[idx] = True
+    return {"k1": k1, "k2": k2, "valid": valid}

@@ -46,11 +46,13 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from meshcore import adjacency_csr, build_adjacency, build_facets, k_ring  # noqa: E402
+from meshcore import (  # noqa: E402
+    adjacency_csr, build_adjacency, build_facets, facet_curvature, k_ring,
+)
 from occ_tessellate import TYPE_NAMES  # noqa: E402
 
 N_TYPES = len(TYPE_NAMES)
-N_FEATURES = 10
+N_FEATURES = 12
 
 FEATURE_NAMES = (
     "dx", "dy", "dz",          # position relative to seed, canonical frame, scaled
@@ -59,15 +61,23 @@ FEATURE_NAMES = (
     "log_area",                # log(area / mean patch area)
     "ring",                    # BFS ring index / max ring
     "dist",                    # |position - seed| / scale
+    # Principal curvatures, scaled by the patch radius so they are dimensionless like
+    # everything else. These are the LOCAL surface-type signal: plane 0/0, cylinder
+    # 1/R and 0, sphere both 1/R, torus 1/r around the tube at every point. The network
+    # otherwise sees only positions, normals and adjacency, and has to infer local shape
+    # from their arrangement.
+    "k1s",                     # larger principal curvature * scale
+    "k2s",                     # smaller principal curvature * scale
 )
 
 
 def derive(positions: np.ndarray):
-    """Facets + adjacency for one baked mesh, using the checked meshCore port."""
+    """Facets, adjacency and curvature for one baked mesh, via the checked port."""
     facets = build_facets(positions)
     pairs, angles = build_adjacency(positions, facets)
     indptr, indices = adjacency_csr(pairs, facets["count"])
-    return facets, indptr, indices
+    curv = facet_curvature(positions, facets)
+    return facets, indptr, indices, curv
 
 
 def _frame_from_normal(n: np.ndarray) -> np.ndarray:
@@ -86,7 +96,7 @@ def _frame_from_normal(n: np.ndarray) -> np.ndarray:
 def extract_patch(facets: dict, indptr, indices, face_id: np.ndarray,
                   face_type: np.ndarray, seed: int, max_facets: int,
                   rng: np.random.Generator | None = None,
-                  spin: bool = True) -> dict | None:
+                  spin: bool = True, curv: dict | None = None) -> dict | None:
     """Build one training sample around `seed`. Returns None if the patch is too small."""
     ids, rings = k_ring(seed, indptr, indices, max_facets)
     if ids.size < 8:
@@ -122,6 +132,10 @@ def extract_patch(facets: dict, indptr, indices, face_id: np.ndarray,
     feats[:, 7] = np.clip(log_area, -8, 8)
     feats[:, 8] = ring_n
     feats[:, 9] = dist
+    if curv is not None:
+        v = curv["valid"][ids]
+        feats[:, 10] = np.where(v, np.clip(curv["k1"][ids] * scale, -20, 20), 0.0)
+        feats[:, 11] = np.where(v, np.clip(curv["k2"][ids] * scale, -20, 20), 0.0)
 
     return {
         "features": feats,
@@ -188,13 +202,13 @@ class BakedPatches:
             face_type = data[f"{dens}_face_type"]
             if positions.shape[0] < 32:
                 continue
-            facets, indptr, indices = derive(positions)
+            facets, indptr, indices, curv = derive(positions)
             ntri = facets["count"]
 
             seeds = self._choose_seeds(face_type, ntri)
             for s in seeds:
                 out = extract_patch(facets, indptr, indices, face_id, face_type,
-                                    int(s), self.max_facets, self.rng)
+                                    int(s), self.max_facets, self.rng, curv=curv)
                 if out is not None:
                     out["density"] = dens
                     yield out

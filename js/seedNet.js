@@ -22,6 +22,7 @@
  *   7    log(area / mean patch area), clipped to +/-8
  *   8    BFS ring index / max ring
  *   9    |relative position| / RMS radius
+ *   10-11 principal curvatures * RMS radius (the local surface-type signal)
  *
  * CANONICAL FRAME: the patch is rotated so the SEED'S NORMAL POINTS ALONG +Z. Training
  * additionally span the patch randomly about Z; at inference we do not, because a fixed
@@ -31,7 +32,7 @@
 export const TYPE_NAMES = ['Plane', 'Cylinder', 'Cone', 'Sphere', 'Torus',
   'Revolution', 'Extrusion', 'BSpline', 'Other'];
 
-export const N_FEATURES = 10;
+export const N_FEATURES = 12;
 
 /** Types the converter has an analytic fitter for. Others route to the NURBS fallback. */
 export const FITTABLE = new Set(['plane', 'cylinder', 'cone', 'sphere', 'torus']);
@@ -102,7 +103,8 @@ function frameFromNormal(n) {
  * Build the (n, 10) feature block for one seed.
  * @returns {{features: Float32Array, ids: number[], n: number}}
  */
-export function buildFeatures(seed, facets, adjacency, maxFacets = 512) {
+export function buildFeatures(seed, facets, adjacency, maxFacets = 512, curv = null) {
+  curv = curv || facets.curvature || null;
   const { ids, rings } = kRing(seed, adjacency, maxFacets);
   const n = ids.length;
   const R = frameFromNormal([facets.normals[seed * 3],
@@ -147,6 +149,10 @@ export function buildFeatures(seed, facets, adjacency, maxFacets = 512) {
     out[o + 7] = Math.min(8, Math.max(-8, la));
     out[o + 8] = rings[i] / ringDiv;
     out[o + 9] = Math.hypot(dx, dy, dz);
+    if (curv && curv.valid && curv.valid[t]) {
+      out[o + 10] = Math.min(20, Math.max(-20, curv.k1[t] * scale));
+      out[o + 11] = Math.min(20, Math.max(-20, curv.k2[t] * scale));
+    }
   }
   return { features: out, ids, n };
 }
@@ -161,7 +167,7 @@ export function buildFeatures(seed, facets, adjacency, maxFacets = 512) {
 export async function proposeRegion(seed, facets, adjacency, run, opts = {}) {
   const maxFacets = opts.maxFacets ?? 512;
   const threshold = opts.threshold ?? 0.5;
-  const { features, ids, n } = buildFeatures(seed, facets, adjacency, maxFacets);
+  const { features, ids, n } = buildFeatures(seed, facets, adjacency, maxFacets, opts.curvature);
   const { sameLogit, typeLogit } = await run(features, n);
 
   const region = new Set();

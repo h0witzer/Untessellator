@@ -68,6 +68,9 @@ class PatchStream(IterableDataset):
             yield s
 
 
+CURV_COLS = (10, 11)
+
+
 class Collate:
     """Module-level and picklable on purpose.
 
@@ -77,11 +80,14 @@ class Collate:
     than at the collate function, so it is worth not rediscovering.
     """
 
-    def __init__(self, max_facets: int):
+    def __init__(self, max_facets: int, drop_curvature: bool = False):
         self.max_facets = max_facets
+        self.drop_curvature = drop_curvature
 
     def __call__(self, batch):
         x, y, m, t = collate(batch, self.max_facets)
+        if self.drop_curvature:
+            x[:, :, CURV_COLS[0]:CURV_COLS[1] + 1] = 0.0
         return (torch.from_numpy(x), torch.from_numpy(y),
                 torch.from_numpy(m), torch.from_numpy(t))
 
@@ -89,7 +95,7 @@ class Collate:
 def make_loader(files, args, type_weights, shuffle_seed):
     stream = PatchStream(files, args.max_facets, args.seeds_per_mesh,
                          tuple(args.densities.split(",")), type_weights, shuffle_seed)
-    return DataLoader(stream, batch_size=args.batch, collate_fn=Collate(args.max_facets),
+    return DataLoader(stream, batch_size=args.batch, collate_fn=Collate(args.max_facets, args.no_curvature),
                       num_workers=args.workers, persistent_workers=args.workers > 0,
                       prefetch_factor=4 if args.workers > 0 else None)
 
@@ -166,6 +172,10 @@ def main(argv=None) -> int:
     ap.add_argument("--balance-seeds", action="store_true",
                     help="bias seed sampling towards rare surface types")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--no-curvature", action="store_true",
+                    help="zero the two curvature columns. The control arm: any gain from "
+                         "curvature has to be measured against an otherwise identical run, "
+                         "not against a previous run with different hyperparameters.")
     args = ap.parse_args(argv)
 
     args.out.mkdir(parents=True, exist_ok=True)
@@ -204,6 +214,7 @@ def main(argv=None) -> int:
                          * N_TYPES, dtype=torch.float32, device=device)
 
     model = SeedFillNet(in_features=N_FEATURES, n_types=N_TYPES).to(device)
+    print(f"curvature   {'DISABLED (control arm)' if args.no_curvature else 'enabled'}")
     print(f"parameters  {count_parameters(model):,} "
           f"(~{count_parameters(model) * 4 / 1e6:.2f} MB fp32)")
 
