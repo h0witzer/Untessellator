@@ -925,6 +925,48 @@ removed without collapsing everything.
 4. `log_area` should be dropped or heavily augmented. Zeroing it at inference costs
    membership (0.866 → 0.678) only because the model was trained to use it.
 
+### Synthetic mix (v3synth): a small Revolution gain, a broader loss
+
+Same settings as v3canon, plus the 4,000-part synthetic bake as 15% of training files.
+Validation real-only, the identical 33,377 patches:
+
+| | v3canon | v3synth |
+|---|---|---|
+| membership IoU | **0.797** | 0.776 |
+| Revolution membership | 0.624 | **0.647** |
+| Revolution type (canonical) | 0.240 | **0.272** |
+| BSpline type | 0.687 | **0.759** |
+| Cylinder type | 0.878 | **0.893** |
+| Cone type | **0.900** | 0.821 |
+| Extrusion type | **0.770** | 0.675 |
+| Plane type | **0.967** | 0.948 |
+| macro type accuracy | **0.738** | 0.729 |
+
+Membership drops for Plane (0.836 → 0.781), Cylinder, Cone and Extrusion seeds. Synthetic
+parts take training steps from real ones, and their planar and cylindrical faces are
+meshed in a pattern real ABC parts do not share — which, given the mesher finding above,
+the model would be expected to pick up. **Not adopted.** Revolution is better attacked
+together with tessellation diversity than by adding more OCCT meshes of any kind.
+
+### The whole validation split, re-meshed
+
+`mesher_bake.py --variant nurbs` over the validation split, scored with v3canon (1,693
+parts at first count; the comparison on parts common to every mesher follows):
+
+| | native | NURBS-converted |
+|---|---|---|
+| membership IoU | 0.797 | 0.724 |
+| macro type accuracy | 0.738 | 0.544 |
+| Torus | 0.740 | **0.024** |
+| Sphere | 0.926 | 0.599 |
+| Cylinder | 0.878 | 0.637 |
+| Cone | 0.900 | 0.712 |
+| Plane | 0.967 | 0.971 |
+
+Every curved analytic class degrades once the same surfaces are meshed on a knot grid;
+planes, which mesh identically either way, do not move. The torus control was not a
+special case.
+
 ### Synthesis, and the statistic that has to match
 
 With disguised primitives removed, genuine revolves are 60 seeds in the 2,000-part

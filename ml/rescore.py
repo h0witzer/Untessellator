@@ -41,6 +41,12 @@ def main(argv=None):
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--ckpt", type=Path, default=Path("D:/abc-data/runs/v2ctrl/best.pt"))
     ap.add_argument("--bake", type=Path, default=Path("D:/abc-data/bake"))
+    ap.add_argument("--split-bake", type=Path, default=Path("D:/abc-data/bake"),
+                    help="bake whose split defines the validation parts; --bake may be a "
+                         "re-meshed variant holding the same parts (mesher_bake.py)")
+    ap.add_argument("--intersect", type=Path, nargs="*", default=[],
+                    help="only parts present in every one of these bakes, so native and "
+                         "re-meshed variants are scored on identical parts")
     ap.add_argument("--relabel", type=Path, default=Path("D:/abc-data/relabel"))
     ap.add_argument("--density", default="medium")
     ap.add_argument("--per-type", type=int, default=4)
@@ -55,7 +61,14 @@ def main(argv=None):
     net.load_state_dict(ck["model"])
     net.to(dev).eval()
 
-    val, _ = val_split(args.bake)
+    val, _ = val_split(args.split_bake)
+    if args.bake != args.split_bake:
+        # A variant bake holds only some parts, so its own sorted glob would give a
+        # different split. Take the main split and look for the same files in the variant.
+        val = [p for p in (args.bake / f.relative_to(args.split_bake) for f in val) if p.exists()]
+    if args.intersect:
+        val = [p for p in val
+               if all((other / p.relative_to(args.bake)).exists() for other in args.intersect)]
     rng = np.random.default_rng(123)
     samples, stored_lab, canon_lab = [], [], []
     used = missing = 0
