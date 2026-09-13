@@ -511,6 +511,70 @@ moves with density (at 5° it falsely cuts 23.5% of within-face edges on the med
 at 15° it misses 2% of real boundaries), which is the threshold-tuning treadmill the
 learned proposer is meant to get off.
 
+## Result: locality decides which types are learnable
+
+First real training run (v1: 24,790 models, 512-facet patches, 30k steps, rare-type seed
+balancing). Membership: IoU 0.661 → **0.807**, precision **0.880**, recall **0.907**,
+against an all-positive baseline of 0.309. Type macro-accuracy 0.503 → **0.745**.
+
+But the per-class numbers split the vocabulary cleanly in two, and the split is not
+about data volume:
+
+| type | acc @ 16k | determined by |
+|---|---|---|
+| Plane | 0.96 | local differential geometry |
+| Sphere | 0.96 | " |
+| Cone | 0.81 | " |
+| Cylinder | 0.75 | " |
+| Torus | 0.72 | " |
+| BSpline | 0.65 | free-form catch-all |
+| Extrusion | 0.59 | direction is local, profile is not |
+| **Revolution** | **0.05** | **rotational symmetry about an axis — global** |
+
+Revolution never learns. Across eight evaluations spanning 16,000 steps it reads
+0.00, 0.00, 0.09, 0.02, 0.01, 0.00, 0.11, 0.05, while every other class climbs — and
+that is *with* `--balance-seeds` deliberately oversampling it.
+
+**This is not the scarcity problem we planned for.** The hypothesis is that a
+512-facet patch does not contain the information: Plane, Sphere, Cone, Cylinder and
+Torus are all fixed by local curvature, so a small neighbourhood suffices, whereas a
+surface of revolution is defined by a *global* property. Locally, a patch on a revolve
+looks like a generic curved patch — which is to say, like a B-spline. Extrusion sits
+between the two, consistent with its direction being locally visible while its profile
+is not.
+
+**If this holds, the synthesis pipeline would have been the wrong fix.** More Revolution
+examples cannot help if the distinguishing information is absent from the input. See the
+patch-size ablation below for the decisive test; do not build synthesis until it reports.
+
+Options if confirmed, in increasing cost: let Revolution route to the NURBS fallback the
+way `Other` does; enlarge the patch; add explicit global context (patch extent relative
+to the whole mesh, or a coarse second-scale summary) so the network can see beyond the
+k-ring.
+
+## Label noise: STEP translation splits periodic surfaces
+
+The bake's cross-check found 43 of 24,800 models (0.17%) where OCCT's face-type
+histogram disagrees with ABC's feature file. Characterised on a 4,000-model sample: 9
+disagreements (0.23%), and OCCT consistently sees **more** faces, not different ones.
+
+It is not a part-mismatch — feat and STEP part indices agree on 2,252 of 2,252 sampled
+models. The signature points at STEP translation splitting periodic surfaces at seams:
+on one model, Torus went 33 → 65 (nearly doubled — tori are doubly periodic), BSpline
+10 → 62, Cylinder 185 → 223. ABC's feature file describes the original CAD B-rep; the
+STEP is a translation of it.
+
+Measured directly on baked meshes: cross-face edges that are tangent-continuous AND
+share a surface type — the seam-split signature — are **1.0% of all cross-face edges**,
+and **66% of those are Torus**.
+
+Consequence: a logical cylinder split at its seam teaches the model that facets on the
+far half are *not* the same surface, when for `paintFrom`'s purposes they plainly are.
+That caps achievable membership IoU slightly. At 1% it is minor label noise rather than
+a structural problem, so it is recorded and deprioritised — but if membership plateaus
+short of expectations, merging adjacent same-type tangent faces before labelling is the
+first thing to try.
+
 ## Kill criterion
 
 The seeded framing gives a better one than 26/62, because `test/paint.mjs` already
