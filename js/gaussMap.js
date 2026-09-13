@@ -58,7 +58,60 @@ export function gather(triIndices, facets) {
     W[i] = facets.areas[t];
     wSum += facets.areas[t];
   }
-  return { n, P, N, W, wSum };
+
+  // Welded vertices of the same region, for POSITIONAL terms only.
+  //
+  // Normals stay on the facets. Averaging unit normals at a vertex and renormalising
+  // shortens the average, which on a cone inflates |n . axis| and therefore biases the
+  // half-angle upward -- the exact quantity the axis criterion depends on. So position
+  // comes from vertices (unbiased) and orientation from facets (exact): each term uses
+  // whichever sampling is correct for it.
+  //
+  // Each vertex carries a third of its incident in-region facet area, which answers
+  // meshCore's reason for preferring centroids in the first place: raw vertex counting
+  // over-weights densely tessellated regions, area weighting does not.
+  let VP = null, VW = null, vn = 0;
+  if (facets.positions) {
+    const acc = new Map();
+    for (let i = 0; i < n; i++) {
+      const t = idx[i];
+      for (let k = 0; k < 3; k++) {
+        const o = t * 9 + k * 3;
+        const x = facets.positions[o], y = facets.positions[o + 1], z = facets.positions[o + 2];
+        // EXACT coordinates, not a quantised key.
+        //
+        // buildAdjacency welds with an absolute quantum (1e4 by default), which is
+        // right for topology but wrong here: WatchStand's radii run 0.001-0.025 model
+        // units, so a 1e-4 quantum is several percent of a small feature and merges
+        // genuinely distinct vertices. Doing that collapsed a true r=0.003 cylinder
+        // to a fitted 0.053.
+        //
+        // Welding is only a de-duplication convenience for positional fitting, and the
+        // two errors are not symmetric: UNDER-welding just lists a vertex twice with
+        // half the weight each, which changes nothing, while OVER-welding moves points
+        // off the surface. So match exact coordinates and accept the occasional
+        // duplicate. A tessellator emits identical values for a shared vertex.
+        const key = x + '_' + y + '_' + z;
+        const e = acc.get(key);
+        if (e) e.w += W[i] / 3;
+        else acc.set(key, { x, y, z, w: W[i] / 3 });
+      }
+    }
+    vn = acc.size;
+    VP = new Float64Array(vn * 3);
+    VW = new Float64Array(vn);
+    let j = 0;
+    for (const e of acc.values()) {
+      VP[j * 3] = e.x; VP[j * 3 + 1] = e.y; VP[j * 3 + 2] = e.z; VW[j] = e.w; j++;
+    }
+  }
+  return { n, P, N, W, wSum, vn, VP, VW };
+}
+
+/** Positional sample set: welded vertices when available, facet centroids otherwise. */
+function positional(g) {
+  return g.vn ? { n: g.vn, P: g.VP, W: g.VW, wSum: g.VW.reduce((a, b) => a + b, 0) }
+              : { n: g.n, P: g.P, W: g.W, wSum: g.wSum };
 }
 
 /** Area-weighted mean of a flat vec3 array. */
@@ -90,13 +143,14 @@ function weightedCov3(A, W, n, wSum, mean) {
 // ── Positional fits ──────────────────────────────────────────────────────────
 
 function fitPlane(g) {
-  const { n, P, N, W, wSum } = g;
+  const { N } = g;
+  const { n, P, W, wSum } = positional(g);          // vertices: on the surface
   const origin = weightedMean3(P, W, n, wSum);
   const { vectors } = eigen3(weightedCov3(P, W, n, wSum, origin));
   let normal = vectors[0];
 
   // PCA sign is arbitrary; orient outward to agree with the facet normals.
-  const meanN = weightedMean3(N, W, n, wSum);
+  const meanN = weightedMean3(N, g.W, g.n, g.wSum);
   if (dot(normal, meanN) < 0) normal = [-normal[0], -normal[1], -normal[2]];
 
   let e = 0;
@@ -111,7 +165,7 @@ function fitPlane(g) {
 
 /** Axial coordinate + radial distance of every facet centroid about an axis. */
 function axialFrame(g, axis, origin) {
-  const { n, P } = g;
+  const { n, P } = g.P ? g : positional(g);
   const Z = new Float64Array(n);
   const R = new Float64Array(n);
   for (let i = 0; i < n; i++) {
@@ -127,7 +181,7 @@ function axialFrame(g, axis, origin) {
 }
 
 function fitCylinder(g, axis) {
-  const { n, P, W, wSum } = g;
+  const { n, P, W, wSum } = positional(g);          // vertices: on the surface
   const origin = weightedMean3(P, W, n, wSum);
   const xh = perp(axis);
   const yh = normalize(cross(axis, xh));
@@ -183,8 +237,9 @@ function fitCylinder(g, axis) {
 }
 
 export function fitCone(g, axis) {
-  const { n, P, N, W, wSum } = g;
-  const origin = weightedMean3(P, W, n, wSum);
+  const { n, N, W, wSum } = g;                      // facets: exact normals
+  const pos = positional(g);                        // vertices: on the surface
+  const origin = weightedMean3(pos.P, pos.W, pos.n, pos.wSum);
 
   // HALF-ANGLE FROM THE NORMALS, not from an R-vs-Z regression.
   //
@@ -213,18 +268,18 @@ export function fitCone(g, axis) {
   let ax = axis, apex = null, bestCost = Infinity;
   for (const s of [1, -1]) {
     const cand = [axis[0] * s, axis[1] * s, axis[2] * s];
-    const fr = axialFrame(g, cand, origin);
-    // On the cone, R = tan(a) * (Z - z0), so each facet votes for an apex position.
+    const fr = axialFrame(pos, cand, origin);
+    // On the cone, R = tan(a) * (Z - z0), so each sample votes for an apex position.
     let z0 = 0;
-    for (let i = 0; i < n; i++) z0 += W[i] * (fr.Z[i] - fr.R[i] / tanA);
-    z0 /= wSum;
+    for (let i = 0; i < pos.n; i++) z0 += pos.W[i] * (fr.Z[i] - fr.R[i] / tanA);
+    z0 /= pos.wSum;
     const ap = [origin[0] + z0 * cand[0], origin[1] + z0 * cand[1], origin[2] + z0 * cand[2]];
     const ca = Math.cos(halfAngle), sa = Math.sin(halfAngle);
-    const f2 = axialFrame(g, cand, ap);
+    const f2 = axialFrame(pos, cand, ap);
     let e = 0;
-    for (let i = 0; i < n; i++) {
+    for (let i = 0; i < pos.n; i++) {
       const d = f2.R[i] * ca - f2.Z[i] * sa;
-      e += W[i] * d * d;
+      e += pos.W[i] * d * d;
     }
     if (e < bestCost) { bestCost = e; ax = cand; apex = ap; }
   }
@@ -232,23 +287,26 @@ export function fitCone(g, axis) {
 
   // Perpendicular distance from (r, z) to the cone surface in the half-plane.
   const ca = Math.cos(halfAngle), sa = Math.sin(halfAngle);
-  const fr = axialFrame(g, ax, apex);
+  const fr = axialFrame(pos, ax, apex);
 
   // Region scale, so the angular term below lands in the same units as distance.
   let s2 = 0;
-  for (let i = 0; i < n; i++) {
-    const dx = P[i * 3] - origin[0], dy = P[i * 3 + 1] - origin[1], dz = P[i * 3 + 2] - origin[2];
-    s2 += W[i] * (dx * dx + dy * dy + dz * dz);
+  for (let i = 0; i < pos.n; i++) {
+    const dx = pos.P[i * 3] - origin[0], dy = pos.P[i * 3 + 1] - origin[1],
+          dz = pos.P[i * 3 + 2] - origin[2];
+    s2 += pos.W[i] * (dx * dx + dy * dy + dz * dz);
   }
-  const scale = Math.sqrt(s2 / wSum) || 1;
+  const scale = Math.sqrt(s2 / pos.wSum) || 1;
 
   // Positional error, plus how far each facet normal is from the cone's own
   // normal there. See SCORE vs RESIDUAL below for why both are needed.
   let e = 0, eN = 0, sd = 0, sdd = 0;
-  for (let i = 0; i < n; i++) {
+  for (let i = 0; i < pos.n; i++) {
     const d = fr.R[i] * ca - fr.Z[i] * sa;
-    e += W[i] * d * d;
-
+    e += pos.W[i] * d * d;
+  }
+  const { P } = g;
+  for (let i = 0; i < n; i++) {
     const px = P[i * 3] - apex[0], py = P[i * 3 + 1] - apex[1], pz = P[i * 3 + 2] - apex[2];
     const z = px * ax[0] + py * ax[1] + pz * ax[2];
     let rx = px - z * ax[0], ry = py - z * ax[1], rz = pz - z * ax[2];
@@ -282,7 +340,7 @@ export function fitCone(g, axis) {
     type: 'cone',
     params: { axis: ax, apex, halfAngle },
     residual: Math.sqrt(e / wSum),
-    score: Math.sqrt(e / wSum + scale * scale * (eN / wSum)),
+    score: Math.sqrt(e / pos.wSum + scale * scale * (eN / wSum)),
     // The axis is chosen by this alone — see above. Exact, and free of any weight.
     axisCost: varNA,
   };

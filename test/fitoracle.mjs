@@ -107,6 +107,20 @@ let pass = 0, total = 0;
       { axis: f.axis, axisPoint: f.location, radius: f.radius }));
     if (truth.size < 4) continue;
     if (n++ >= 6) break;
+
+    // The truth set is built by TOLERANCE, so it is only a clean sample of this
+    // surface while the tolerance is small against the feature. On WatchStand the
+    // band is 1.9e-3 while two cylinders have radii of 3.2e-3 and 5e-4 — ratios of
+    // 0.59 and 3.85, meaning "within tolerance of this cylinder" sweeps in most of
+    // the neighbourhood. Scoring a fitter against those sets measures the harness,
+    // not the fitter, so declare them unmeasurable instead of counting them wrong.
+    const ratio = tolD / f.radius;
+    if (ratio > 0.25) {
+      console.log(`  cyl    r=${f.radius.toFixed(3).padStart(8)}` +
+        `  ${String(truth.size).padStart(4)} facets  ->  ` +
+        `${'SKIPPED'.padStart(9)}   tolerance is ${(100 * ratio).toFixed(0)}% of the radius`);
+      continue;
+    }
     total++;
     const fit = fitRegionAs('cylinder', truth, facets);
     const got = fit.params ? fit.params.radius : NaN;
