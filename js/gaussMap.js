@@ -39,7 +39,7 @@ import {
 } from './meshCore.js';
 
 /** Gather area-weighted facet data for one region. */
-function gather(triIndices, facets) {
+export function gather(triIndices, facets) {
   const idx = [...triIndices];
   const n = idx.length;
   const P = new Float64Array(n * 3);   // centroids
@@ -182,55 +182,109 @@ function fitCylinder(g, axis) {
   };
 }
 
-function fitCone(g, axis) {
-  const { n, P, W, wSum } = g;
+export function fitCone(g, axis) {
+  const { n, P, N, W, wSum } = g;
   const origin = weightedMean3(P, W, n, wSum);
-  const { Z, R } = axialFrame(g, axis, origin);
 
-  // Weighted linear regression R = a*Z + b. The slope gives the half-angle
-  // directly and stays valid on partial patches, unlike deriving it from the
-  // mean normal (which only cancels the in-plane terms over a full revolution).
-  let sw = 0, sz = 0, sr = 0, szz = 0, szr = 0;
+  // HALF-ANGLE FROM THE NORMALS, not from an R-vs-Z regression.
+  //
+  // The regression needs the patch to span enough AXIAL extent for the radius to
+  // visibly change. A narrow annular band has almost constant R, so the slope comes
+  // out ~0 and the fit is rejected as "no taper" even when the patch is perfectly
+  // conical — which is exactly how a 59 deg cone with 30 facets, sitting on its true
+  // axis, was reported degenerate (test/fitoracle.mjs).
+  //
+  // Every outward normal of a cone makes the same angle with the axis:
+  // |n . a| = sin(halfAngle), independently of where the facet sits. That holds on
+  // any patch, however narrow, and needs no axial extent at all. It is the Gauss-map
+  // relation this module is named for, applied per facet rather than to the mean.
+  let sAbs = 0;
   for (let i = 0; i < n; i++) {
-    const w = W[i];
-    sw += w; sz += w * Z[i]; sr += w * R[i];
-    szz += w * Z[i] * Z[i]; szr += w * Z[i] * R[i];
+    sAbs += W[i] * Math.abs(N[i * 3] * axis[0] + N[i * 3 + 1] * axis[1] + N[i * 3 + 2] * axis[2]);
   }
-  const den = sw * szz - sz * sz;
-  if (Math.abs(den) < 1e-18) return null;
-  const a = (sw * szr - sz * sr) / den;
-  const bb = (sr - a * sz) / sw;
-  if (!isFinite(a) || Math.abs(a) < 1e-6) return null;   // degenerate -> cylinder
+  const halfAngle = Math.asin(Math.min(1, Math.max(0, sAbs / wSum)));
+  if (!(halfAngle > 1e-4) || halfAngle > 1.5533) return null;    // (0, 89 deg)
+  const tanA = Math.tan(halfAngle);
 
-  // Orient the axis so the radius grows along +axis, then place the apex at R=0.
-  let ax = axis, slope = a, inter = bb;
-  if (slope < 0) {
-    ax = [-axis[0], -axis[1], -axis[2]];
-    slope = -slope;
-    // Z flips sign, so R = a*Z + b becomes R = slope*Z' + b with Z' = -Z.
+  // Orientation is not determined by the half-angle, so place the apex for both
+  // senses of the axis and keep whichever explains the region better. Cheaper and
+  // more reliable than inferring it from a normal's sign, which flips on a mesh
+  // whose winding is inconsistent.
+  let ax = axis, apex = null, bestCost = Infinity;
+  for (const s of [1, -1]) {
+    const cand = [axis[0] * s, axis[1] * s, axis[2] * s];
+    const fr = axialFrame(g, cand, origin);
+    // On the cone, R = tan(a) * (Z - z0), so each facet votes for an apex position.
+    let z0 = 0;
+    for (let i = 0; i < n; i++) z0 += W[i] * (fr.Z[i] - fr.R[i] / tanA);
+    z0 /= wSum;
+    const ap = [origin[0] + z0 * cand[0], origin[1] + z0 * cand[1], origin[2] + z0 * cand[2]];
+    const ca = Math.cos(halfAngle), sa = Math.sin(halfAngle);
+    const f2 = axialFrame(g, cand, ap);
+    let e = 0;
+    for (let i = 0; i < n; i++) {
+      const d = f2.R[i] * ca - f2.Z[i] * sa;
+      e += W[i] * d * d;
+    }
+    if (e < bestCost) { bestCost = e; ax = cand; apex = ap; }
   }
-  const halfAngle = Math.atan(slope);
-  if (!(halfAngle > 1e-4) || halfAngle > 1.5533) return null;   // (0, 89 deg)
-
-  const z0 = -inter / a;                    // apex axial coord in ORIGINAL frame
-  const apex = [
-    origin[0] + z0 * axis[0],
-    origin[1] + z0 * axis[1],
-    origin[2] + z0 * axis[2],
-  ];
+  if (!apex || !isFinite(apex[0])) return null;
 
   // Perpendicular distance from (r, z) to the cone surface in the half-plane.
   const ca = Math.cos(halfAngle), sa = Math.sin(halfAngle);
   const fr = axialFrame(g, ax, apex);
-  let e = 0;
+
+  // Region scale, so the angular term below lands in the same units as distance.
+  let s2 = 0;
+  for (let i = 0; i < n; i++) {
+    const dx = P[i * 3] - origin[0], dy = P[i * 3 + 1] - origin[1], dz = P[i * 3 + 2] - origin[2];
+    s2 += W[i] * (dx * dx + dy * dy + dz * dz);
+  }
+  const scale = Math.sqrt(s2 / wSum) || 1;
+
+  // Positional error, plus how far each facet normal is from the cone's own
+  // normal there. See SCORE vs RESIDUAL below for why both are needed.
+  let e = 0, eN = 0, sd = 0, sdd = 0;
   for (let i = 0; i < n; i++) {
     const d = fr.R[i] * ca - fr.Z[i] * sa;
     e += W[i] * d * d;
+
+    const px = P[i * 3] - apex[0], py = P[i * 3 + 1] - apex[1], pz = P[i * 3 + 2] - apex[2];
+    const z = px * ax[0] + py * ax[1] + pz * ax[2];
+    let rx = px - z * ax[0], ry = py - z * ax[1], rz = pz - z * ax[2];
+    const rn = Math.sqrt(rx * rx + ry * ry + rz * rz);
+    if (rn > 1e-12) { rx /= rn; ry /= rn; rz /= rn; }
+    const nx = rx * ca - ax[0] * sa, ny = ry * ca - ax[1] * sa, nz = rz * ca - ax[2] * sa;
+    const c = N[i * 3] * nx + N[i * 3 + 1] * ny + N[i * 3 + 2] * nz;
+    eN += W[i] * Math.max(0, 1 - c * c);      // sin^2 of the disagreement angle
+
+    // n . axis, whose SPREAD is the real axis discriminator (see below).
+    const na = N[i * 3] * ax[0] + N[i * 3 + 1] * ax[1] + N[i * 3 + 2] * ax[2];
+    sd += W[i] * na;
+    sdd += W[i] * na * na;
   }
+
+  // THE AXIS TEST IS THE SPREAD OF (n . axis), NOT THE POSITIONAL RESIDUAL.
+  //
+  // On a cone's true axis every outward normal makes the same angle with it, so
+  // n . axis is CONSTANT — that is the Gauss-map relation this module is built on,
+  // and it is exact, not approximate. Tilt the axis and the value spreads out.
+  //
+  // Position alone cannot see this. A patch of a 45 deg cone is fitted almost as
+  // closely by a wrong axis with a compensating half-angle: measured on WatchStand,
+  // the positional residual at a 6.8 deg wrong axis was 8.4e-4 against 4.0e-3 at the
+  // TRUE one, so a position-only search actively prefers the wrong answer and walks
+  // away from a correct Gauss-map seed. Adding the variance term makes the true axis
+  // the minimum, which is what it should have been all along.
+  const varNA = Math.max(0, sdd / wSum - (sd / wSum) * (sd / wSum));
+
   return {
     type: 'cone',
     params: { axis: ax, apex, halfAngle },
     residual: Math.sqrt(e / wSum),
+    score: Math.sqrt(e / wSum + scale * scale * (eN / wSum)),
+    // The axis is chosen by this alone — see above. Exact, and free of any weight.
+    axisCost: varNA,
   };
 }
 
@@ -403,6 +457,19 @@ function axisSeeds(g) {
 }
 
 /**
+ * How good is an axis?
+ *
+ * `axisCost` when the fit supplies one — for cones that is the variance of
+ * (n . axis), which is EXACTLY zero on the true axis and needs no weighting against
+ * the positional term. Everything else falls back to the positional residual.
+ */
+function axisCost(f) {
+  if (!f) return Infinity;
+  if (isFinite(f.axisCost)) return f.axisCost;
+  return isFinite(f.score) ? f.score : f.residual;
+}
+
+/**
  * Walk an axis downhill on the positional residual by pattern search over the
  * unit sphere. Derivative-free, so it works identically for cylinders and cones
  * and cannot diverge — each step is accepted only if the residual improves.
@@ -411,6 +478,7 @@ function refineAxis(g, axis0, fitFn, maxIter = 80) {
   let axis = normalize(axis0);
   let best = fitFn(g, axis);
   let step = 0.2;                        // radians
+  const cost = axisCost;
 
   for (let it = 0; it < maxIter && step > 1e-7; it++) {
     const t1 = perp(axis);
@@ -425,7 +493,7 @@ function refineAxis(g, axis0, fitFn, maxIter = 80) {
         axis[2] + step * (du * t1[2] + dv * t2[2]),
       ]);
       const f = fitFn(g, cand);
-      if (f && isFinite(f.residual) && (!best || f.residual < best.residual)) {
+      if (f && isFinite(f.residual) && cost(f) < cost(best)) {
         best = f; axis = cand; improved = true;
       }
     }
@@ -469,10 +537,11 @@ export function fitRegionAs(type, triIndices, facets) {
 
   if (type === 'cylinder' || type === 'cone') {
     const fitFn = type === 'cylinder' ? fitCylinder : fitCone;
+    const cost = axisCost;
     let best = null;
     for (const seed of axisSeeds(g)) {
       const r = refineAxis(g, seed, fitFn);
-      if (r && isFinite(r.residual) && (!best || r.residual < best.residual)) best = r;
+      if (r && isFinite(r.residual) && cost(r) < cost(best)) best = r;
     }
     return done(best, type === 'cone'
       ? 'no apex: the region has no measurable taper (a cone with zero half-angle is a cylinder)'

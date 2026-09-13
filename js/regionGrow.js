@@ -47,30 +47,45 @@
  * ground-truth surface, and the fitters recover a 0.5 mm radius to 1e-6 when
  * handed the right facets.
  *
- * CORRECTION — that last sentence is true of CYLINDERS and false of CONES.
+ * CORRECTION — that last sentence WAS true of cylinders and false of cones.
  *
- * It was measured on a cylinder and generalised to every primitive. test/fitoracle.mjs
- * now measures it per type by handing fitRegionAs the EXACT ground-truth facet set:
+ * It had been measured on a cylinder and generalised. test/fitoracle.mjs now measures
+ * it per type by handing fitRegionAs the EXACT ground-truth facets. Cones originally
+ * scored 0 of 4 from perfect input — 22.34 deg for a 9.85, 86.00 for a 45, and a
+ * "no measurable taper" rejection for a 59 whose patch was exactly conical.
  *
- *     cone   9.85 deg, 477 facets  ->  22.34 deg   (err 12.48)
- *     cone   9.85 deg, 244 facets  ->  31.21 deg   (err 21.36)
- *     cone  59.00 deg,  30 facets  ->  DEGENERATE  ("no measurable taper")
- *     cone  45.00 deg,  50 facets  ->  86.00 deg   (err 41.00)
- *     cylinders ........................  4/6, the two misses being a 5% relative
- *                                         tolerance on sub-millimetre radii
+ * Root cause was in gaussMap.js, in two parts, both now fixed:
  *
- * 0 of 4 cones, from perfect input. So paint.mjs's "0/4 conical faces" is NOT a
- * segmentation result on this fixture — a perfect region fails too, and no proposer,
- * learned or otherwise, can lift it. fitCone is the blocking defect.
+ *   - The half-angle came from an R-vs-Z regression, which needs the patch to span
+ *     axial extent. A narrow annular band has near-constant R, so the slope read ~0
+ *     and a perfectly conical patch was rejected. It now comes from the normals,
+ *     |n . axis| = sin(halfAngle), which holds on any patch however narrow.
+ *   - The axis was refined by pattern search on the POSITIONAL residual, which has a
+ *     degenerate minimum: a wrong axis with a compensating half-angle fits a patch
+ *     more closely than the true one (measured 8.4e-4 against 4.0e-3 on the 45 deg
+ *     cone), so the search actively walked away from a correct Gauss-map seed. The
+ *     axis is now chosen by the variance of (n . axis), which is exactly zero on a
+ *     cone's true axis and needs no weighting against anything.
  *
- * Demonstrated by test/paintnet.mjs: a trained seed proposer produced 100% purity and
- * 100% recall on the 59 deg cone (30/30 facets) and 90.6%/96.0% on the 45 deg cone,
- * where the plain-BFS baseline scores 50%/20% and 0%/0% respectively. Cones recovered
- * still went 0/4 -> 0/4, because fitCone cannot use a correct region.
+ * After the fix, from perfect input: 9.66 / 8.49 / 58.96 / 44.99 deg against truths of
+ * 9.85 / 9.85 / 59.00 / 45.00 — 4 of 4.
  *
- * Consequence for ordering: fix fitCone before spending anything further on
- * segmentation. Re-run test/fitoracle.mjs first whenever a primitive underperforms —
- * if it fails there, the region feeding it is not the problem.
+ * Downstream, one click each (test/paint.mjs, test/paintnet.mjs):
+ *
+ *     baseline paintFrom ....................... 0/4 -> 1/4   (fitter fix alone)
+ *     paintFrom seeded by a learned proposer ... 1/4 -> 3/4
+ *
+ * The learned proposer is optional and lives behind js/seedNet.js; without it the
+ * converter behaves exactly as before. It helps by replacing the initial patch that
+ * the NEGATIVE RESULT above names — neighbourhood()'s plain adjacency BFS.
+ *
+ * The remaining failure is the 45 deg cone: the proposed region is 90.6% pure and
+ * 96.0% complete, yet the fit lands at 15.42 deg, while the same fitter given the
+ * exact facets returns 44.99. Five foreign facets out of 53 are enough to wreck it, so
+ * the next weakness is outlier sensitivity in the fit, not the region.
+ *
+ * Method note worth keeping: run test/fitoracle.mjs before optimising any proposer.
+ * If a primitive cannot be recovered from perfect input, nothing feeding it can help.
  */
 
 import { fitRegionAs } from './gaussMap.js';

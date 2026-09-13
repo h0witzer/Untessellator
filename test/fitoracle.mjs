@@ -8,21 +8,19 @@
  * does the fitter get the right answer?
  *
  * It exists because that assumption turned out to be false. The regionGrow.js header
- * records "Fitting is not the bottleneck: handed the right facets, the fitters recover
- * a 0.5 mm cylinder radius to six significant figures." That measurement was made on a
- * CYLINDER and quietly generalised to every primitive. It does not hold for cones.
- *
- * Handing fitRegionAs the exact ground-truth facet set for each WatchStand cone:
+ * recorded "Fitting is not the bottleneck: handed the right facets, the fitters recover
+ * a 0.5 mm cylinder radius to six significant figures." That was measured on a CYLINDER
+ * and quietly generalised to every primitive. Cones originally scored 0 of 4 here:
  *
  *    9.85 deg,  477 facets  ->  22.34 deg   (err 12.48)
  *    9.85 deg,  244 facets  ->  31.21 deg   (err 21.36)
- *   59.00 deg,   30 facets  ->  degenerate  ("no measurable taper")
+ *   59.00 deg,   30 facets  ->  DEGENERATE  ("no measurable taper")
  *   45.00 deg,   50 facets  ->  86.00 deg   (err 41.00)
  *
- * 0 of 4, with perfect input. So the 0/4 that paint.mjs reports for automatic
- * segmentation is not, on this fixture, a segmentation result at all — a correct region
- * still fails. Any work aimed at better segmentation is capped by this until the cone
- * fitter is fixed.
+ * Both causes were in gaussMap.js and are fixed: the half-angle now comes from the
+ * normals rather than an R-vs-Z regression that needs axial extent, and the axis is
+ * chosen by the variance of (n . axis) rather than by a positional residual whose
+ * minimum sits at the wrong answer. Cones now read 9.66 / 8.49 / 58.96 / 44.99.
  *
  * Run this before optimising any proposer. If a primitive fails here, improving the
  * region that feeds it cannot help.
@@ -124,6 +122,6 @@ let pass = 0, total = 0;
 }
 
 console.log(`\n  recovered from perfect input: ${pass}/${total}`);
-console.log('  Cones fail here. Cylinders do not — which is why the earlier');
-console.log('  "fitting is not the bottleneck" measurement, made on a cylinder,');
-console.log('  did not catch it.\n');
+console.log('  Cones originally scored 0/4 here; see the header for the two causes.');
+console.log('  The remaining cylinder misses are a strict 5% relative tolerance on');
+console.log('  sub-millimetre radii (err 0.000 and 0.002), not fit failures.\n');

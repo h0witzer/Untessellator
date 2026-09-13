@@ -693,7 +693,8 @@ The model does the job it was built for. On the 45° cone the BFS baseline captu
 Cone at 87% and 100% confidence on the two faces where a cone is well defined. Mean
 2.7 ms per call including the k-ring BFS, feature build and inference.
 
-**Cones recovered: 0/4 → 0/4.** The criterion says stop, so we stop.
+**Cones recovered: 0/4 → 0/4** on the first run. Which turned out not to be a statement
+about the model at all — see below.
 
 But the diagnosis moved, and `test/fitoracle.mjs` was written to pin it down — handing
 `fitRegionAs` the *exact* ground-truth facets:
@@ -723,6 +724,45 @@ Two further observations from the same run:
 **Revised ordering.** Fix `fitCone`, then re-run `fitoracle.mjs`, then re-evaluate the
 model. Until a primitive passes the fit-from-truth oracle, no proposer can raise its
 score — which is a much cheaper thing to know before optimising a network than after.
+
+### fitCone fixed — criterion now MET
+
+Two defects in `gaussMap.js`, both structural rather than tuning:
+
+1. **Half-angle from an R-vs-Z regression.** That needs the patch to span axial extent.
+   A narrow annular band has near-constant R, so the slope read ~0 and a perfectly
+   conical 30-facet patch on its true axis was rejected as "no measurable taper". It now
+   comes from the normals: `|n · axis| = sin(halfAngle)` holds on any patch, however
+   narrow. This is the Gauss-map relation the module is named for, applied per facet.
+2. **Axis refined on the positional residual.** That objective has a degenerate minimum —
+   a wrong axis with a compensating half-angle fits a patch *better* than the true one
+   (measured 8.4e-4 against 4.0e-3 on the 45° cone), so the search actively walked away
+   from a correct Gauss-map seed. The axis is now chosen by the variance of `n · axis`,
+   which is **exactly zero** on a cone's true axis.
+
+The second fix matters methodologically too. A weighted blend of positional and normal
+terms needed a trust constant of ~256 to reach 4/4 — tuned on four cones, i.e. fitted to
+the fixture. Using the exact criterion instead scored **better** with no constant at all.
+
+Results, from perfect input: **4/4** (9.66 / 8.49 / 58.96 / 44.99 against 9.85 / 9.85 /
+59.00 / 45.00). And one click each:
+
+| | cones recovered |
+|---|---|
+| baseline `paintFrom`, before the fix | 0/4 |
+| baseline `paintFrom`, after the fix | 1/4 |
+| **`paintFrom` seeded by the model** | **3/4** |
+
+Per-cone error, baseline → model-seeded: 8.04° → **0.03°**, 61.67° → **0.12°**,
+0.73° → **0.03°**, and 40.34° → 29.58° (the one remaining failure).
+
+**The criterion is met.** The model earns its place — but note it was never the thing
+that was broken, and the fitter fix alone accounts for the first quarter of the gain.
+
+**Next weakness, measured:** on the 45° cone the proposed region is 90.6% pure and 96.0%
+complete, yet fits to 15.42° where the exact facets give 44.99°. Five foreign facets out
+of 53 wreck it. The next work is outlier robustness in the fit — not the region, and not
+the model.
 
 ---
 
