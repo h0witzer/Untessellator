@@ -16,6 +16,9 @@ improvements. Two details are load-bearing and must not be "fixed":
   - Only edges shared by EXACTLY TWO triangles produce adjacency. Boundary edges and
     non-manifold edges (3+ triangles) contribute nothing, so facets across them are not
     neighbours at all.
+  - Zero-area facets are DROPPED before the edge map is built, not merely skipped
+    later. A sliver with vertices (A, B, B) contributes the edge A-B twice, so an
+    ordinary 2-manifold edge reads as 4-manifold and the rule above then rejects it.
 
 `test_meshcore.py` checks this port against the JS by running both over the same mesh
 and comparing facet arrays and the full adjacency structure.
@@ -58,6 +61,11 @@ def build_facets(positions: np.ndarray) -> dict:
         "centroids": p.mean(axis=1),
         "normals": normals,
         "areas": areas,
+        # Zero-area facets have no meaningful normal and are not surface. Real STLs
+        # carry them - 3DBenchy ships 563 of 225,706 - and leaving them in inflates
+        # edge multiplicity, because a sliver with vertices (A, B, B) contributes the
+        # edge A-B twice and an ordinary 2-manifold edge then reads as 4-manifold.
+        "degenerate": ~ok,
     }
 
 
@@ -72,6 +80,9 @@ def build_adjacency(positions: np.ndarray, facets: dict, quant: float = QUANT):
     if ntri == 0:
         return np.zeros((0, 2), np.int32), np.zeros(0, np.float64)
 
+    # Degenerate facets are excluded, not merely ignored - see build_facets.
+    live = ~facets["degenerate"] if "degenerate" in facets else np.ones(ntri, bool)
+
     # Weld: quantise every vertex, then map identical integer triples to one id.
     q = _jsround(p.reshape(-1, 3) * quant).astype(np.int64)
     _, vid = np.unique(q, axis=0, return_inverse=True)
@@ -84,6 +95,11 @@ def build_adjacency(positions: np.ndarray, facets: dict, quant: float = QUANT):
     edges = np.concatenate([e0, e1, e2], axis=0)
     edges = np.sort(edges, axis=1)
     owner = np.tile(np.arange(ntri, dtype=np.int64), 3)
+    keep_live = np.tile(live, 3)
+    edges = edges[keep_live]
+    owner = owner[keep_live]
+    if edges.shape[0] == 0:
+        return np.zeros((0, 2), np.int32), np.zeros(0, np.float64)
 
     order = np.lexsort((edges[:, 1], edges[:, 0]))
     edges = edges[order]

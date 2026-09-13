@@ -125,6 +125,7 @@ export function buildFacets(positions) {
   const centroids = new Float64Array(count * 3);
   const normals = new Float64Array(count * 3);
   const areas = new Float64Array(count);
+  const degenerate = new Uint8Array(count);
 
   for (let t = 0; t < count; t++) {
     const o = t * 9;
@@ -140,7 +141,21 @@ export function buildFacets(positions) {
 
     const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
     areas[t] = 0.5 * len;
-    if (len > 1e-20) {
+    // DEGENERATE FACET: zero area, so it has no meaningful normal and is not surface.
+    //
+    // Real STLs carry these. 3DBenchy - the most-printed model there is - ships 563 of
+    // them out of 225,706, of which 552 have two literally identical vertices. They
+    // are invisible: zero area means nothing to see. But they are not harmless. A
+    // sliver with vertices (A, B, B) contributes the edge A-B TWICE, so an ordinary
+    // 2-manifold edge is counted as 4-manifold, buildAdjacency's "exactly two owners"
+    // test rejects it, and the traversal walls off there. On Benchy that split the
+    // mesh into 300 components under flood fill - which is what a bucket fill hitting
+    // an invisible seam and refusing to continue actually is.
+    //
+    // They also carry a ZERO normal, which would poison any fit that averaged it in.
+    if (!(len > 1e-20)) {
+      degenerate[t] = 1;
+    } else {
       normals[t * 3]     = nx / len;
       normals[t * 3 + 1] = ny / len;
       normals[t * 3 + 2] = nz / len;
@@ -157,7 +172,7 @@ export function buildFacets(positions) {
   // at coarse tessellation and 0.06% at fine. That is a density-dependent BIAS, not
   // noise, and it does not average out -- fitting the tangent-fillet wall to
   // centroids gives r=19.990482 for a true 20, and to vertices gives 20.000000.
-  return { count, centroids, normals, areas, positions };
+  return { count, centroids, normals, areas, positions, degenerate };
 }
 
 /**
@@ -174,6 +189,9 @@ export function buildAdjacency(positions, facets, quant = 1e4) {
 
   const edgeMap = new Map();
   for (let t = 0; t < facets.count; t++) {
+    // Degenerate facets are excluded, not merely ignored: leaving them in inflates
+    // edge multiplicity and makes real edges look non-manifold. See buildFacets.
+    if (facets.degenerate && facets.degenerate[t]) continue;
     const o = t * 9;
     const k = [
       key(positions[o],     positions[o + 1], positions[o + 2]),
