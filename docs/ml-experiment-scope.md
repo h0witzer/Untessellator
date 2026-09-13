@@ -654,6 +654,46 @@ a structural problem, so it is recorded and deprioritised — but if membership 
 short of expectations, merging adjacent same-type tangent faces before labelling is the
 first thing to try.
 
+## Validation plan: the whole corpus, not a showcase
+
+The showcase set is a smoke test and must not be mistaken for validation. Fourteen
+hand-picked models are a broader basis than one WatchStand, but they are still
+hand-picked, and picked by us — the same selection bias, one order of magnitude up.
+
+Proving the tool is useful means **reconstructing a substantial portion of ABC from mesh
+input and scoring against the STEP each model came from**. Everything needed is already
+on disk from Stage 1:
+
+- 24,790 baked models with per-facet `face_id` and `face_type`, at three densities
+- 200,000 STEP files, so ground-truth surfaces can be parsed for any of them
+- `test/oracle.mjs` and `test/fitoracle.mjs` already score faces against exact surfaces
+
+The benchmark is: for each model, run the full pipeline on the mesh alone, then report
+faces recovered out of the oracle ceiling, per surface type, per tessellation density.
+That yields a distribution rather than an anecdote, and it makes regressions visible —
+today a change that helps WatchStand and breaks a thousand other parts looks like
+progress.
+
+Two things to build first, since the harnesses currently assume one fixture: truth-set
+construction that refuses cases where the tolerance is large against the feature (as
+`fitoracle.mjs` now does), and per-type reporting so a gain on planes cannot mask a loss
+on cones.
+
+### First showcase run — findings
+
+- **Torus classification works.** 40/40 on an exact torus at medium and fine density,
+  39-40/40 on the displaced "lumpy" variants. This is the class ParSeNet and HPNet do
+  not support at all, and the one the vocabulary decision was made for.
+- **There is no torus fitter.** `fitRegionAs` covers plane, cylinder, cone, sphere and
+  a NURBS fallback. So the model identifies a torus correctly and the analytic side has
+  nowhere to send it: 0 of 40 fits on the exact tori. Highest-value gap found.
+- **Density sensitivity.** Seeded coverage collapses from 44.4% to 0.1% between coarse
+  and fine tessellations of the same torus. A 36,864-facet single surface is denser
+  per-face than anything in ABC, so this is probably out-of-distribution — but the
+  density ladder was meant to train exactly this out, and did not.
+- **3DBenchy fits best of the whole set**: mean relative residual 2.5e-2, with a type
+  spread appropriate to a hull. Consistent with it being real CAD geometry.
+
 ## Kill criterion
 
 The seeded framing gives a better one than 26/62, because `test/paint.mjs` already
