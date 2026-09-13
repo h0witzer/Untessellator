@@ -42,6 +42,14 @@ OUTPUT
 Every part runs in an isolated worker (isolated_pool.py): NurbsConvert segfaults on
 some shapes, and gmsh can stall.
 
+FAILURES ARE REMEMBERED. Every part that crashes, times out or errors is appended to
+<out>/_failures.jsonl, and later runs skip it unless --retry-failed is given. Without
+this, a restarted bake re-tries every past failure first. Parts that were written are
+skipped, and the task order is deterministic, so the known crashers sit at the front of
+the queue. A restarted gmsh training bake spent more than 10 minutes on them and wrote
+nothing. --skip-gaps covers runs made before the log existed: it treats every part
+missing ahead of the last one written as a past failure.
+
 Usage:
     python mesher_bake.py --variant gmsh --split val --out D:/abc-data/bake_gmsh --jobs 10
 """
@@ -49,6 +57,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -265,6 +274,10 @@ def main(argv=None):
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 4) - 4))
     ap.add_argument("--timeout", type=float, default=300.0)
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--retry-failed", action="store_true",
+                    help="retry parts listed in <out>/_failures.jsonl instead of skipping them")
+    ap.add_argument("--skip-gaps", action="store_true",
+                    help="treat parts missing ahead of the last one written as past failures")
     args = ap.parse_args(argv)
 
     val, train = val_split(args.bake)
@@ -281,11 +294,40 @@ def main(argv=None):
             break
     print(f"{args.variant}: {len(tasks):,} parts from the {args.split} split -> {args.out}", flush=True)
 
+    failures_log = args.out / "_failures.jsonl"
+    known = set()
+    if failures_log.exists() and not args.retry_failed:
+        for line in failures_log.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                r = json.loads(line)
+                known.add((r["model_id"], r["part"]))
+    gaps = []
+    if args.skip_gaps:
+        written = [i for i, t in enumerate(tasks) if Path(t[4]).exists()]
+        if written:
+            gaps = [t for t in tasks[:max(written)] if not Path(t[4]).exists()
+                    and (t[1], t[2]) not in known]
+    args.out.mkdir(parents=True, exist_ok=True)
+    if gaps:
+        with failures_log.open("a", encoding="utf-8") as fh:
+            for t in gaps:
+                fh.write(json.dumps({"model_id": t[1], "part": t[2], "status": "gap"}) + "\n")
+        known |= {(t[1], t[2]) for t in gaps}
+    if known:
+        before = len(tasks)
+        tasks = [t for t in tasks if (t[1], t[2]) not in known]
+        print(f"  skipping {before - len(tasks):,} known failures ({len(gaps):,} inferred from gaps); "
+              f"{len(tasks):,} to run", flush=True)
+
     t0 = time.time()
     status, tris = Counter(), 0
     fail = lambda task, st: {"model_id": task[1], "part": task[2], "status": st, "tris": 0}
     for i, rec in enumerate(run_isolated(bake_variant, tasks, args.jobs, args.timeout, fail), 1):
         status[rec["status"]] += 1
+        if rec["status"] != "exists" and not rec["status"].startswith("ok"):
+            with failures_log.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"model_id": rec["model_id"], "part": rec["part"],
+                                     "status": rec["status"]}) + "\n")
         tris += rec["tris"]
         if i % 250 == 0:
             print(f"  {i:,}/{len(tasks):,}  {i / (time.time() - t0):.1f}/s", flush=True)
