@@ -584,8 +584,10 @@ i.e. spline patches that are locally conical or planar. Again arguably correct a
 
 **Consequences:**
 
-1. **Do not build the Revolution synthesis pipeline.** Right conclusion, wrong original
-   reason. More examples cannot teach a distinction that is not in the geometry.
+1. ~~**Do not build the Revolution synthesis pipeline.**~~ **Reversed — see "Canonical
+   labels" below.** The provenance diagnosis was right, but the conclusion drawn from it
+   was not: the fix is to *relabel* the faces that are primitives in disguise, after which
+   the genuine revolves that remain are scarce and synthesis is worth doing after all.
 2. **Label-match accuracy is the wrong metric for type.** Score by whether the predicted
    primitive *fits within tolerance* — which `oracle.mjs` already does, since it tests
    facets against real surfaces rather than comparing enum values.
@@ -803,6 +805,211 @@ that was broken, and the fitter fix alone accounts for the first quarter of the 
 complete, yet fits to 15.42° where the exact facets give 44.99°. Five foreign facets out
 of 53 wreck it. The next work is outlier robustness in the fit — not the region, and not
 the model.
+
+## Canonical labels: fix the noise instead of accepting it
+
+The provenance finding above treated `Revolution` as unrecoverable. It is recoverable,
+just not by the network: the label can be corrected at the source. `canonical.py` fits
+every face's exact B-rep samples against Plane, Sphere, Cylinder, Cone and Torus and
+relabels it as the first primitive whose residual is below 1e-6 of its extent. The label
+becomes **the simplest exact surface**, which is what the converter wants anyway.
+
+**Where the threshold comes from.** Residuals on stored-`Revolution` faces are bimodal —
+a cluster at machine precision and a cluster far above — so the cut is unambiguous
+there. `Extrusion` and `BSpline` residuals are continuous with no gap, so those are
+relabelled only at the strict threshold. Fitter precision floors were fixed first (cone
+all-axis search, torus Levenberg–Marquardt), since a fitter that misses exact primitives
+would leave noise in place and call it signal.
+
+**Validation split, 1,999 parts, zero face-order misalignments** (`relabel_sidecar.py`
+checks every density). Largest moves: BSpline→Torus 1,168, Revolution→Cylinder 511,
+BSpline→Plane 410, BSpline→Cylinder 220, Extrusion→Cylinder 202, Revolution→Torus 175,
+Revolution→Cone 64. Roughly two thirds of `Revolution` faces are primitives.
+
+### The existing model, re-scored — no retraining
+
+`rescore.py`, v2ctrl checkpoint, identical 33,377 patches, per-class accuracy:
+
+| class | stored labels | canonical labels |
+|---|---|---|
+| Plane | 0.964 | 0.964 |
+| Cylinder | 0.881 | 0.876 |
+| Torus | 0.833 | **0.743** |
+| Revolution | 0.164 | **0.240** |
+| BSpline | 0.651 | 0.664 |
+| macro | 0.736 | 0.734 |
+
+Of stored-Revolution seeds relabelled to a primitive, the model already predicted that
+primitive 55.7% of the time — it was being marked wrong for right answers. Torus drops
+because 1,168 faces stored as BSpline are tori, and the model was trained to call them
+BSpline. Macro is flat, so **the gain is only available by retraining on canonical
+labels**; `train.py --relabel` does that, and skips any real file without a sidecar
+rather than mixing label schemes.
+
+**Membership baseline for every later comparison.** Membership does not depend on type
+labels, so it is the one number directly comparable between checkpoints trained on stored,
+canonical or synthetic-mixed labels. v2ctrl on the same 33,377 patches, pooled IoU
+**0.7975**; by canonical seed class Plane 0.834, Cylinder 0.768, Cone 0.783, Sphere 0.918,
+Torus 0.866, **Revolution 0.624**, Extrusion 0.615, BSpline 0.625, Other 0.559.
+
+### Retrained on canonical labels (v3canon): no change — and why
+
+Same settings as v2ctrl (60k steps, curvature zeroed), labels from the sidecars. Scored
+on the identical 33,377 patches:
+
+| | v2ctrl | v3canon |
+|---|---|---|
+| membership IoU | 0.7975 | 0.7970 |
+| macro type accuracy, canonical labels | 0.7339 | 0.7375 |
+| Revolution (canonical) | 0.240 | 0.240 |
+| Torus (canonical) | 0.743 | 0.740 |
+| BSpline (canonical) | 0.664 | 0.687 |
+
+Split by stored → canonical pair, the telling row is **BSpline → Torus (507 seeds): the
+model predicts Torus 0.2% of the time before retraining and 0.4% after**, while calling
+the same faces BSpline fell from 62% to 45% — so the corrected labels did reach training,
+and the model still could not act on them. Native tori score 83%. These faces are exact
+tori; if geometry decided the type, they would score like native ones.
+
+The hypothesis this points to is that the type head reads OCCT's *triangulation pattern*
+— a B-spline surface is meshed on its knot grid, an analytic torus on its own
+parameterisation — rather than the surface. Tested directly below.
+
+### Control: same geometry, two tessellations
+
+150 validation parts with native torus faces. Each whole shape is converted with
+`BRepBuilderAPI_NurbsConvert` — identical geometry, every face now stored as a B-spline —
+and both versions are tessellated at the same density. Seeds on the same torus faces
+(486 in each version). The conversion throws on 17 of 270 candidates and segfaults on 2,
+so each part is meshed in an isolated worker process.
+
+| checkpoint | mesh | predicted Torus | membership IoU |
+|---|---|---|---|
+| v2ctrl | native torus | **83.5%** | 0.866 |
+| v2ctrl | NURBS-converted | **2.7%** (BSpline 88%) | 0.730 |
+| v3canon | native torus | 84.2% | 0.863 |
+| v3canon | NURBS-converted | 2.7% (BSpline 89%) | 0.728 |
+
+Triangles per torus face are similar (413 native, 353 converted), so this is not a
+density effect. **Identical geometry gets a different surface type, and a worse
+segmentation, depending only on which mesher produced it.** Retraining on corrected labels
+cannot fix that, which is why v3canon matched v2ctrl.
+
+Which inputs carry the cue — one feature group zeroed at inference, same patches:
+
+| zeroed | v2ctrl Torus %: native / NURBS | v3canon Torus %: native / NURBS |
+|---|---|---|
+| nothing | 83.5 / 2.7 | 84.2 / 2.7 |
+| **log_area** | **87.4 / 42.0** | **89.9 / 48.4** |
+| ring | 12.1 / 3.7 | 12.6 / 1.6 |
+| log_area + ring | 1.4 / 0.2 | 1.2 / 2.1 |
+| position + dist | 6.0 / 0.2 | 8.8 / 0.2 |
+| normal + dot | 0.0 / 0.0 | 0.0 / 0.0 |
+
+Zeroing `log_area` — each facet's area relative to the patch mean — lifts Torus on the
+converted mesh from 2.7% to 42–48% while native stays near 88%. Relative triangle size
+is where the mesher's pattern lives: a knot-grid mesh has a different area distribution
+from an analytic surface's. Positions and normals carry the geometry and cannot be
+removed without collapsing everything.
+
+**Consequences.**
+
+1. Type accuracy measured on OCCT meshes of ABC is partly accuracy at recognising OCCT's
+   meshing of each stored type. A user's STL from any other exporter is out of
+   distribution by construction, for type and for membership.
+2. This is the strongest argument yet for the tessellation-diversity augmentation (other
+   meshers, decimation, remeshing): not scan realism, but removing a shortcut the model
+   demonstrably takes on clean CAD meshes.
+3. `BRepBuilderAPI_NurbsConvert` is itself a free augmentation — same geometry, same
+   canonical label, a different mesh pattern — available for every training part.
+4. `log_area` should be dropped or heavily augmented. Zeroing it at inference costs
+   membership (0.866 → 0.678) only because the model was trained to use it.
+
+### Synthesis, and the statistic that has to match
+
+With disguised primitives removed, genuine revolves are 60 seeds in the 2,000-part
+validation sample. `synth_bake.py` generates them: B-spline, ellipse, hyperbola and
+parabola profiles; full and partial revolves; booleans with boxes, holes, tilted second
+revolves; each face audited by `canonical.py` (99.6% genuine). Synthetic parts join
+**training only** (`train.py --synth`); validation stays real.
+
+The check that matters is not realism by eye but the seed's view. For a Revolution seed,
+the fraction of its 512-facet patch on the same face (`neighbourhood_stats.py`):
+
+| | mean | p10 | p50 | p90 |
+|---|---|---|---|---|
+| real ABC, canonical (539 seeds, 90 parts) | 0.496 | 0.09 | 0.46 | 0.98 |
+| synthetic, first cut | 0.840 | 0.71 | 0.85 | 1.00 |
+| + plates, buried shafts, clusters | 0.801 | 0.64 | 0.82 | — |
+| + curved neighbours (fillets, holes, bosses) | 0.711 | 0.35 | 0.76 | 0.96 |
+| + scene weights fitted to real, and a `tiny` scene (measured, 359 parts) | 0.563 | 0.28 | 0.55 | 0.88 |
+| real ABC, whole validation split (269 seeds) | 0.504 | 0.11 | 0.47 | 0.98 |
+
+A model trained on the first cut could learn "Revolution seed ⇒ nearly everything
+belongs", which real parts punish.
+
+**Why adding plates did nothing.** The statistic is a *facet* fraction, and tessellation
+deflection scales with the part, so a large plate is a handful of triangles while a
+curved revolve gets hundreds. A small knob on a plate held **87.4% of the triangles and
+3.6% of the area**. Only curved neighbours dilute a revolve's facet share, as real
+parts' fillets and holes do. The remaining gap is the low tail: the smallest real
+revolve faces carry about 12 triangles, so a `tiny` scene (a revolve a tenth the part's
+size) was added and weighted up.
+
+**It did not work, and neither did the next guess.** A tiny revolve still gets 100+
+triangles, because angular deflection sets a minimum segment count around any circle
+(tiny-scene mean 0.55, 1.1% of seeds under 0.2). Turned parts with a narrow curved band
+moved the statistic the wrong way (mean 0.77): OCCT subdivides a curved profile along its
+length and a straight one not at all, so revolve faces averaged 1,695 triangles against 96
+per cylinder face. With many segments and gentle bands, every *other* class matched real
+(Plane 0.08 vs 0.11, Cylinder 0.09 vs 0.10, Cone 0.17 vs 0.16, Torus 0.52 vs 0.47), but
+Revolution stayed at 0.67.
+
+**What the low tail actually is.** Characterising real Revolution seeds by rate: under 0.2
+they sit on small faces (median 84 triangles) in complex parts (median 100 faces),
+surrounded by Torus 30%, Plane 21%, Cylinder 19%. Fitting every real genuine-Revolution
+face against the primitives explains why those faces are small:
+
+| best primitive residual / extent | faces | triangles p50 | rate mean | nearest |
+|---|---|---|---|---|
+| 1e-6 – 1e-5 | 20 | 311 | 0.30 | Torus 20 |
+| 1e-5 – 1e-4 | 15 | 84 | 0.14 | Torus 12 |
+| 1e-4 – 1e-3 | 45 | 36 | 0.16 | Torus 35, Cylinder 10 |
+| 1e-3 – 1e-2 | 66 | 263 | 0.36 | Torus 61 |
+| > 1e-2 | 78 | 474 | 0.57 | Torus 62 |
+
+**36% of real "genuine" revolves are within 1e-3 of a torus** — fillets approximated as a
+revolved B-spline, tessellated like the fillet they approximate. They are the low tail;
+clearly curved revolves (median residual 4.3e-2) are the high one. No weighting of
+isolated-revolve scenes could have produced them. The generator now writes half of its
+rounded lathe shoulders as a B-spline through a perturbed arc, 1e-4 to 1e-2 off.
+
+That closed the gap. Turned parts with near-torus shoulders, 120 parts, Revolution seeds:
+mean **0.494** (real 0.504), p10 0.18 (0.11), p50 0.49 (0.47), p90 0.80 (0.98), with Plane,
+Cylinder, Cone and Torus also within a few hundredths of real. All 383 revolve faces are
+genuine at 1e-6; built directly, their residuals are 33% 1e-5–1e-4, 43% 1e-4–1e-3, 16%
+1e-3–1e-2 and 8% beyond, against real's heavier far tail (29% and 35%), which the
+clearly curved scenes supply.
+
+**The full training set.** Turned parts at ~60% of draws, the other scenes kept for
+variety. Predicted from per-scene rates: mean 0.516. Measured on the 4,000-part bake
+(3,993 built, 10,458 genuine revolve faces, 4.9 GB):
+
+| Revolution seeds | mean | p10 | p50 | p90 |
+|---|---|---|---|---|
+| real ABC, validation split | 0.504 | 0.11 | 0.47 | 0.98 |
+| synthetic training set | 0.524 | 0.21 | 0.50 | 0.83 |
+
+Plane, Cylinder, Cone and Torus are within 0.03 of real on the mean. The tails stay
+narrower than real at both ends; no scene weighting moved them (p10 0.21–0.24 and p90
+0.82–0.86 at every lathe share tried), so closing them would need new scene types rather
+than a new mix. Synthetic BSpline faces (0.49 vs 0.24) are fillet by-products, 438 seeds
+against thousands of real ones, and not what the set is for.
+
+This also raises a labelling question the 1e-6 threshold does not answer: a surface
+within 1e-4 of a torus is, for a converter working to a tolerance, a torus. Whether such
+faces should be labelled `Torus` depends on the export tolerance the tool promises, and is
+a product decision rather than a measurement.
 
 ---
 

@@ -96,15 +96,21 @@ def main(argv=None):
     print(f"checkpoint {args.ckpt}  (step {ck.get('step')})")
     print(f"validation models used {used:,}   without sidecar {missing:,}   patches {len(samples):,}\n")
 
-    preds = []
+    preds, tps, fps, fns = [], [], [], []
     with torch.no_grad():
         for i in range(0, len(samples), 256):
-            x, _, m, _ = collate(samples[i:i + 256], args.max_facets)
+            x, y, m, _ = collate(samples[i:i + 256], args.max_facets)
             if args.zero_curvature:
                 x[:, :, 10:12] = 0.0
-            _, tl = net(torch.from_numpy(x).to(dev), torch.from_numpy(m).to(dev))
+            sl, tl = net(torch.from_numpy(x).to(dev), torch.from_numpy(m).to(dev))
             preds.append(tl.float().argmax(1).cpu().numpy())
+            member = (sl.float().sigmoid().cpu().numpy() > 0.5) & (m > 0)
+            truth = (y > 0.5) & (m > 0)
+            tps.append((member & truth).sum(1))
+            fps.append((member & ~truth).sum(1))
+            fns.append((~member & truth).sum(1))
     pred = np.concatenate(preds)
+    TP, FP, FN = (np.concatenate(a).astype(np.float64) for a in (tps, fps, fns))
     S = np.array(stored_lab)
     C = np.array(canon_lab)
 
@@ -137,6 +143,14 @@ def main(argv=None):
         agree = float((pred[moved] == C[moved]).mean())
         print(f"  of the stored-Revolution seeds relabeled to a primitive (n={int(moved.sum())}), "
               f"the model already predicted that primitive {100 * agree:.1f}% of the time")
+
+    # Membership does not depend on type labels, so this is the one number directly
+    # comparable across checkpoints trained on stored, canonical or synthetic-mixed labels.
+    # Pooled IoU (sums over patches) per canonical seed class, matching train.py's metric.
+    iou = lambda sel: TP[sel].sum() / max(TP[sel].sum() + FP[sel].sum() + FN[sel].sum(), 1e-9)
+    print(f"\n  membership IoU (pooled)  all seeds {iou(np.ones_like(C, bool)):.4f}")
+    print("  by canonical seed class: " + ", ".join(
+        f"{name} {iou(C == k):.3f}" for k, name in enumerate(TYPE_NAMES) if (C == k).any()))
 
 
 if __name__ == "__main__":

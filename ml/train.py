@@ -48,7 +48,9 @@ from patches import BakedPatches, N_FEATURES, N_TYPES, collate  # noqa: E402
 
 class PatchStream(IterableDataset):
     def __init__(self, files: list[Path], max_facets: int, seeds_per_mesh: int,
-                 densities: tuple[str, ...], type_weights=None, seed: int = 0):
+                 densities: tuple[str, ...], type_weights=None, seed: int = 0,
+                 relabel_root: Path | None = None):
+        self.relabel_root = relabel_root
         self.files = files
         self.max_facets = max_facets
         self.seeds_per_mesh = seeds_per_mesh
@@ -63,7 +65,7 @@ class PatchStream(IterableDataset):
         ds = BakedPatches(root=Path("."), densities=self.densities,
                           max_facets=self.max_facets, seeds_per_mesh=self.seeds_per_mesh,
                           type_weights=self.type_weights, seed=self.seed + wid * 977,
-                          files=mine)
+                          files=mine, relabel_root=self.relabel_root)
         for s in ds:
             yield s
 
@@ -94,7 +96,8 @@ class Collate:
 
 def make_loader(files, args, type_weights, shuffle_seed):
     stream = PatchStream(files, args.max_facets, args.seeds_per_mesh,
-                         tuple(args.densities.split(",")), type_weights, shuffle_seed)
+                         tuple(args.densities.split(",")), type_weights, shuffle_seed,
+                         args.relabel)
     return DataLoader(stream, batch_size=args.batch, collate_fn=Collate(args.max_facets, args.no_curvature),
                       num_workers=args.workers, persistent_workers=args.workers > 0,
                       prefetch_factor=4 if args.workers > 0 else None)
@@ -104,7 +107,7 @@ def measure_stats(files, args, n: int = 800):
     """Observe the real positive rate and type frequencies before training."""
     ds = BakedPatches(root=Path("."), densities=tuple(args.densities.split(",")),
                       max_facets=args.max_facets, seeds_per_mesh=8, seed=12345,
-                      files=files[: max(1, min(len(files), 400))])
+                      files=files[: max(1, min(len(files), 400))], relabel_root=args.relabel)
     pos = tot = 0
     types = np.zeros(N_TYPES, np.int64)
     k = 0
@@ -172,6 +175,12 @@ def main(argv=None) -> int:
     ap.add_argument("--balance-seeds", action="store_true",
                     help="bias seed sampling towards rare surface types")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--relabel", type=Path, default=None,
+                    help="relabel sidecar root: train and validate on canonical surface types")
+    ap.add_argument("--synth", type=Path, default=None,
+                    help="synthetic bake to mix into TRAINING only; validation stays real")
+    ap.add_argument("--synth-frac", type=float, default=0.15,
+                    help="fraction of training files drawn from --synth")
     ap.add_argument("--no-curvature", action="store_true",
                     help="zero the two curvature columns. The control arm: any gain from "
                          "curvature has to be measured against an otherwise identical run, "
@@ -193,10 +202,27 @@ def main(argv=None) -> int:
     rng.shuffle(files)
     nval = max(1, int(len(files) * args.val_frac))
     val_files, train_files = files[:nval], files[nval:]
+
+    # Synthetic parts join TRAINING only. Validation stays real ABC with canonical labels,
+    # because the question is always how the model does on real parts; a validation score
+    # inflated by synthetic parts it was built to handle would answer nothing.
+    n_synth = 0
+    if args.synth is not None and args.synth_frac > 0:
+        synth = sorted(args.synth.glob("*/*.npz"))
+        rng.shuffle(synth)
+        want = int(len(train_files) * args.synth_frac / max(1e-9, 1 - args.synth_frac))
+        synth = synth[:want]
+        n_synth = len(synth)
+        train_files = list(train_files) + list(synth)
+        rng.shuffle(train_files)
     print(f"device      {device}"
           + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
     print(f"baked files {len(files):,}  ->  train {len(train_files):,}  val {len(val_files):,}"
           "   (split by model, never by patch)")
+    print(f"labels      {'canonical (relabel sidecars)' if args.relabel else 'stored B-rep types'}")
+    if n_synth:
+        print(f"synthetic   {n_synth:,} parts mixed into training "
+              f"({100 * n_synth / len(train_files):.1f}% of training files); validation is real-only")
 
     rate, types, nsamp = measure_stats(train_files, args)
     pw = (1 - rate) / max(rate, 1e-6) if args.pos_weight == "auto" else float(args.pos_weight)

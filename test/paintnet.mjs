@@ -36,7 +36,7 @@ import { parseStepFaces } from './parseStep.mjs';
 import { buildFacets, buildAdjacency } from '../js/meshCore.js';
 import { paintFrom, surfaceEval } from '../js/regionGrow.js';
 import { fitRegionAs } from '../js/gaussMap.js';
-import { proposeRegion, TYPE_NAMES } from '../js/seedNet.js';
+import { proposeRegion, TYPE_NAMES , N_FEATURES } from '../js/seedNet.js';
 
 const require = createRequire(import.meta.url);
 const ort = require('onnxruntime-node');
@@ -46,7 +46,7 @@ const FIX = join(HERE, 'fixtures');
 const DEG = 180 / Math.PI;
 const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 
-const MODEL = process.argv[2] || 'D:/abc-data/runs/v1/seedfill.onnx';
+const MODEL = process.argv[2] || 'D:/abc-data/runs/v2ctrl/seedfill.onnx';
 if (!existsSync(MODEL)) {
   console.error(`no model at ${MODEL}\nTrain one, or pass a path.`);
   process.exit(2);
@@ -65,7 +65,7 @@ function readSTL(path) {
 
 const session = await ort.InferenceSession.create(MODEL);
 const runner = async (features, n) => {
-  const x = new ort.Tensor('float32', features, [1, n, 10]);
+  const x = new ort.Tensor('float32', features, [1, n, N_FEATURES]);
   const m = new ort.Tensor('float32', new Float32Array(n).fill(1), [1, n]);
   const out = await session.run({ features: x, mask: m });
   return { sameLogit: out.same_logit.data, typeLogit: Array.from(out.type_logit.data) };

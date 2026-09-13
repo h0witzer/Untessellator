@@ -179,7 +179,7 @@ class BakedPatches:
     def __init__(self, root: Path, densities=("coarse", "medium", "fine"),
                  max_facets: int = 512, seeds_per_mesh: int = 24,
                  type_weights: np.ndarray | None = None, seed: int = 0,
-                 files: list[Path] | None = None):
+                 files: list[Path] | None = None, relabel_root: Path | None = None):
         self.root = Path(root)
         self.densities = tuple(densities)
         self.max_facets = max_facets
@@ -187,6 +187,12 @@ class BakedPatches:
         self.type_weights = type_weights
         self.rng = np.random.default_rng(seed)
         self.files = files if files is not None else sorted(self.root.glob("*/*.npz"))
+        # CORRECTED LABELS. When set, a real-bake file takes its face types from the
+        # relabel sidecar (canonical.py) instead of the stored B-rep type, and a file
+        # WITHOUT a sidecar is skipped rather than silently mixing the two label schemes.
+        # Synthetic-bake files already carry canonical types and are recognised by their
+        # "kind" field.
+        self.relabel_root = Path(relabel_root) if relabel_root else None
 
     def __len__(self) -> int:
         return len(self.files)
@@ -197,13 +203,23 @@ class BakedPatches:
             data = np.load(path)
         except Exception:
             return
+        canon = None
+        if self.relabel_root is not None and "kind" not in data.files:
+            mid, part = str(data["model_id"]), str(data["part"])
+            sc = self.relabel_root / mid[:5] / f"{mid}_{part}.npz"
+            if not sc.exists():
+                return
+            try:
+                canon = np.load(sc)["canonical"]
+            except Exception:
+                return
         for dens in self.densities:
             key = f"{dens}_positions"
             if key not in data.files:
                 continue
             positions = data[key]
             face_id = data[f"{dens}_face_id"]
-            face_type = data[f"{dens}_face_type"]
+            face_type = data[f"{dens}_face_type"] if canon is None else canon[face_id]
             if positions.shape[0] < 32:
                 continue
             facets, indptr, indices, curv = derive(positions)

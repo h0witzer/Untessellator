@@ -32,7 +32,7 @@ import { createRequire } from 'node:module';
 
 import { buildFacets, buildAdjacency, segment } from '../js/meshCore.js';
 import { paintFrom } from '../js/regionGrow.js';
-import { proposeRegion, TYPE_NAMES, fitterFor } from '../js/seedNet.js';
+import { proposeRegion, TYPE_NAMES, fitterFor , N_FEATURES } from '../js/seedNet.js';
 import { attachCurvature } from '../js/curvature.js';
 
 const require = createRequire(import.meta.url);
@@ -40,7 +40,7 @@ const ort = require('onnxruntime-node');
 
 const DIR = process.argv[2] || 'D:/abc-data/showcase';
 const SEEDS = Number(process.argv[3] || 40);
-const MODEL = 'D:/abc-data/runs/v1/seedfill.onnx';
+const MODEL = process.env.SEEDNET || 'D:/abc-data/runs/v2ctrl/seedfill.onnx';
 
 function readSTL(path) {
   const b = readFileSync(path);
@@ -65,7 +65,7 @@ if (!existsSync(MODEL)) { console.error(`no model at ${MODEL}`); process.exit(2)
 const session = await ort.InferenceSession.create(MODEL);
 const runner = async (features, n) => {
   const out = await session.run({
-    features: new ort.Tensor('float32', features, [1, n, 10]),
+    features: new ort.Tensor('float32', features, [1, n, N_FEATURES]),
     mask: new ort.Tensor('float32', new Float32Array(n).fill(1), [1, n]),
   });
   return { sameLogit: out.same_logit.data, typeLogit: Array.from(out.type_logit.data) };
