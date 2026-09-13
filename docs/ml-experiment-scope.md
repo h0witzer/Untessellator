@@ -1040,6 +1040,83 @@ Queued next: `v4all` (native plus NURBS, gmsh and game-art copies of training pa
 `game_bake.py`) and `v4nogmsh` (gmsh held out). Both will be scored on this table and on
 the four labelled mesh sets.
 
+### Training across meshers (v4all, v4nogmsh)
+
+Both runs use v3canon's settings (60k steps, canonical labels, curvature zeroed), plus
+re-meshed copies of TRAINING parts at 60% of training files. Validation stays native.
+
+- **v4all:** 19,754 NURBS, 7,277 gmsh and 7,455 game-art copies.
+- **v4nogmsh:** the same without gmsh, so gmsh is a mesher it never saw.
+
+The copies come from `mesher_bake.py`, `game_bake.py` and the fixed `isolated_pool.py`.
+NURBS conversion fails on 7.4% of training parts (1,453 OCCT exceptions and 232 crashes
+that reproduce on retry). gmsh built 7,825 of 8,000.
+
+**Labelled meshes**, same parts per column group:
+
+| | native v3canon | native v4all | native v4nogmsh | nurbs v3canon | nurbs v4all | nurbs v4nogmsh | gmsh v3canon | gmsh v4all | gmsh v4nogmsh |
+|---|---|---|---|---|---|---|---|---|---|
+| membership IoU | 0.794 | 0.771 | 0.773 | 0.718 | 0.737 | 0.737 | 0.514 | **0.682** | 0.548 |
+| macro type acc | 0.748 | 0.694 | 0.688 | 0.546 | 0.611 | 0.621 | 0.423 | **0.590** | 0.469 |
+| Plane | 0.965 | 0.938 | 0.943 | 0.964 | 0.945 | 0.951 | 0.827 | 0.931 | 0.869 |
+| Cylinder | 0.877 | 0.645 | 0.757 | 0.622 | 0.492 | 0.635 | 0.043 | **0.560** | **0.060** |
+| Cone | 0.906 | 0.874 | 0.884 | 0.721 | 0.820 | 0.828 | 0.600 | 0.785 | 0.680 |
+| Sphere | 0.938 | 0.934 | 0.934 | 0.592 | 0.872 | 0.897 | 0.467 | 0.875 | 0.671 |
+| Torus | 0.749 | 0.623 | **0.775** | 0.018 | 0.155 | **0.502** | 0.167 | 0.306 | **0.730** |
+| Revolution | 0.207 | 0.158 | 0.102 | 0.179 | 0.151 | 0.127 | 0.169 | 0.093 | 0.103 |
+| Extrusion | 0.781 | 0.800 | 0.693 | 0.607 | 0.771 | 0.603 | 0.586 | 0.715 | 0.479 |
+| BSpline | 0.719 | 0.675 | 0.541 | 0.715 | 0.694 | 0.584 | 0.587 | 0.545 | 0.336 |
+
+| game-art (300 parts, `bake_game2`) | native v3canon | native v4all | native v4nogmsh | game v3canon | game v4all | game v4nogmsh |
+|---|---|---|---|---|---|---|
+| membership IoU | 0.807 | 0.788 | 0.786 | 0.639 | 0.670 | 0.666 |
+| macro type acc | 0.697 | 0.648 | 0.643 | 0.447 | 0.475 | 0.481 |
+| Sphere | 0.919 | 0.913 | 0.925 | 0.425 | 0.769 | 0.777 |
+| Torus | 0.745 | 0.640 | 0.773 | 0.161 | 0.155 | 0.382 |
+
+**Real hand-made meshes** (`meshReport`, 60 seeds per file):
+
+| set | checkpoint | Cone share | bogus / fitted | failed / attempted | mean claimed |
+|---|---|---|---|---|---|
+| Kenney, 39 files | v3canon | 13% | 34% | 617 / 2,304 | 62.7% |
+| | v4all | 17% | 37% | 213 / 2,074 | 73.5% |
+| | v4nogmsh | 19% | 45% | 139 / 2,288 | 76.7% |
+| Poly Haven, 5 props | v3canon | 49% | 61% | 10 / 260 | 58.9% |
+| | v4all | 43% | 57% | 3 / 254 | 62.8% |
+| | v4nogmsh | 50% | 66% | 7 / 271 | 60.1% |
+| Master Chief (rip) | v3canon | 57% | 100% | 0 / 43 | 6.2% |
+| | v4all | 65% | 98% | 0 / 44 | 5.8% |
+| | v4nogmsh | 57% | 96% | 0 / 49 | 6.9% |
+
+**Findings.**
+
+1. **Diversity fixes the meshers it contains.** v4all on gmsh: membership IoU
+   0.514 → 0.682, cylinders 0.043 → 0.560. The native-to-gmsh membership gap shrinks
+   from 0.28 to 0.09. Spheres recover on every re-meshing (0.87–0.88 on NURBS and gmsh).
+2. **It only partly generalises to a mesher it has not seen.** v4nogmsh on gmsh: IoU
+   0.548 and **cylinders 0.060**, still collapsed. Spheres (0.671) and tori (0.730) do
+   transfer. An isotropic, Delaunay-style mesh is its own family: the model stops reading
+   the pattern only for families it was shown. Real exporters are more families still,
+   so coverage has to be broad (decimation, isotropic remeshing and quad-dominant art are
+   obvious next ones).
+3. **Adding gmsh is a trade-off.** v4nogmsh beats v4all on native Cylinder (0.757 vs
+   0.645) and on Torus everywhere, including native 0.775, above v3canon's 0.749. With
+   gmsh in training, native cylinders are called Extrusion 17% and Cone 14%. Those are
+   geometric neighbours, not pattern artefacts. The analytic fitters separate them by
+   residual, which argues for fit-based arbitration after the type head.
+4. **The cost on native meshes is modest:** about −0.02 membership IoU and −0.05 macro
+   type accuracy for both, within the same 60k-step budget spread over 2.5× the files.
+   BSpline (0.719 → 0.541 for v4nogmsh) and Revolution (0.207 → 0.10–0.16) lose most.
+5. **Real hand-made meshes do not improve.** Failed fits fall and more of each mesh is
+   claimed, but bogus fits hold or rise (Kenney 34% → 45% for v4nogmsh). The type head
+   is not the lever for game art. The residual-gated freeform route in
+   `game-assets-scope.md` is.
+
+**Neither model replaces v3canon outright.** v4all is the better choice when meshes
+come from unknown tools, and v3canon when they come from OCCT. The next training run
+should add further mesher families before tuning anything else, and be judged on
+membership and type across all of them.
+
 ### Synthesis, and the statistic that has to match
 
 With disguised primitives removed, genuine revolves are 60 seeds in the 2,000-part
