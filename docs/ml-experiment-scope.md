@@ -485,13 +485,23 @@ so the work carries forward rather than being thrown away.
 
 ### The problem, measured
 
-On baked ABC data, a 512-facet adjacency BFS around a random seed contains, on average,
-**only 16.7% facets that actually share the seed's face**. That is the `paintFrom`
-failure stated numerically — `regionGrow.js` records it qualitatively as "the seed patch
-crosses the boundary and poisons the initial fit before growth begins". The BFS supplies
-a superset that is roughly 1 part signal to 5 parts noise, and the model's entire job is
-to cut it down. Two consequences for training: the positive class needs loss weighting
-at about 1:5, and patch size is a hyperparameter worth sweeping rather than fixing.
+On baked ABC data, over 600 patches drawn from 216 models, a 512-facet adjacency BFS
+around a random seed contains on average **37.4% facets that actually share the seed's
+face** — so `pos_weight` for the binary head is about **1.67**, not the 1:5 an early
+single-model probe suggested. (That probe sampled 12 seeds on one part and read 16.7%;
+it was not representative, and the loss weighting should come from the corpus-wide
+figure. Re-measure on the full bake before training.)
+
+Either way the BFS over-reaches badly, which is the `paintFrom` failure stated
+numerically — `regionGrow.js` records it qualitatively as "the seed patch crosses the
+boundary and poisons the initial fit before growth begins". Cutting that superset down
+is the model's entire job, and patch size is a hyperparameter worth sweeping rather than
+fixing.
+
+**The seeded framing does defuse the Revolution shortage, measurably.** Revolution is
+0.19% of patches corpus-wide, but seeds landing on Revolution faces were 12.7% of that
+sample — because seeds are drawn per facet, and the stratified selection deliberately
+front-loads rare-type-rich models. Scarcity in *models* is not scarcity in *examples*.
 
 Related, from the same bake: on a plane-and-cylinder ABC part, **26 cross-face edges stay
 invisible to crease angle at every density in the ladder** — identical count at coarse,
