@@ -592,6 +592,45 @@ i.e. spline patches that are locally conical or planar. Again arguably correct a
 3. Revolution and Extrusion fitters are still worth having for the cases where no
    simpler primitive fits; they just should not be forced when one does.
 
+## Deployment: measured, not assumed
+
+v1 exported to ONNX (opset 17, dynamic batch and facet count) and run under
+onnxruntime, single-threaded CPU:
+
+| patch size | ONNX vs PyTorch max abs diff | latency |
+|---|---|---|
+| 256 facets | 4.8e-06 | **1.57 ms** |
+| 512 facets | 4.3e-06 | **3.04 ms** |
+| 1024 facets | 4.3e-06 | **6.12 ms** |
+
+**1.11 MB** on disk, against the ~25 MB OCCT WASM bundle the tool already fetches. The
+numeric agreement is float32 round-off, so the exported graph is the trained model.
+
+This vindicates the architecture constraint that drove the design. There is no KNN
+anywhere — the k-ring BFS supplied locality when the patch was built — so every
+operation is a matmul, LayerNorm, ReLU or masked max. WASM typically runs a few times
+slower than native CPU, which still leaves 512-facet inference in the region of 6–15 ms
+per click against a budget of "tens of milliseconds". Sparse convolution or dynamic-KNN
+architectures would have had no browser path at all.
+
+Still to verify: the same graph under **onnxruntime-web** specifically, in a real
+browser, rather than desktop onnxruntime. Exporting is not the same as running fast in
+WASM.
+
+### Patch size is settled at 512
+
+Matched ablation (batch 64, 24 seeds/mesh, identical but for patch width):
+
+| step | 512 IoU | 2048 IoU | 512 Rev | 2048 Rev |
+|---|---|---|---|---|
+| 4000 | 0.693 | 0.623 | 0.00 | 0.00 |
+| 8000 | 0.747 | 0.671 | 0.02 | 0.00 |
+
+Larger patches are **worse** on membership and do nothing for Revolution. Both follow
+from the diagnosis above: more surface cannot reveal a distinction that is not
+geometric, and a wider patch lowers the positive rate while asking one fixed-capacity
+max-pool to summarise more.
+
 ## Label noise: STEP translation splits periodic surfaces
 
 The bake's cross-check found 43 of 24,800 models (0.17%) where OCCT's face-type
