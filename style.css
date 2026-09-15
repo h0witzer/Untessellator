@@ -1391,3 +1391,10 @@ input[type="number"].val:focus { outline: none; border-color: var(--accent); }
   outline: 1px solid #f97316;
   outline-offset: -1px;
 }
+
+/* Paint (experimental): multi-line status under the paint controls */
+.paint-status {
+  white-space: pre-line;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.45;
+}

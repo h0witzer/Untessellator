@@ -36,6 +36,17 @@ import numpy as np
 QUANT = 1e4
 
 
+def weld_quantum(positions: np.ndarray) -> float:
+    """Port of meshCore.weldQuantum: a welding grid of a millionth of the bounding-box diagonal.
+    The fixed QUANT merged vertices of parts modelled in small units (a 0.09 m watch stand lost
+    708 of 4,820 neighbours); for a part about 100 units across the two are the same."""
+    p = np.asarray(positions, dtype=np.float64).reshape(-1, 3)
+    if p.shape[0] == 0:
+        return QUANT
+    diag = float(np.linalg.norm(p.max(0) - p.min(0)))
+    return 1e6 / diag if diag > 0 and np.isfinite(diag) else QUANT
+
+
 def _jsround(a: np.ndarray) -> np.ndarray:
     """JavaScript Math.round: floor(x + 0.5), i.e. half away from zero towards +inf."""
     return np.floor(a + 0.5)
@@ -148,7 +159,8 @@ def adjacency_csr(pairs: np.ndarray, ntri: int) -> tuple[np.ndarray, np.ndarray]
 
 
 def k_ring(seed: int, indptr: np.ndarray, indices: np.ndarray,
-           max_facets: int, max_rings: int = 64) -> tuple[np.ndarray, np.ndarray]:
+           max_facets: int, max_rings: int = 64,
+           excluded: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
     """BFS outward from `seed` over the dual graph.
 
     Returns (facet_ids, ring_index), truncated at `max_facets`. This is the same
@@ -175,6 +187,10 @@ def k_ring(seed: int, indptr: np.ndarray, indices: np.ndarray,
             break
         nbrs = np.unique(nbrs)
         nbrs = nbrs[~seen[nbrs]]
+        if excluded is not None:
+            # Facets already painted into another group: the patch walks around them, as
+            # seedNet.kRing does with `excluded` (painted-neighbour augmentation).
+            nbrs = nbrs[~excluded[nbrs]]
         if nbrs.size == 0:
             break
         if total + nbrs.size > max_facets:

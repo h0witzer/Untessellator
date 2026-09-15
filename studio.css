@@ -1,0 +1,32 @@
+/* The studio's own additions to the Form Studio kit's onshape.css. */
+
+.studio-canvas {
+  cursor: crosshair;
+  touch-action: none;
+}
+.studio-canvas--brush {
+  cursor: none;
+}
+.studio-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+.studio-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--os-text-secondary);
+  font-size: 13px;
+  pointer-events: none;
+}
+.studio-empty[hidden] {
+  display: none;
+}
+.os-stage.studio-dropping {
+  box-shadow: inset 0 0 0 2px #3e94ff;
+}

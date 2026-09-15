@@ -47,9 +47,11 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from meshcore import (  # noqa: E402
-    adjacency_csr, build_adjacency, build_facets, facet_curvature, k_ring,
+    adjacency_csr, build_adjacency, build_facets, facet_curvature, k_ring, weld_quantum,
 )
+from seedfeatures import EXT_FEATURE_NAMES, adjacency_csr_angles, ext_features  # noqa: E402
 from occ_tessellate import TYPE_NAMES  # noqa: E402
+from surface_targets import N_SURFACE, targets as surface_targets  # noqa: E402
 
 N_TYPES = len(TYPE_NAMES)
 N_FEATURES = 12
@@ -70,13 +72,22 @@ FEATURE_NAMES = (
     "k2s",                     # smaller principal curvature * scale
 )
 
+# v6: the 12 above plus the extended columns of seedfeatures.py (crease bottleneck, local
+# crease, normal-spread eigenvalues, seed-local primitive fits), chosen by ml/feature_screen.py.
+FEATURE_NAMES_V6 = FEATURE_NAMES + EXT_FEATURE_NAMES
+N_FEATURES_V6 = len(FEATURE_NAMES_V6)
 
-def derive(positions: np.ndarray):
-    """Facets, adjacency and curvature for one baked mesh, via the checked port."""
+
+def derive(positions: np.ndarray, with_angles: bool = False):
+    """Facets, adjacency and curvature for one baked mesh, via the checked port. With
+    `with_angles`, also the dihedral angle of every CSR entry (for the v6 features)."""
     facets = build_facets(positions)
-    pairs, angles = build_adjacency(positions, facets)
-    indptr, indices = adjacency_csr(pairs, facets["count"])
+    pairs, angles = build_adjacency(positions, facets, weld_quantum(positions))
     curv = facet_curvature(positions, facets)
+    if with_angles:
+        indptr, indices, eangles = adjacency_csr_angles(pairs, angles, facets["count"])
+        return facets, indptr, indices, curv, eangles
+    indptr, indices = adjacency_csr(pairs, facets["count"])
     return facets, indptr, indices, curv
 
 
@@ -96,9 +107,18 @@ def _frame_from_normal(n: np.ndarray) -> np.ndarray:
 def extract_patch(facets: dict, indptr, indices, face_id: np.ndarray,
                   face_type: np.ndarray, seed: int, max_facets: int,
                   rng: np.random.Generator | None = None,
-                  spin: bool = True, curv: dict | None = None) -> dict | None:
-    """Build one training sample around `seed`. Returns None if the patch is too small."""
-    ids, rings = k_ring(seed, indptr, indices, max_facets)
+                  spin: bool = True, curv: dict | None = None,
+                  surface: tuple | None = None, extended: bool = False,
+                  eangles: np.ndarray | None = None,
+                  excluded: np.ndarray | None = None) -> dict | None:
+    """Build one training sample around `seed`. Returns None if the patch is too small.
+
+    `surface` is a (kind, params) pair from surface_sidecar.py, indexed by face id. When given,
+    the sample also carries the seed face's surface-hypothesis targets in this patch's frame
+    ("surface", "surface_mask"), and the frame itself ("R", "q") so a predicted surface can be
+    placed back in the world.
+    """
+    ids, rings = k_ring(seed, indptr, indices, max_facets, excluded=excluded)
     if ids.size < 8:
         return None
 
@@ -140,8 +160,11 @@ def extract_patch(facets: dict, indptr, indices, face_id: np.ndarray,
         v = curv["valid"][ids]
         feats[:, 10] = np.where(v, np.clip(curv["k1"][ids] * scale, -20, 20), 0.0)
         feats[:, 11] = np.where(v, np.clip(curv["k2"][ids] * scale, -20, 20), 0.0)
+    if extended:
+        ext = ext_features(ids, seed, facets, indptr, indices, eangles, d, n, scale, excluded)
+        feats = np.concatenate([feats, ext], axis=1)
 
-    return {
+    out = {
         "features": feats,
         "same": (face_id[ids] == face_id[seed]).astype(np.float32),
         "type": int(face_type[seed]),
@@ -150,13 +173,27 @@ def extract_patch(facets: dict, indptr, indices, face_id: np.ndarray,
         "seed": int(seed),
         "scale": scale,
     }
+    if surface is not None:
+        kinds, params = surface
+        sf = int(face_id[seed])
+        tgt = np.zeros(N_SURFACE, np.float32)
+        msk = np.zeros(3, np.float32)
+        if sf < len(kinds):
+            q = np.asarray(seed_pos, np.float64)
+            nn = np.asarray(seed_nrm, np.float64)
+            nn = nn / (np.linalg.norm(nn) + 1e-30)
+            ax, ha, kn, hk, ks, hs = surface_targets(int(kinds[sf]), params[sf], q, nn, R, scale)
+            tgt[0:3], tgt[3], tgt[4] = ax, kn, ks
+            msk[:] = (ha, hk, hs)
+        out.update(surface=tgt, surface_mask=msk, R=R, q=np.asarray(seed_pos, np.float64))
+    return out
 
 
 def collate(samples: list[dict], max_facets: int):
     """Pad to a fixed width and build a validity mask. Padding is masked out of both
     the loss and the global max-pool, so it cannot influence a prediction."""
     b = len(samples)
-    x = np.zeros((b, max_facets, N_FEATURES), np.float32)
+    x = np.zeros((b, max_facets, samples[0]["features"].shape[1]), np.float32)
     y = np.zeros((b, max_facets), np.float32)
     m = np.zeros((b, max_facets), np.float32)
     t = np.zeros(b, np.int64)
@@ -169,6 +206,18 @@ def collate(samples: list[dict], max_facets: int):
     return x, y, m, t
 
 
+def collate_surface(samples: list[dict]):
+    """Surface targets and their masks; samples without a sidecar contribute zeros, masked out."""
+    b = len(samples)
+    tgt = np.zeros((b, N_SURFACE), np.float32)
+    msk = np.zeros((b, 3), np.float32)
+    for i, s in enumerate(samples):
+        if "surface" in s:
+            tgt[i] = s["surface"]
+            msk[i] = s["surface_mask"]
+    return tgt, msk
+
+
 class BakedPatches:
     """Iterates baked .npz files, emitting `seeds_per_mesh` patches from each.
 
@@ -179,7 +228,9 @@ class BakedPatches:
     def __init__(self, root: Path, densities=("coarse", "medium", "fine"),
                  max_facets: int = 512, seeds_per_mesh: int = 24,
                  type_weights: np.ndarray | None = None, seed: int = 0,
-                 files: list[Path] | None = None, relabel_root: Path | None = None):
+                 files: list[Path] | None = None, relabel_root: Path | None = None,
+                 surface_root: Path | None = None, extended: bool = False,
+                 exclude_prob: float = 0.0):
         self.root = Path(root)
         self.densities = tuple(densities)
         self.max_facets = max_facets
@@ -193,6 +244,31 @@ class BakedPatches:
         # Synthetic-bake files already carry canonical types and are recognised by their
         # "kind" field.
         self.relabel_root = Path(relabel_root) if relabel_root else None
+        # SURFACE TARGETS. When set, patches carry the seed face's analytic surface in their
+        # frame (surface_sidecar.py). A file without a sidecar is NOT skipped: its patches
+        # still train membership and type, with the surface loss masked out.
+        self.surface_root = Path(surface_root) if surface_root else None
+        # v6 inputs (seedfeatures.py) and PAINTED-NEIGHBOUR AUGMENTATION: with probability
+        # `exclude_prob` a patch is drawn as if some neighbouring faces were already painted into
+        # other groups, which the studio removes from the model's patch. Faces of a simpler type
+        # than the seed's are removed more often (0.6 against 0.25), matching painting simpler
+        # surfaces first. Simulated without retraining, excluding painted facets raised clean
+        # fills on gmsh 46 -> 58% but degraded the type head on the holed patches it never saw.
+        self.extended = extended
+        self.exclude_prob = exclude_prob
+
+    def _excluded_faces(self, s: int, indptr, indices, face_id, face_type):
+        ids0, _ = k_ring(s, indptr, indices, self.max_facets)
+        fids = face_id[ids0]
+        faces, first = np.unique(fids, return_index=True)
+        types = face_type[ids0][first]
+        keep = faces != face_id[s]
+        faces, types = faces[keep], types[keep]
+        if faces.size == 0:
+            return None
+        p = np.where(types < face_type[s], 0.6, 0.25)
+        chosen = faces[self.rng.random(faces.size) < p]
+        return np.isin(face_id, chosen) if chosen.size else None
 
     def __len__(self) -> int:
         return len(self.files)
@@ -213,6 +289,16 @@ class BakedPatches:
                 canon = np.load(sc)["canonical"]
             except Exception:
                 return
+        surface = None
+        if self.surface_root is not None and "model_id" in data.files:
+            mid, part = str(data["model_id"]), str(data["part"])
+            ss = self.surface_root / mid[:5] / f"{mid}_{part}.npz"
+            if ss.exists():
+                try:
+                    sd = np.load(ss)
+                    surface = (sd["kind"], sd["params"])
+                except Exception:
+                    surface = None
         for dens in self.densities:
             key = f"{dens}_positions"
             if key not in data.files:
@@ -222,13 +308,22 @@ class BakedPatches:
             face_type = data[f"{dens}_face_type"] if canon is None else canon[face_id]
             if positions.shape[0] < 32:
                 continue
-            facets, indptr, indices, curv = derive(positions)
+            eangles = None
+            if self.extended or self.exclude_prob > 0:
+                facets, indptr, indices, curv, eangles = derive(positions, with_angles=True)
+            else:
+                facets, indptr, indices, curv = derive(positions)
             ntri = facets["count"]
 
             seeds = self._choose_seeds(face_type, ntri)
             for s in seeds:
+                excluded = None
+                if self.exclude_prob > 0 and self.rng.random() < self.exclude_prob:
+                    excluded = self._excluded_faces(int(s), indptr, indices, face_id, face_type)
                 out = extract_patch(facets, indptr, indices, face_id, face_type,
-                                    int(s), self.max_facets, self.rng, curv=curv)
+                                    int(s), self.max_facets, self.rng, curv=curv,
+                                    surface=surface, extended=self.extended,
+                                    eangles=eangles, excluded=excluded)
                 if out is not None:
                     out["density"] = dens
                     yield out

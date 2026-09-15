@@ -176,6 +176,29 @@ export function buildFacets(positions) {
 }
 
 /**
+ * The inverse welding grid for a mesh: a millionth of its bounding-box diagonal.
+ *
+ * This was a fixed 1e4 (a 0.0001-unit grid), which is right for a 100 mm part and wrong for
+ * one modelled in metres: WatchStandMedium.3mf is 0.09 m across, so the grid was 0.1 mm and
+ * merged the vertices of its crush ribs. 708 of its 4,820 triangles lost a neighbour, which
+ * walls fills off exactly as degenerate triangles would. For a part about 100 units across
+ * the relative grid is the old one.
+ */
+export function weldQuantum(positions) {
+  let lo = [Infinity, Infinity, Infinity];
+  let hi = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i + 2 < positions.length; i += 3) {
+    for (let a = 0; a < 3; a++) {
+      const v = positions[i + a];
+      if (v < lo[a]) lo[a] = v;
+      if (v > hi[a]) hi[a] = v;
+    }
+  }
+  const diagonal = Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]);
+  return diagonal > 0 && Number.isFinite(diagonal) ? 1e6 / diagonal : 1e4;
+}
+
+/**
  * Build triangle adjacency keyed on quantized shared edges.
  *
  * @param {ArrayLike<number>} positions  flat non-indexed vertex positions
@@ -183,7 +206,7 @@ export function buildFacets(positions) {
  * @param {number} quant  inverse position quantum for vertex welding
  * @returns {Map<number, Array<{neighbor:number, angle:number}>>} angle in degrees
  */
-export function buildAdjacency(positions, facets, quant = 1e4) {
+export function buildAdjacency(positions, facets, quant = weldQuantum(positions)) {
   const key = (x, y, z) =>
     Math.round(x * quant) + '_' + Math.round(y * quant) + '_' + Math.round(z * quant);
 

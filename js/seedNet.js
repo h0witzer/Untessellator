@@ -32,7 +32,11 @@
 export const TYPE_NAMES = ['Plane', 'Cylinder', 'Cone', 'Sphere', 'Torus',
   'Revolution', 'Extrusion', 'BSpline', 'Other'];
 
+import { writeExtendedFeatures, N_EXT } from './seedFeatures.js';
+
 export const N_FEATURES = 12;
+/** Width of a v6 model's input: the 12 above plus js/seedFeatures.js's extended columns. */
+export const N_FEATURES_V6 = N_FEATURES + N_EXT;
 
 /** Types the converter has an analytic fitter for. Others route to the NURBS fallback. */
 export const FITTABLE = new Set(['plane', 'cylinder', 'cone', 'sphere', 'torus']);
@@ -47,7 +51,7 @@ export function fitterFor(typeName) {
  * Breadth-first walk over the dual graph, mirroring k_ring() in ml/meshcore.py.
  * Returns facet ids in BFS order plus each one's ring index.
  */
-export function kRing(seed, adjacency, maxFacets, maxRings = 64) {
+export function kRing(seed, adjacency, maxFacets, maxRings = 64, excluded = null) {
   const seen = new Set([seed]);
   const ids = [seed];
   const rings = [0];
@@ -56,7 +60,9 @@ export function kRing(seed, adjacency, maxFacets, maxRings = 64) {
     const next = [];
     for (const f of frontier) {
       for (const e of adjacency.get(f) || []) {
-        if (seen.has(e.neighbor)) continue;
+        // `excluded` (facets already painted into another group) is not part of the Python
+        // mirror: with it the patch walks around them, as an experiment in test/fillEval.mjs.
+        if (seen.has(e.neighbor) || (excluded && excluded[e.neighbor])) continue;
         seen.add(e.neighbor);
         next.push(e.neighbor);
       }
@@ -103,9 +109,10 @@ function frameFromNormal(n) {
  * Build the (n, 10) feature block for one seed.
  * @returns {{features: Float32Array, ids: number[], n: number}}
  */
-export function buildFeatures(seed, facets, adjacency, maxFacets = 512, curv = null) {
+export function buildFeatures(seed, facets, adjacency, maxFacets = 512, curv = null, excluded = null, extended = false) {
+  const width = extended ? N_FEATURES_V6 : N_FEATURES;
   curv = curv || facets.curvature || null;
-  const { ids, rings } = kRing(seed, adjacency, maxFacets);
+  const { ids, rings } = kRing(seed, adjacency, maxFacets, 64, excluded);
   const n = ids.length;
   const R = frameFromNormal([facets.normals[seed * 3],
                              facets.normals[seed * 3 + 1],
@@ -136,11 +143,11 @@ export function buildFeatures(seed, facets, adjacency, maxFacets = 512, curv = n
   const meanArea = sumArea / n || 1;
   const ringDiv = Math.max(1, maxRing);
 
-  const out = new Float32Array(n * N_FEATURES);
+  const out = new Float32Array(n * width);
   for (let i = 0; i < n; i++) {
     const t = ids[i];
     const dx = d[i * 3] / scale, dy = d[i * 3 + 1] / scale, dz = d[i * 3 + 2] / scale;
-    const o = i * N_FEATURES;
+    const o = i * width;
     out[o] = dx; out[o + 1] = dy; out[o + 2] = dz;
     out[o + 3] = nrm[i * 3]; out[o + 4] = nrm[i * 3 + 1]; out[o + 5] = nrm[i * 3 + 2];
     out[o + 6] = facets.normals[t * 3] * sn[0] + facets.normals[t * 3 + 1] * sn[1]
@@ -154,7 +161,75 @@ export function buildFeatures(seed, facets, adjacency, maxFacets = 512, curv = n
       out[o + 11] = Math.min(20, Math.max(-20, curv.k2[t] * scale));
     }
   }
-  return { features: out, ids, n };
+  if (extended) {
+    const dScaled = new Float64Array(n * 3);
+    for (let i = 0; i < n * 3; i++) dScaled[i] = d[i] / scale;
+    writeExtendedFeatures(out, width, N_FEATURES, ids, seed, facets, adjacency, dScaled, nrm, scale, excluded);
+  }
+  return { features: out, ids, n, scale };
+}
+
+/**
+ * The surface a surface-head model predicted under `seed`, placed in the world in
+ * regionGrow.surfaceEval's format. `surface` is the model's 5-vector (ml/surface_targets.py):
+ * the axis in the patch frame, asinh(kn) and asinh(ks), where kn = scale / d and d is the
+ * distance along the seed facet's normal to the axis, centre or tube centre.
+ *
+ * It exists to START growth. The analytic fitters still decide the final surface: measured
+ * on ABC validation parts, handing a hypothesis-grown region to paintFrom beats paintFrom from
+ * the model's region, while using the hypothesis itself as the boundary under-fills.
+ *
+ * @param {'plane'|'cylinder'|'cone'|'sphere'|'torus'} kind
+ * @param {ArrayLike<number>} surface
+ * @param {object} facets
+ * @param {number} seed
+ * @param {number} scale   the patch scale buildFeatures used for this seed
+ * @returns {{type:string, params:object}|null}
+ */
+export function surfaceHypothesis(kind, surface, facets, seed, scale) {
+  if (!surface) return null;
+  const q = [facets.centroids[seed * 3], facets.centroids[seed * 3 + 1], facets.centroids[seed * 3 + 2]];
+  const n = [facets.normals[seed * 3], facets.normals[seed * 3 + 1], facets.normals[seed * 3 + 2]];
+  const along = (p, v, s) => [p[0] + s * v[0], p[1] + s * v[1], p[2] + s * v[2]];
+  const unit = (v) => {
+    const l = Math.hypot(v[0], v[1], v[2]);
+    return l > 1e-300 ? [v[0] / l, v[1] / l, v[2] / l] : null;
+  };
+
+  const kn = Math.sinh(surface[3]);
+  if (kind === 'plane' || Math.abs(kn) < 1e-6) return { type: 'plane', params: { origin: q, normal: n } };
+  const s = kn > 0 ? 1 : -1;
+  const d = scale / Math.abs(kn);
+  const foot = along(q, n, -s * d);
+  if (kind === 'sphere') return { type: 'sphere', params: { center: foot, radius: d } };
+
+  // frame rows map world -> frame, so the world axis is R^T a
+  const R = frameFromNormal(n);
+  const a = unit([
+    surface[0] * R[0][0] + surface[1] * R[1][0] + surface[2] * R[2][0],
+    surface[0] * R[0][1] + surface[1] * R[1][1] + surface[2] * R[2][1],
+    surface[0] * R[0][2] + surface[1] * R[1][2] + surface[2] * R[2][2],
+  ]);
+  if (!a) return null;
+  const na = n[0] * a[0] + n[1] * a[1] + n[2] * a[2];
+  if (kind === 'cylinder') return { type: 'cylinder', params: { axis: a, axisPoint: foot, radius: d } };
+  if (kind === 'cone') {
+    const sina = Math.min(Math.abs(na), 0.999999);
+    if (sina < 1e-6) return { type: 'cylinder', params: { axis: a, axisPoint: foot, radius: d } };
+    const sg = s * na >= 0 ? 1 : -1;
+    const open = [-sg * a[0], -sg * a[1], -sg * a[2]];        // radius grows along `open`
+    return { type: 'cone', params: { axis: open, apex: along(foot, open, -d / sina), halfAngle: Math.asin(sina) } };
+  }
+  if (kind === 'torus') {
+    const ks = Math.sinh(surface[4]);
+    if (Math.abs(ks) < 1e-9) return null;
+    const up = unit([n[0] - na * a[0], n[1] - na * a[1], n[2] - na * a[2]]);
+    if (!up) return null;
+    const side = (ks > 0 ? 1 : -1) * s;
+    const bigR = scale / Math.abs(ks);
+    return { type: 'torus', params: { axis: a, center: along(foot, up, -side * bigR), majorRadius: bigR, minorRadius: d } };
+  }
+  return null;
 }
 
 /**
@@ -167,8 +242,8 @@ export function buildFeatures(seed, facets, adjacency, maxFacets = 512, curv = n
 export async function proposeRegion(seed, facets, adjacency, run, opts = {}) {
   const maxFacets = opts.maxFacets ?? 512;
   const threshold = opts.threshold ?? 0.5;
-  const { features, ids, n } = buildFeatures(seed, facets, adjacency, maxFacets, opts.curvature);
-  const { sameLogit, typeLogit } = await run(features, n);
+  const { features, ids, n, scale } = buildFeatures(seed, facets, adjacency, maxFacets, opts.curvature, opts.excluded, opts.extended);
+  const { sameLogit, typeLogit, surface } = await run(features, n);
 
   const region = new Set();
   for (let i = 0; i < n; i++) {
@@ -186,6 +261,9 @@ export async function proposeRegion(seed, facets, adjacency, run, opts = {}) {
     confidence: probs[best],
     probs,
     patchSize: n,
+    // present only when the model has a surface head (ml/surface_targets.py)
+    surface: surface ? Array.from(surface) : null,
+    scale,
   };
 }
 

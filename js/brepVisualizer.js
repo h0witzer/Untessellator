@@ -21,6 +21,7 @@
  */
 
 import * as THREE from 'three';
+import { patchBounds, evalPatch, planeBoundary } from './brepBuilder.js';
 
 const CIRCLE_SEGMENTS = 64;
 
@@ -372,6 +373,86 @@ function meshSphere(params, mat) {
   return mesh;
 }
 
+// ── patch meshes: the same surface patch the STEP face is built on ─────────────
+//
+// The cylinder / cone / sphere builders above draw whole tubes and bands from AXIAL extents and
+// world-aligned rings, and nothing drew tori, so the preview showed surfaces where no face would be
+// exported. These draw brepBuilder.patchBounds' ranges through evalPatch, so the preview is the
+// exported face by construction.
+
+function meshPatch(params, b, mat) {
+  const SU = Math.max(2, Math.ceil(48 * (b.umax - b.umin) / (2 * Math.PI)));
+  const SV = b.type === 'cylinder' || b.type === 'cone' ? 1
+           : Math.max(2, Math.ceil(24 * (b.vmax - b.vmin) / Math.PI));
+  const positions = [];
+  const indices = [];
+  for (let i = 0; i <= SU; i++) {
+    const u = b.umin + (b.umax - b.umin) * i / SU;
+    for (let j = 0; j <= SV; j++) {
+      const v = b.vmin + (b.vmax - b.vmin) * j / SV;
+      positions.push(...evalPatch(params, b, u, v));
+    }
+  }
+  const row = SV + 1;
+  for (let i = 0; i < SU; i++) {
+    for (let j = 0; j < SV; j++) {
+      const a = i * row + j, c = (i + 1) * row + j;
+      indices.push(a, c, c + 1, a, c + 1, a + 1);
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.setIndex(indices);
+  geo.computeVertexNormals();
+  return new THREE.Mesh(geo, mat);
+}
+
+/** The patch's four boundary curves (two when U wraps the full circle). */
+function wirePatch(params, b, mat) {
+  const g = new THREE.Group();
+  const N = 48;
+  const curve = (fn) => {
+    const pts = [];
+    for (let i = 0; i <= N; i++) pts.push(...fn(i / N));
+    return makeLine(pts, mat);
+  };
+  const du = b.umax - b.umin, dv = b.vmax - b.vmin;
+  g.add(curve(t => evalPatch(params, b, b.umin + du * t, b.vmin)));
+  g.add(curve(t => evalPatch(params, b, b.umin + du * t, b.vmax)));
+  if (!b.uFull) {
+    g.add(curve(t => evalPatch(params, b, b.umin, b.vmin + dv * t)));
+    g.add(curve(t => evalPatch(params, b, b.umax, b.vmin + dv * t)));
+  }
+  return g;
+}
+
+const CURVED = new Set(['cylinder', 'cone', 'sphere', 'torus']);
+
+/** A planar face as exported: its outer loop with holes, triangulated in the plane. */
+function meshPlaneBoundary(params, b, mat) {
+  const { xA, yA } = b.frame;
+  const o = params.origin;
+  const to2 = (p) => new THREE.Vector2(
+    (p[0] - o[0]) * xA[0] + (p[1] - o[1]) * xA[1] + (p[2] - o[2]) * xA[2],
+    (p[0] - o[0]) * yA[0] + (p[1] - o[1]) * yA[1] + (p[2] - o[2]) * yA[2]);
+  const shape = new THREE.Shape(b.outer.map(to2));
+  for (const h of b.holes) shape.holes.push(new THREE.Path(h.map(to2)));
+  const geo = new THREE.ShapeGeometry(shape);
+  const pa = geo.attributes.position;
+  for (let i = 0; i < pa.count; i++) {
+    const u = pa.getX(i), v = pa.getY(i);
+    pa.setXYZ(i, o[0] + u * xA[0] + v * yA[0], o[1] + u * xA[1] + v * yA[1], o[2] + u * xA[2] + v * yA[2]);
+  }
+  geo.computeVertexNormals();
+  return new THREE.Mesh(geo, mat);
+}
+
+function wirePlaneBoundary(b, mat) {
+  const g = new THREE.Group();
+  for (const l of [b.outer, ...b.holes]) g.add(makeLine([...l.flat(), ...l[0]], mat));
+  return g;
+}
+
 // ── public API ────────────────────────────────────────────────────────────────
 
 /**
@@ -404,6 +485,15 @@ export function buildBrepOverlay(groups, geometry, colorMap) {
 
     let vizGroup;
     try {
+      if (CURVED.has(g.surface.type)) {
+        const b = patchBounds(g.surface.type, g.surface.params, g.triangleIndices, geometry.attributes.position);
+        if (b) overlay.add(wirePatch(g.surface.params, b, mat));
+        continue;
+      }
+      if (g.surface.type === 'plane') {
+        const b = planeBoundary(g.surface.params, g.triangleIndices, geometry);
+        if (b.outer) { overlay.add(wirePlaneBoundary(b, mat)); continue; }
+      }
       switch (g.surface.type) {
         case 'plane':    vizGroup = vizPlane(g.surface, verts, mat);    break;
         case 'cylinder': vizGroup = vizCylinder(g.surface, verts, mat); break;
@@ -465,13 +555,22 @@ export function buildAnalyticalFacesMesh(groups, geometry, analyticalBounds, col
     let edgeGroup = null;
 
     try {
-      if (type === 'plane') {
+      if (type === 'plane' && bound?.outer) {
+        faceMesh = meshPlaneBoundary(params, bound, meshMat);
+        edgeGroup = wirePlaneBoundary(bound, edgeMat);
+      } else if (type === 'plane') {
         const loop = bound?.loop;
         if (loop && loop.length >= 3) {
           faceMesh = meshPlane(loop, meshMat);
           // Outline edge
           const pts = [...loop.flatMap(c => c), ...loop[0]];
           edgeGroup = makeLine(pts, edgeMat);
+        }
+      } else if (CURVED.has(type)) {
+        const b = bound?.patch ?? patchBounds(type, params, g.triangleIndices, geometry.attributes.position);
+        if (b) {
+          faceMesh = meshPatch(params, b, meshMat);
+          edgeGroup = wirePatch(params, b, edgeMat);
         }
       } else if (type === 'cylinder') {
         let vmin = bound?.vmin, vmax = bound?.vmax;

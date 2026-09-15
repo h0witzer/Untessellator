@@ -24,6 +24,13 @@
  *
  * Run this before optimising any proposer. If a primitive fails here, improving the
  * region that feeds it cannot help.
+ *
+ * OPEN REGRESSION: the 45 deg cone reads 54.9 since the geometric refinement (gaussMap.js),
+ * against 44.99 before. The goal is the ORIGINAL surface, so this is a failure, not a fixture
+ * artefact. WatchStandMedium.3mf's vertices sit 2.3e-3 RMS off the true cone; least squares on
+ * positions follows them to a cone they fit better (1.0e-3) and the truth does not. The facet
+ * normals still point at 45 deg. Recovering the seed surface from a mesh that does not lie on it
+ * exactly is the case test/fitTruth.mjs --jitter measures.
  */
 
 import { join, dirname } from 'node:path';

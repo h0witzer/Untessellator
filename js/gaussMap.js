@@ -564,6 +564,36 @@ export function fitCone(g, axis) {
  * reported as freeform, not as a torus that happens to be nearby, and that judgement
  * belongs to the residual gate rather than to the classifier.
  */
+/**
+ * Centre of the circle through q_i = p_i - s n_i, in the plane through `m` normal to
+ * `axis`: a weighted algebraic (Kasa) fit, u^2 + v^2 + D u + E v + F = 0, which is linear
+ * in D, E, F. Returns null when the points do not constrain a circle.
+ */
+function spineCentre(P, N, W, n, s, axis, m) {
+  const e1 = perp(axis);
+  const e2 = cross(axis, e1);
+  const A = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  const b = [0, 0, 0];
+  for (let i = 0; i < n; i++) {
+    const d = [P[i * 3] - s * N[i * 3] - m[0],
+               P[i * 3 + 1] - s * N[i * 3 + 1] - m[1],
+               P[i * 3 + 2] - s * N[i * 3 + 2] - m[2]];
+    const u = dot(d, e1), v = dot(d, e2), w = W[i];
+    const row = [u, v, 1];
+    const rhs = -(u * u + v * v);
+    for (let r = 0; r < 3; r++) {
+      for (let c = 0; c < 3; c++) A[r][c] += w * row[r] * row[c];
+      b[r] += w * row[r] * rhs;
+    }
+  }
+  const x = solve3(A, b);
+  if (!x || !x.every(Number.isFinite)) return null;
+  const cu = -x[0] / 2, cv = -x[1] / 2;
+  return [m[0] + cu * e1[0] + cv * e2[0],
+          m[1] + cu * e1[1] + cv * e2[1],
+          m[2] + cu * e1[2] + cv * e2[2]];
+}
+
 function fitTorus(g) {
   const { n, P, N, W, wSum } = g;
   const pos = positional(g);                          // vertices, for the refinement
@@ -602,16 +632,22 @@ function fitTorus(g) {
   // Coarse scan then golden-section. The objective is unimodal in r but the scan guards
   // against the trivial minimum near r = 0, where any small patch looks planar.
   let best = null;
+  const minima = [];
   for (const sgn of [1, -1]) {
     const lo = hint ? Math.max(0.02 * ext, 0.5 * hint) : 0.02 * ext;
     const hi = hint ? Math.min(4.0 * ext, 2.0 * hint) : 2.0 * ext;
     if (!(hi > lo)) continue;
     const steps = 48;
     let bi = null;
+    const scan = [];
     for (let i = 0; i <= steps; i++) {
       const r = lo + (hi - lo) * (i / steps);
       const pr = probe(r, sgn);
+      scan.push({ ...pr, r, sgn });
       if (!bi || pr.planar < bi.planar) bi = { ...pr, r };
+    }
+    for (let i = 1; i < steps; i++) {
+      if (scan[i].planar <= scan[i - 1].planar && scan[i].planar <= scan[i + 1].planar) minima.push(scan[i]);
     }
     if (!bi) continue;
     const span = (hi - lo) / steps;
@@ -629,11 +665,20 @@ function fitTorus(g) {
   }
   if (!best || !(best.r > 0)) return null;
 
+  // CENTRE FROM A CIRCLE FIT, NOT THE MEAN. The tube centres q = p - r n lie on the
+  // spine circle, so the torus centre is that circle's centre. Their mean is the centre
+  // only when q covers the whole ring, and CAD fillets rarely do: on ABC validation parts
+  // they span a median 80-85 deg of it, and the mean of an arc sits inside the arc.
+  // Measured against the true STEP surfaces with the true r, so only the estimator
+  // differed, on 684 native tori: centre error 0.90 R and R error 61% from the mean,
+  // 0.009 R and 0.7% from the circle fit (gmsh: 0.054 R and 3.8%). Rings spanning
+  // 300 deg or more were fine either way, which is why generated test tori never showed it.
+  const ax = normalize(best.axis);
+  const c0 = spineCentre(P, N, W, n, best.sgn * best.r, ax, best.centre) ?? best.centre;
+
   // Refine on the VERTICES, which lie exactly on the surface where centroids do not.
   // With the axis and centre fixed, each vertex gives rho and z about the axis, and its
   // distance to the tube-centre circle is sqrt((rho-R)^2 + z^2), which should equal r.
-  const ax = normalize(best.axis);
-  const c0 = best.centre;
   const rho = new Float64Array(pos.n), zz = new Float64Array(pos.n);
   let wAll = 0;
   for (let i = 0; i < pos.n; i++) {
@@ -709,20 +754,564 @@ function fitTorus(g) {
     const e = misfit(cand.R, cand.r);
     if (e < bestE) { bestE = e; R = cand.R; rr = cand.r; }
   }
-  if (R === null) return null;
 
-  // True point-to-surface residual, on the vertices.
-  let e = 0, ws = 0;
-  for (let i = 0; i < pos.n; i++) {
-    const dr = rho[i] - R;
-    const d = Math.sqrt(dr * dr + zz[i] * zz[i]) - rr;
-    e += pos.W[i] * d * d; ws += pos.W[i];
+  let fit = null;
+  if (R !== null) {
+    // True point-to-surface residual, on the vertices.
+    let e = 0, ws = 0;
+    for (let i = 0; i < pos.n; i++) {
+      const dr = rho[i] - R;
+      const d = Math.sqrt(dr * dr + zz[i] * zz[i]) - rr;
+      e += pos.W[i] * d * d; ws += pos.W[i];
+    }
+    fit = {
+      type: 'torus',
+      params: { axis: ax, center: c0, majorRadius: R, minorRadius: rr },
+      residual: Math.sqrt(e / ws),
+    };
   }
-  return {
-    type: 'torus',
-    params: { axis: ax, center: c0, majorRadius: R, minorRadius: rr },
-    residual: Math.sqrt(e / ws),
+
+  // Every candidate, including the self-intersecting ones rejected above, is a START for
+  // the geometric refinement; only its result has to be a proper torus.
+  // Starts share one axis, so refineBest's axis de-duplication must not collapse them.
+  const starts = [];
+
+  // MORE THAN ONE TUBE HYPOTHESIS. Everything above commits to the single deepest planarity
+  // minimum, and every start built from it shares its axis and centre. On fat tori - R/r of
+  // 1.2 to 2, the fillets around small holes - that minimum is often the wrong one: scored
+  // against the true STEP surfaces, 31 of 40 remaining native/gmsh misses had a true surface
+  // fitting their vertices 1e4 times better than the fit (test/fitTruth.mjs, a basin check),
+  // and almost all were such tori. So the next-best local minima of the scan, for both tube
+  // senses, and the curvature estimate of r each get their own axis, centre and R as starts.
+  const tubeStarts = minima.sort((a, b) => a.planar - b.planar).slice(0, 4);
+  if (hint) for (const sgn of [1, -1]) tubeStarts.push({ ...probe(hint, sgn), r: hint, sgn });
+  for (const m of tubeStarts) {
+    const axm = normalize(m.axis);
+    const cm = spineCentre(P, N, W, n, m.sgn * m.r, axm, m.centre) ?? m.centre;
+    let Rm = 0;
+    for (let i = 0; i < n; i++) {
+      const dx = P[i * 3] - m.sgn * m.r * N[i * 3] - cm[0];
+      const dy = P[i * 3 + 1] - m.sgn * m.r * N[i * 3 + 1] - cm[1];
+      const dz = P[i * 3 + 2] - m.sgn * m.r * N[i * 3 + 2] - cm[2];
+      const z = dx * axm[0] + dy * axm[1] + dz * axm[2];
+      Rm += W[i] * Math.sqrt(Math.max(0, dx * dx + dy * dy + dz * dz - z * z));
+    }
+    Rm /= wSum;
+    if (Rm > 0 && isFinite(Rm)) {
+      starts.push({ startOnly: true, params: { axis: axm, center: cm, majorRadius: Rm, minorRadius: m.r } });
+    }
+  }
+  for (const cand of candidates) {
+    if (cand.R > 0 && cand.r > 0 && isFinite(cand.R) && isFinite(cand.r)) {
+      starts.push({ startOnly: true,
+                    params: { axis: ax, center: c0, majorRadius: cand.R, minorRadius: cand.r } });
+    }
+  }
+  return refineBest(g, pos, fit ? [fit, ...starts] : starts, 'torus', refineTorus, false) ?? fit;
+}
+
+// ── Geometric refinement ─────────────────────────────────────────────────────
+//
+// Every estimate above is ALGEBRAIC: a relation that holds exactly on the true surface
+// (tangent planes concur at a cone's apex, tube centres lie on a circle), solved in
+// closed form. That makes them good at finding the basin and poor at its bottom. Off an
+// exact surface each relation weights error differently from distance, and several
+// read facet normals, which on an inscribed mesh are secant normals tilted by O(theta^2).
+//
+// Scored against the true STEP surfaces of 80 validation parts (test/fitTruth.mjs), that
+// left cones and tori well short of what the data supports even where the mesh vertices
+// sit on the true surface to 1e-8 of the part:
+//
+//                      native OCCT            gmsh
+//     cone   dev<1e-4    39.9%                5.5%
+//     torus  dev<1e-5    12.3%, 11% degen     7.9%
+//
+// The fix is the standard one: finish with least squares on the true geometric distance
+// of the VERTICES, started from the algebraic estimate. The residual is exactly zero at
+// the truth when the vertices are on the surface, so where the start is in the basin the
+// refinement converges to it regardless of how the start was obtained.
+
+/** Gaussian elimination with partial pivoting on a small dense system. */
+function solveN(A, b) {
+  const k = b.length;
+  const M = A.map((row, i) => [...row, b[i]]);
+  for (let c = 0; c < k; c++) {
+    let p = c;
+    for (let r = c + 1; r < k; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
+    if (!(Math.abs(M[p][c]) > 1e-300)) return null;
+    if (p !== c) { const t = M[c]; M[c] = M[p]; M[p] = t; }
+    for (let r = c + 1; r < k; r++) {
+      const f = M[r][c] / M[c][c];
+      if (f === 0) continue;
+      for (let j = c; j <= k; j++) M[r][j] -= f * M[c][j];
+    }
+  }
+  const x = new Array(k);
+  for (let i = k - 1; i >= 0; i--) {
+    let s = M[i][k];
+    for (let j = i + 1; j < k; j++) s -= M[i][j] * x[j];
+    x[i] = s / M[i][i];
+  }
+  return x.every(Number.isFinite) ? x : null;
+}
+
+/**
+ * Levenberg-Marquardt with a forward-difference Jacobian.
+ *
+ * @param {number[]} x0      start
+ * @param {number} m         residual count
+ * @param {(x:number[], out:Float64Array)=>void} resid   fills out with WEIGHTED residuals
+ * @param {number[]} steps   finite-difference step per parameter
+ * @returns {{x:number[], cost:number}|null}  cost = sum of squared weighted residuals
+ */
+function levenbergMarquardt(x0, m, resid, steps, maxIter = 100) {
+  const k = x0.length;
+  let x = [...x0];
+  let f = new Float64Array(m);
+  resid(x, f);
+  const sumSq = (v) => { let s = 0; for (let i = 0; i < m; i++) s += v[i] * v[i]; return s; };
+  let cost = sumSq(f);
+  if (!isFinite(cost)) return null;
+  const J = new Float64Array(m * k);
+  const fp = new Float64Array(m);
+  let fn = new Float64Array(m);
+  let lam = 1e-3;
+
+  for (let it = 0; it < maxIter && cost > 0; it++) {
+    for (let j = 0; j < k; j++) {
+      const xp = [...x];
+      xp[j] += steps[j];
+      resid(xp, fp);
+      for (let i = 0; i < m; i++) J[i * k + j] = (fp[i] - f[i]) / steps[j];
+    }
+    const A = Array.from({ length: k }, () => new Array(k).fill(0));
+    const g = new Array(k).fill(0);
+    for (let i = 0; i < m; i++) {
+      const o = i * k;
+      for (let a = 0; a < k; a++) {
+        const ja = J[o + a];
+        if (ja === 0) continue;
+        g[a] += ja * f[i];
+        for (let b = a; b < k; b++) A[a][b] += ja * J[o + b];
+      }
+    }
+    let dmax = 0;
+    for (let a = 0; a < k; a++) {
+      for (let b = 0; b < a; b++) A[a][b] = A[b][a];
+      dmax = Math.max(dmax, A[a][a]);
+    }
+    if (!(dmax > 0)) break;
+
+    let accepted = false;
+    while (lam < 1e10) {
+      const M = A.map((row, a) => row.map((v, b) => (a === b ? v + lam * Math.max(v, 1e-12 * dmax) : v)));
+      const dx = solveN(M, g.map(v => -v));
+      if (dx) {
+        const xn = x.map((v, j) => v + dx[j]);
+        resid(xn, fn);
+        const cn = sumSq(fn);
+        if (cn < cost) {
+          const gain = cost - cn;
+          x = xn; [f, fn] = [fn, f]; cost = cn;
+          lam = Math.max(lam * 0.3, 1e-12);
+          accepted = gain > 1e-14 * cost ? true : 'converged';
+          break;
+        }
+      }
+      lam *= 10;
+    }
+    if (accepted !== true) break;
+  }
+  return { x, cost };
+}
+
+/** Tangent frame of a unit axis: the rotation parameters below perturb along these. */
+function tangentFrame(axis) {
+  const t1 = perp(axis);
+  return [t1, normalize(cross(axis, t1))];
+}
+
+/** Region extent about the weighted mean of a positional sample set. */
+function extentOf(pos) {
+  const c = weightedMean3(pos.P, pos.W, pos.n, pos.wSum);
+  let ext = 0;
+  for (let i = 0; i < pos.n; i++) {
+    ext = Math.max(ext, Math.hypot(pos.P[i * 3] - c[0], pos.P[i * 3 + 1] - c[1], pos.P[i * 3 + 2] - c[2]));
+  }
+  return { c, ext: ext || 1 };
+}
+
+/** Below this fraction of the region extent a refined RMS is exact: no other start can beat it. */
+const EXACT_REL = 1e-6;
+
+/**
+ * Robust least squares on geometric distance: iteratively reweighted Levenberg-Marquardt
+ * with Cauchy weights 1 / (1 + (d / s)^2), s = 1.4826 x the median |distance|.
+ *
+ * Plain least squares has no resistance to foreign facets, and every region a segmenter
+ * proposes carries some. Refined without any robustness, fitoracle's 45 deg WatchStand
+ * cone (a tolerance-built truth set that sweeps in a few neighbours) went from 44.99 to
+ * 64.69 deg: the refinement walked to the wrong axis the positional residual has always
+ * preferred there.
+ *
+ * A HARD trim was tried first - keep the best-fitting 80% of vertex weight, refit, repeat,
+ * the same fraction the cone's axis criterion uses - and was worse, for a reason worth
+ * keeping: on a small face the vertices that are dropped are the ones that DISCRIMINATE.
+ * Ten vertices on two rings of a cone, less two, are fitted exactly by other cones. It lost
+ * a WatchStand cone in paint.mjs (4/4 -> 3/4) and moved fitoracle's 45 deg cone only to
+ * 49.68. A smooth weight keeps every vertex; on clean data the median residual describes
+ * all of them, the weights stay near 1, and this is ordinary least squares.
+ *
+ * @returns {{x:number[], rms:number, sigma:number, d:Float64Array, d0:Float64Array}|null}
+ *          rms over ALL vertices unweighted (the residual callers threshold on), d and d0
+ *          the distances at the result and at the start
+ */
+function robustFit(pos, x0, steps, dist, ext) {
+  const n = pos.n;
+  const wn = Float64Array.from(pos.W, w => w / pos.wSum);
+  const d = new Float64Array(n);
+  const floor = 1e-12 * ext;
+  const scaleOf = () => {
+    const a = Array.from(d, Math.abs).sort((p, q) => p - q);
+    return Math.max(1.4826 * a[a.length >> 1], floor);
   };
+  dist(x0, d);
+  if (!d.every(Number.isFinite)) return null;
+  const d0 = Float64Array.from(d);
+  let x = x0, sigma = scaleOf();
+  for (let round = 0; round < 8; round++) {
+    const sw = Float64Array.from(wn, (w, i) => Math.sqrt(w / (1 + (d[i] / sigma) ** 2)));
+    const lm = levenbergMarquardt(x, n, (xx, o) => {
+      dist(xx, o);
+      for (let i = 0; i < n; i++) o[i] *= sw[i];
+    }, steps);
+    if (!lm) break;
+    x = lm.x;
+    dist(x, d);
+    const next = scaleOf();
+    const settled = Math.abs(next - sigma) <= 0.01 * sigma;
+    sigma = next;
+    if (settled) break;
+  }
+  let e = 0;
+  for (let i = 0; i < n; i++) e += wn[i] * d[i] * d[i];
+  return { x, rms: Math.sqrt(e), sigma, d: Float64Array.from(d), d0 };
+}
+
+/**
+ * Refine a cone on vertex distance.
+ *
+ * NOT parameterised by the apex. On a shallow cone the apex sits many patch-widths away
+ * and slides a long way for a tiny change in the surface, so an apex parameterisation is
+ * ill-conditioned exactly where cones are hardest - and it has no limit as the half-angle
+ * goes to zero. Instead: a reference point on the axis beside the patch, the radius r0
+ * there, and the half-angle. The generator in the (rho, z) half-plane is then
+ * rho = r0 + z tan(a), whose perpendicular distance is (rho - r0 - z tan a) cos a, and
+ * a = 0 is simply a cylinder. The apex is recovered at the end.
+ */
+function refineCone(pos, p0) {
+  const { c, ext } = extentOf(pos);
+  const ax0 = normalize(p0.axis);
+  const [t1, t2] = tangentFrame(ax0);
+  const zc = dot(sub(c, p0.apex), ax0);
+  const c0 = [p0.apex[0] + zc * ax0[0], p0.apex[1] + zc * ax0[1], p0.apex[2] + zc * ax0[2]];
+  const unpack = (x) => ({
+    ref: [c0[0] + (x[0] * t1[0] + x[1] * t2[0]) * ext,
+          c0[1] + (x[0] * t1[1] + x[1] * t2[1]) * ext,
+          c0[2] + (x[0] * t1[2] + x[1] * t2[2]) * ext],
+    axis: normalize([ax0[0] + x[2] * t1[0] + x[3] * t2[0],
+                     ax0[1] + x[2] * t1[1] + x[3] * t2[1],
+                     ax0[2] + x[2] * t1[2] + x[3] * t2[2]]),
+    r0: x[4] * ext,
+    a: x[5],
+  });
+  const dist = (x, out) => {
+    const { ref, axis, r0, a } = unpack(x);
+    const ca = Math.cos(a), ta = Math.tan(a);
+    for (let i = 0; i < pos.n; i++) {
+      const dx = pos.P[i * 3] - ref[0], dy = pos.P[i * 3 + 1] - ref[1], dz = pos.P[i * 3 + 2] - ref[2];
+      const z = dx * axis[0] + dy * axis[1] + dz * axis[2];
+      const rho = Math.sqrt(Math.max(0, dx * dx + dy * dy + dz * dz - z * z));
+      out[i] = (rho - r0 - z * ta) * ca;
+    }
+  };
+  const x0 = [0, 0, 0, 0, (zc * Math.tan(p0.halfAngle)) / ext, p0.halfAngle];
+  const t = robustFit(pos, x0, new Array(6).fill(1e-7), dist, ext);
+  if (!t) return null;
+  t.fit = null;
+  let { ref, axis, r0, a } = unpack(t.x);
+  if (a < 0) { a = -a; axis = [-axis[0], -axis[1], -axis[2]]; }
+  if (!(a > 1e-4) || !(a < 1.5533) || !isFinite(t.rms)) return t;   // (0, 89 deg), as fitCone
+  // radius r0 at `ref` shrinks to zero a distance r0 / tan(a) back along the (opening) axis
+  const back = r0 / Math.tan(a);
+  const apex = [ref[0] - back * axis[0], ref[1] - back * axis[1], ref[2] - back * axis[2]];
+  if (apex.every(Number.isFinite)) {
+    t.fit = { type: 'cone', params: { axis, apex, halfAngle: a }, residual: t.rms };
+  }
+  return t;
+}
+
+/** Refine a cylinder on vertex distance: axis point (2), axis (2), radius. */
+function refineCylinder(pos, p0) {
+  const { c, ext } = extentOf(pos);
+  const ax0 = normalize(p0.axis);
+  const [t1, t2] = tangentFrame(ax0);
+  const zc = dot(sub(c, p0.axisPoint), ax0);
+  const c0 = [p0.axisPoint[0] + zc * ax0[0], p0.axisPoint[1] + zc * ax0[1], p0.axisPoint[2] + zc * ax0[2]];
+  const unpack = (x) => ({
+    point: [c0[0] + (x[0] * t1[0] + x[1] * t2[0]) * ext,
+            c0[1] + (x[0] * t1[1] + x[1] * t2[1]) * ext,
+            c0[2] + (x[0] * t1[2] + x[1] * t2[2]) * ext],
+    axis: normalize([ax0[0] + x[2] * t1[0] + x[3] * t2[0],
+                     ax0[1] + x[2] * t1[1] + x[3] * t2[1],
+                     ax0[2] + x[2] * t1[2] + x[3] * t2[2]]),
+    radius: x[4] * ext,
+  });
+  const dist = (x, out) => {
+    const { point, axis, radius } = unpack(x);
+    for (let i = 0; i < pos.n; i++) {
+      const dx = pos.P[i * 3] - point[0], dy = pos.P[i * 3 + 1] - point[1], dz = pos.P[i * 3 + 2] - point[2];
+      const z = dx * axis[0] + dy * axis[1] + dz * axis[2];
+      out[i] = Math.sqrt(Math.max(0, dx * dx + dy * dy + dz * dz - z * z)) - radius;
+    }
+  };
+  const t = robustFit(pos, [0, 0, 0, 0, p0.radius / ext], new Array(5).fill(1e-7), dist, ext);
+  if (!t) return null;
+  t.fit = null;
+  const { point, axis, radius } = unpack(t.x);
+  if (radius > 0 && point.every(Number.isFinite) && isFinite(t.rms)) {
+    t.fit = { type: 'cylinder', params: { axis, axisPoint: point, radius }, residual: t.rms };
+  }
+  return t;
+}
+
+/** Refine a torus on vertex distance: centre (3), axis (2), R, r. */
+function refineTorus(pos, p0) {
+  const { ext } = extentOf(pos);
+  const ax0 = normalize(p0.axis);
+  const [t1, t2] = tangentFrame(ax0);
+  const c0 = p0.center;
+  const unpack = (x) => ({
+    center: [c0[0] + (x[0] * t1[0] + x[1] * t2[0] + x[2] * ax0[0]) * ext,
+             c0[1] + (x[0] * t1[1] + x[1] * t2[1] + x[2] * ax0[1]) * ext,
+             c0[2] + (x[0] * t1[2] + x[1] * t2[2] + x[2] * ax0[2]) * ext],
+    axis: normalize([ax0[0] + x[3] * t1[0] + x[4] * t2[0],
+                     ax0[1] + x[3] * t1[1] + x[4] * t2[1],
+                     ax0[2] + x[3] * t1[2] + x[4] * t2[2]]),
+    R: x[5] * ext,
+    r: x[6] * ext,
+  });
+  const dist = (x, out) => {
+    const { center, axis, R, r } = unpack(x);
+    for (let i = 0; i < pos.n; i++) {
+      const dx = pos.P[i * 3] - center[0], dy = pos.P[i * 3 + 1] - center[1], dz = pos.P[i * 3 + 2] - center[2];
+      const z = dx * axis[0] + dy * axis[1] + dz * axis[2];
+      const rho = Math.sqrt(Math.max(0, dx * dx + dy * dy + dz * dz - z * z));
+      out[i] = Math.hypot(rho - R, z) - r;
+    }
+  };
+  const x0 = [0, 0, 0, 0, 0, p0.majorRadius / ext, p0.minorRadius / ext];
+  const t = robustFit(pos, x0, new Array(7).fill(1e-7), dist, ext);
+  if (!t) return null;
+  t.fit = null;
+  const { center, axis, R, r } = unpack(t.x);
+  if (R > 0 && r > 0 && center.every(Number.isFinite) && isFinite(t.rms)) {
+    t.fit = { type: 'torus', params: { axis, center, majorRadius: R, minorRadius: r }, residual: t.rms };
+  }
+  return t;
+}
+
+/** Refine a plane on vertex distance: normal (2), offset along it. */
+function refinePlane(pos, p0) {
+  const { c, ext } = extentOf(pos);
+  const n0 = normalize(p0.normal);
+  const [t1, t2] = tangentFrame(n0);
+  const o0 = p0.origin;
+  const unpack = (x) => ({
+    normal: normalize([n0[0] + x[0] * t1[0] + x[1] * t2[0],
+                       n0[1] + x[0] * t1[1] + x[1] * t2[1],
+                       n0[2] + x[0] * t1[2] + x[1] * t2[2]]),
+    origin: [o0[0] + x[2] * ext * n0[0], o0[1] + x[2] * ext * n0[1], o0[2] + x[2] * ext * n0[2]],
+  });
+  const dist = (x, out) => {
+    const { normal, origin } = unpack(x);
+    for (let i = 0; i < pos.n; i++) {
+      out[i] = (pos.P[i * 3] - origin[0]) * normal[0] + (pos.P[i * 3 + 1] - origin[1]) * normal[1]
+             + (pos.P[i * 3 + 2] - origin[2]) * normal[2];
+    }
+  };
+  const t = robustFit(pos, [0, 0, 0], [1e-7, 1e-7, 1e-7], dist, ext);
+  if (!t) return null;
+  t.fit = null;
+  const { normal, origin } = unpack(t.x);
+  if (normal.every(Number.isFinite) && isFinite(t.rms)) {
+    // Keep the reported origin beside the region: the region's centre, dropped onto the plane.
+    const h = dot(sub(c, origin), normal);
+    t.fit = { type: 'plane', params: { origin: [c[0] - h * normal[0], c[1] - h * normal[1], c[2] - h * normal[2]], normal },
+              residual: t.rms };
+  }
+  return t;
+}
+
+/** Refine a sphere on vertex distance: centre (3), radius. */
+function refineSphere(pos, p0) {
+  const { ext } = extentOf(pos);
+  const c0 = p0.center;
+  const unpack = (x) => ({
+    center: [c0[0] + x[0] * ext, c0[1] + x[1] * ext, c0[2] + x[2] * ext],
+    radius: x[3] * ext,
+  });
+  const dist = (x, out) => {
+    const { center, radius } = unpack(x);
+    for (let i = 0; i < pos.n; i++) {
+      out[i] = Math.hypot(pos.P[i * 3] - center[0], pos.P[i * 3 + 1] - center[1], pos.P[i * 3 + 2] - center[2]) - radius;
+    }
+  };
+  const t = robustFit(pos, [0, 0, 0, p0.radius / ext], new Array(4).fill(1e-7), dist, ext);
+  if (!t) return null;
+  t.fit = null;
+  const { center, radius } = unpack(t.x);
+  if (radius > 0 && center.every(Number.isFinite) && isFinite(t.rms)) {
+    t.fit = { type: 'sphere', params: { center, radius }, residual: t.rms };
+  }
+  return t;
+}
+
+/**
+ * One-facet plane hypotheses: the plane of a facet, for a few facets spread through the region.
+ *
+ * Every refinement starts from the region's own statistics, and on an impure region those
+ * are pulled by the foreign facets - worst when the foreign facets are LARGE, since every
+ * estimate here is area-weighted. OCCT meshes a planar cap as a fan of long slivers, so a
+ * cylinder region with three cap facets can carry more cap area than cylinder area, and the
+ * PCA plane of a plane region with a few wall facets is simply the wrong plane. A facet of
+ * the true plane lies exactly in it, so its plane is an exact minimal-sample hypothesis in
+ * the RANSAC sense, needing no estimate from the region at all.
+ */
+function planeStarts(g, k = 8) {
+  const meanN = weightedMean3(g.N, g.W, g.n, g.wSum);
+  const out = [];
+  const stride = Math.max(1, Math.floor(g.n / k));
+  for (let i = 0; i < g.n && out.length < k; i += stride) {
+    let normal = [g.N[i * 3], g.N[i * 3 + 1], g.N[i * 3 + 2]];
+    if (!(norm(normal) > 0.5)) continue;
+    if (dot(normal, meanN) < 0) normal = [-normal[0], -normal[1], -normal[2]];
+    out.push({ startOnly: true, params: { origin: [g.P[i * 3], g.P[i * 3 + 1], g.P[i * 3 + 2]], normal } });
+  }
+  return out;
+}
+
+/** Sine of the angle between each facet normal and the surface's normal at its centroid. */
+function normalMisfit(type, p, g) {
+  const out = new Float64Array(g.n);
+  for (let i = 0; i < g.n; i++) {
+    const x = g.P[i * 3], y = g.P[i * 3 + 1], z = g.P[i * 3 + 2];
+    let s;
+    if (type === 'plane') {
+      s = p.normal;
+    } else if (type === 'sphere') {
+      s = [x - p.center[0], y - p.center[1], z - p.center[2]];
+    } else {
+      const a = normalize(p.axis);
+      const o = type === 'cylinder' ? p.axisPoint : type === 'cone' ? p.apex : p.center;
+      const dx = x - o[0], dy = y - o[1], dz = z - o[2];
+      const t = dx * a[0] + dy * a[1] + dz * a[2];
+      let rx = dx - t * a[0], ry = dy - t * a[1], rz = dz - t * a[2];
+      const rn = Math.hypot(rx, ry, rz);
+      if (rn > 0) { rx /= rn; ry /= rn; rz /= rn; }
+      if (type === 'cylinder') {
+        s = [rx, ry, rz];
+      } else if (type === 'cone') {
+        const ca = Math.cos(p.halfAngle), sa = Math.sin(p.halfAngle);
+        s = [rx * ca - a[0] * sa, ry * ca - a[1] * sa, rz * ca - a[2] * sa];
+      } else {
+        s = [dx - p.majorRadius * rx, dy - p.majorRadius * ry, dz - p.majorRadius * rz];
+      }
+    }
+    const sl = Math.hypot(s[0], s[1], s[2]);
+    const c = sl > 0 ? Math.abs(g.N[i * 3] * s[0] + g.N[i * 3 + 1] * s[1] + g.N[i * 3 + 2] * s[2]) / sl : 0;
+    out[i] = Math.sqrt(Math.max(0, 1 - Math.min(1, c * c)));
+  }
+  return out;
+}
+
+const madOf = (a) => {
+  const s = Array.from(a, Math.abs).sort((p, q) => p - q);
+  return s.length ? 1.4826 * s[s.length >> 1] : Infinity;
+};
+
+/**
+ * Refine several starts; return the best of the starts and their refinements.
+ *
+ * Multi-start because the failures left after refining a single start were all BASIN
+ * errors, not precision errors: faces of 6-30 facets whose start sat 30-90 deg from the
+ * true axis, where no local method helps.
+ *
+ * CANDIDATES ARE JUDGED ON POSITIONS AND NORMALS TOGETHER, each by a Cauchy cost
+ * sum w log(1 + (e / s)^2) at ONE scale shared by all candidates - the smallest robust scale
+ * any candidate reaches, never below what float32 coordinates can represent. Shared, because
+ * each fit's own scale would make them incomparable; Cauchy, because plain squares would hand
+ * the choice back to foreign facets, whose cost this grows only logarithmically.
+ *
+ * Positions alone were tried first and lost 61 game-art cylinders of 4-8 facets that the
+ * analytic start had right (dev 1e-5 -> 1e-3 of the part). Six to eight vertices barely
+ * constrain a five-parameter cylinder, and least squares found another one through them. But
+ * a low-poly prism's facet normals are EXACTLY perpendicular to the true axis, which is why
+ * the Gauss-map start was right; the normal term restores that evidence. Normals also carry
+ * what quantisation erases on narrow bands: on WatchStand's 29-facet 59 deg cones, vertices
+ * at 3e-9 cannot tell 59.00 from 58.68 deg, while the facet normals disagree 10x.
+ *
+ * @param {object} g           gathered region (facet centroids and normals)
+ * @param {object} pos         positional sample set
+ * @param {Array<{params:object, startOnly?:boolean}>} starts  fits, or bare starts marked startOnly
+ * @param {string} type
+ * @param {Function} refine    refinePlane / refineCylinder / refineCone / refineSphere / refineTorus
+ * @param {boolean} [dedupe]   refine starts whose axes agree within ~1 deg only once
+ */
+function refineBest(g, pos, starts, type, refine, dedupe = true) {
+  const { ext } = extentOf(pos);
+  const cands = [];
+  const axes = [];
+  for (const s of starts) {
+    if (!s || !s.params) continue;
+    if (dedupe) {
+      const a = normalize(s.params.axis ?? s.params.normal);
+      if (axes.some(b => Math.abs(dot(a, b)) > 0.9998)) continue;
+      axes.push(a);
+    }
+    const r = refine(pos, s.params);
+    if (!r) continue;
+    if (!s.startOnly) cands.push({ fit: s, d: r.d0 });
+    if (r.fit) {
+      cands.push({ fit: r.fit, d: r.d });
+      if (r.fit.residual <= EXACT_REL * ext) break;
+    }
+  }
+  if (cands.length <= 1) return cands.length ? cands[0].fit : null;
+
+  // float32 coordinates are exact to ~6e-8 of their magnitude; below that neither distances
+  // nor facet normals (that quantum over an edge length) carry information.
+  let big = 0;
+  for (let i = 0; i < pos.n * 3; i++) big = Math.max(big, Math.abs(pos.P[i]));
+  const quantum = 6e-8 * big;
+  const edge = Math.sqrt(2 * g.wSum / g.n);
+  let sp = Infinity, sn = Infinity;
+  for (const c of cands) {
+    c.e = normalMisfit(type, c.fit.params, g);
+    sp = Math.min(sp, madOf(c.d));
+    sn = Math.min(sn, madOf(c.e));
+  }
+  sp = Math.max(sp, quantum, 1e-12 * ext);
+  sn = Math.max(sn, edge > 0 ? quantum / edge : 0, 1e-12);
+
+  let best = null, bestCost = Infinity;
+  for (const c of cands) {
+    let cost = 0;
+    for (let i = 0; i < pos.n; i++) cost += pos.W[i] * Math.log1p((c.d[i] / sp) ** 2);
+    for (let i = 0; i < g.n; i++) cost += g.W[i] * Math.log1p((c.e[i] / sn) ** 2);
+    if (cost < bestCost) { bestCost = cost; best = c.fit; }
+  }
+  return best;
 }
 
 /**
@@ -833,7 +1422,8 @@ const ORDER = { plane: 0, cylinder: 1, cone: 2, sphere: 3, torus: 4 };
  *
  * @param {Set<number>|number[]} triIndices
  * @param {{count,centroids,normals,areas}} facets  from meshCore.buildFacets
- * @param {{tol?:number, maxTol?:number}} [opts]
+ * @param {{tol?:number, maxTol?:number, ratio?:number}} [opts]
+ *        ratio  ...and whose residual is within this factor of the best candidate's
  *        tol    accept the simplest surface whose relative residual is under this
  *        maxTol beyond this nothing is considered an analytic fit -> 'nurbs'
  * @returns {{type,params,residual,relResidual,gauss,candidates}}
@@ -869,18 +1459,30 @@ export function classifyRegion(triIndices, facets, opts = {}) {
   const candidates = [];
   const push = c => { if (c && isFinite(c.residual)) candidates.push(c); };
 
-  push(fitPlane(g));
+  // EVERY CANDIDATE IS REFINED before any is compared. The choice below asks whether a simpler
+  // primitive explains the region as well as the best one, and that is only meaningful between
+  // fits that have each reached their own optimum: set a refined torus beside an unrefined
+  // cylinder and the torus wins regions it has no business winning.
+  const pos = positional(g);
+  const plane = fitPlane(g);
+  push(refineBest(g, pos, [plane, ...planeStarts(g)], 'plane', refinePlane) ?? plane);
 
   // Narrow bands are degenerate in normal space (the two smallest eigenvalues
   // are close and either may be the true axis), so try both as axis candidates.
   const axisCandidates = [vectors[0]];
   if (values[1] > 0 && (values[0] / values[1]) > 0.1) axisCandidates.push(vectors[1]);
 
+  const cyls = [], cones = [];
   for (const ax of axisCandidates) {
-    push(fitCylinder(g, ax));
-    push(fitCone(g, ax));
+    const cy = fitCylinder(g, ax);
+    if (cy) cyls.push(cy);
+    const co = fitCone(g, ax);
+    if (co) cones.push(co);
   }
-  push(fitSphere(g));
+  push(refineBest(g, pos, cyls, 'cylinder', refineCylinder));
+  push(refineBest(g, pos, cones, 'cone', refineCone));
+  const sphere = fitSphere(g);
+  push(sphere && (refineBest(g, pos, [sphere], 'sphere', refineSphere, false) ?? sphere));
 
   // A torus has seven parameters against a cylinder's five, so on residual alone it
   // could impersonate the simpler primitives. Measured on tangent-fillet, it does not:
@@ -901,8 +1503,31 @@ export function classifyRegion(triIndices, facets, opts = {}) {
   // Prefer the SIMPLEST surface that explains the data, not merely the lowest
   // residual — a more general primitive always fits at least as well, so raw
   // residual comparison across differing degrees of freedom is not meaningful.
+  //
+  // "Explains the data" is RELATIVE TO THE BEST FIT, not a fixed fraction of the region. A flat
+  // 1% of extent let a plane take a shallow cylindrical arc whose sagitta is under 1% of it, and
+  // for export that is a face whose edges miss their neighbours by up to 1% of the face. A
+  // simpler primitive is accepted when its residual is within `ratio` of the best candidate's -
+  // or of the float32 quantum, below which no two fits differ measurably - and still under tol.
+  //
+  // Measured on 40 validation parts x 3 meshers, true type returned (test/fitTruth.mjs --ratio):
+  //
+  //     ratio        cylinder  cone   sphere  torus
+  //     2              85.4    95.4   93.2    94.9
+  //     4              87.2    97.5   94.2    94.5
+  //     8              89.1    98.2   94.2    92.8
+  //     unlimited      87.5    93.3   92.2    73.2    (the old rule; 7.6% of cylinders -> plane)
+  //
+  // 4 rather than 8 because the real downloaded mesh does better with it (watchstand.mjs:
+  // WatchStandCoarse 21/77 at 4, 19 at 8). The cost of any finite ratio is on IMPURE crease
+  // regions of that mesh: a torus absorbs foreign facets well enough to win, taking two
+  // WatchStandMedium cones (19 -> 17/77) at every ratio tried.
+  let big = 0;
+  for (let i = 0; i < pos.n * 3; i++) big = Math.max(big, Math.abs(pos.P[i]));
+  const bestResidual = Math.max(Math.min(...candidates.map(c => c.residual)), 6e-8 * big);
+  const ratio = opts.ratio ?? 4;
   const acceptable = candidates
-    .filter(c => c.relResidual <= tol)
+    .filter(c => c.relResidual <= tol && c.residual <= ratio * bestResidual)
     .sort((a, b) => ORDER[a.type] - ORDER[b.type] || a.relResidual - b.relResidual);
 
   const best = acceptable[0]
@@ -1006,7 +1631,10 @@ function refineAxis(g, axis0, fitFn, maxIter = 80) {
  */
 export function fitRegionAs(type, triIndices, facets) {
   const g = gather(triIndices, facets);
-  if (g.n < 3 || g.wSum <= 0) {
+  // One triangle already fixes a plane exactly. OCCT meshes a rectangular planar face as TWO
+  // triangles, and refusing those (the old limit of three for every type) left every such face of a
+  // native mesh without a surface, so no solid could close around it.
+  if (g.n < (type === 'plane' ? 1 : 3) || g.wSum <= 0) {
     return { type, params: null, residual: Infinity, relResidual: Infinity,
              degenerate: true, reason: 'too few triangles' };
   }
@@ -1024,8 +1652,16 @@ export function fitRegionAs(type, triIndices, facets) {
     : { type, params: null, residual: Infinity, relResidual: Infinity,
         extent, degenerate: true, reason };
 
-  if (type === 'plane')  return done(fitPlane(g), 'plane fit degenerate');
-  if (type === 'sphere') return done(fitSphere(g), 'normals do not converge on a centre');
+  if (type === 'plane') {
+    const base = fitPlane(g);
+    return done(refineBest(g, positional(g), [base, ...planeStarts(g)], 'plane', refinePlane) ?? base,
+                'plane fit degenerate');
+  }
+  if (type === 'sphere') {
+    const base = fitSphere(g);
+    return done(base && (refineBest(g, positional(g), [base], 'sphere', refineSphere, false) ?? base),
+                'normals do not converge on a centre');
+  }
   if (type === 'torus')  return done(fitTorus(g), 'no consistent tube: {p - r n} is not planar for any r');
   if (type === 'nurbs')  return { type: 'nurbs', params: null, residual: Infinity,
                                   relResidual: Infinity, extent };
@@ -1035,9 +1671,19 @@ export function fitRegionAs(type, triIndices, facets) {
     const cost = axisCost;
     let best = null;
 
+    const found = [];
     for (const seed of axisSeeds(g)) {
       const r = refineAxis(g, seed, fitFn);
-      if (r && isFinite(r.residual) && cost(r) < cost(best)) best = r;
+      if (!r || !isFinite(r.residual)) continue;
+      found.push(r);
+      if (cost(r) < cost(best)) best = r;
+    }
+    if (best) {
+      // The axis criterion's choice first, so it is kept unless a refined fit beats it.
+      found.sort((a, b) => cost(a) - cost(b));
+      const lm = refineBest(g, positional(g), [best, ...found], type,
+                            type === 'cone' ? refineCone : refineCylinder);
+      if (lm) best = lm;
     }
     return done(best, type === 'cone'
       ? 'no apex: the region has no measurable taper (a cone with zero half-angle is a cylinder)'

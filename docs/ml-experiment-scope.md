@@ -1117,6 +1117,177 @@ come from unknown tools, and v3canon when they come from OCCT. The next training
 should add further mesher families before tuning anything else, and be judged on
 membership and type across all of them.
 
+### Removing the triangulation features (v5)
+
+`log_area` (relative triangle area) and `ring` (BFS hop count) describe the mesh, not
+the surface. The NURBS-torus test above already showed `log_area` carries the mesher
+fingerprint. Four runs share v4nogmsh's settings (gmsh held out, NURBS + game-art copies,
+60k steps, curvature zeroed) and today's data:
+
+- `v5ctrl`: nothing extra zeroed
+- `v5noarea`: `log_area` zeroed
+- `v5noring`: `ring` zeroed
+- `v5noboth`: both zeroed
+
+The control exists because the NURBS pool grew after v4nogmsh trained (21,299 copies
+against 19,754), so v4nogmsh is not the same data. `train.py --zero-features` stores the
+columns in the checkpoint. `rescore.py` reads them back, and `export_onnx.py` zeroes
+them inside the ONNX graph so the browser cannot feed them.
+
+**Patch level** (`rescore.py`; native/NURBS/gmsh on 1,801–1,802 identical parts, game art
+on 300):
+
+| | native ctrl | native noboth | nurbs ctrl | nurbs noboth | **gmsh ctrl** | **gmsh noarea** | **gmsh noring** | **gmsh noboth** | game ctrl | game noboth |
+|---|---|---|---|---|---|---|---|---|---|---|
+| membership IoU | 0.774 | 0.743 | 0.735 | 0.727 | 0.545 | 0.579 | 0.569 | **0.620** | 0.670 | 0.635 |
+| macro type acc | 0.684 | 0.651 | 0.614 | 0.611 | 0.470 | 0.498 | 0.486 | **0.542** | 0.480 | 0.467 |
+| Plane | 0.935 | 0.944 | 0.941 | 0.954 | 0.806 | 0.921 | 0.818 | **0.918** | 0.918 | 0.967 |
+| Cylinder | 0.729 | 0.624 | 0.632 | 0.556 | 0.066 | 0.061 | 0.127 | 0.131 | 0.582 | 0.548 |
+| Sphere | 0.911 | 0.915 | 0.860 | 0.880 | 0.674 | 0.615 | 0.661 | **0.853** | 0.667 | 0.677 |
+| Torus | 0.735 | 0.646 | 0.372 | 0.441 | 0.632 | 0.349 | 0.664 | **0.312** | 0.309 | 0.303 |
+| BSpline | 0.592 | 0.543 | 0.618 | 0.572 | 0.394 | 0.665 | 0.360 | **0.645** | 0.365 | 0.362 |
+
+**End to end** (`test/fillEval.mjs`, 80 validation parts, the same clicks as the
+v3canon/v4 baseline). Share of automatic fills that are clean:
+
+| | native | nurbs | gmsh | game |
+|---|---|---|---|---|
+| v3canon | 44% | 35% | 23% | 33% |
+| v4all | 42% | 34% | 28% | 34% |
+| v5ctrl | 44% | 36% | 24% | 34% |
+| v5noarea | 40% | 34% | 24% | 32% |
+| v5noring | 42% | 35% | 24% | 32% |
+| v5noboth | 40% | 35% | 24% | 33% |
+
+**Findings.**
+
+1. **Removing both features generalises to an unseen mesher at the patch level.** On
+   gmsh, membership IoU rises 0.545 → 0.620 and macro accuracy 0.470 → 0.542. That is
+   about half the gap to v4all, which trained on gmsh (0.682). Planes, spheres,
+   B-splines and extrusions gain most.
+2. **Cylinders on isotropic meshes are still not fixed** (0.066 → 0.131). Tori get worse
+   without `log_area` (0.632 → 0.312). The features were not the only route to the
+   shortcut, and tori were partly relying on them legitimately.
+3. **The cost on native meshes is real but modest:** IoU −0.031, macro −0.033,
+   Cylinder −0.10. Game art, which all four runs trained on, gains nothing.
+4. **On hand-made meshes** (`meshReport`), removing `log_area` moves the Cone fallback
+   to B-spline on organic meshes (Master Chief 8% → 37%) and to Plane or Cylinder on
+   low-poly art. Cone share falls by 10–18 points and bogus fits by a few points. `ring`
+   alone does little.
+5. **None of it reaches the user.** Clean fills stay flat or fall (native 44% → 40%,
+   gmsh 24% everywhere). On gmsh about 60% of fills spill, for every model and even with
+   the true type declared. **`paintFrom`'s growth step is the cap on fill quality**, so
+   no further training run should be judged on fills until that spill is diagnosed.
+
+### Surface hypothesis head (s1, s2, s3)
+
+The spill diagnosis showed two things:
+- `paintFrom`'s acceptance test admits facets of neighbouring analytic faces.
+- The fitters fail on the small regions a click provides: 12-facet torus seeds come back
+  degenerate 46% of the time.
+
+This experiment gives the seeded-fill model a third output, **the analytic surface under the
+seed**, used inside segmentation to guide growth. Final geometry still comes only from the
+analytic fitters on the selected facets.
+
+**Parameterisation** (`ml/surface_targets.py`), in the patch frame (seed at the origin, seed
+normal +Z, lengths / scale):
+- the axis, sign-free
+- `asinh(kn)`, with kn = scale / (distance along the seed normal to the axis, centre or tube
+  centre), signed by which side that point lies
+- for tori, `asinh(ks)`, with ks = side × scale / R
+
+Radii, centres and the cone apex follow from these plus the seed facet. A cone's half-angle
+is |n · axis|.
+
+**Labels:**
+- `ml/surface_sidecar.py` reads exact parameters from STEP for every face: 24,990 models,
+  3.01 M faces, 0 face-order mismatches, 9 minutes.
+- Faces without an exact stored primitive carry no surface loss.
+- `ml/test_surface_targets.py` round-trips targets → surface → distance of the seed face's
+  own vertices. They land within 0.1–0.3% of patch scale, which is the chord offset of
+  reconstructing through the seed centroid. The seed is facet 0 of every patch.
+
+**Runs.** v5noboth's settings (60k steps, `log_area` and `ring` zeroed, NURBS + game-art
+copies) plus `--surface-root`:
+- `s1nogmsh`: curvature off, gmsh held out
+- `s2nogmsh_curv`: curvature on
+- `s3all`: curvature off, gmsh in training
+
+Native validation IoU is 0.809 / 0.800 / 0.802.
+
+**Parameters** (`ml/surface_eval.py`, 250 validation parts):
+
+| | s1 native | s2 native | s3 native | s1 gmsh | s3 gmsh |
+|---|---|---|---|---|---|
+| axis error p50 (cylinder / cone / torus) | 2.7 / 5.2 / 4.9° | 2.7 / 6.0 / 5.9° | 2.2 / 5.6 / 5.7° | 5.8 / 7.2 / 5.2° | 2.9 / 6.7 / 5.9° |
+| cylinder axis p90 | 10.6° | 11.4° | 8.3° | **74.7°** | 12.3° |
+| kn sign, curved types | 95–100% | 95–100% | 96–100% | 91–100% | 94–100% |
+| \|kn\| relative error p50 | 0.07–0.13 | 0.12–0.16 | 0.06–0.14 | 0.08–0.23 | 0.07–0.22 |
+
+**As a strict in-patch gate** (paintFrom's tolD and 15°, true type, predicted parameters),
+the hypothesis under-fills. Clean patches on native meshes, true surface vs predicted
+parameters (s1):
+
+| | true surface | predicted |
+|---|---|---|
+| Cylinder | 49% | 22% |
+| Cone | 68% | 18% |
+| Torus | 67% | 8% |
+
+Recall p50 is 0.33–0.59. Locally the parameters are good, but a few degrees of axis error or
+10% of curvature puts the far side of a 512-facet patch outside tolD.
+
+**End to end** (`test/surfaceGateEval.mjs`, the fillEval clicks, true type declared). Clean
+fills:
+- `paintFrom`: today's fill from the model's region
+- `+`: with the adaptive angle tolerance and membership veto
+- `hyp → fit`: grow with the hypothesis surface, then hand that region to paintFrom
+
+| | paintFrom | paintFrom+ | hyp → fit | hyp → fit+ |
+|---|---|---|---|---|
+| s1 native | 49% | 48% | **57%** | 56% |
+| s3 native | 48% | 45% | **56%** | 54% |
+| s1 gmsh | 29% | 31% | 31% | 32% |
+| s3 gmsh | 28% | **35%** | 30% | 33% |
+| s1 game | **33%** | 32% | 28% | 27% |
+| s3 game | **32%** | **32%** | 28% | 28% |
+
+With the model's own type instead ("auto"), native goes 40% → 46% (s1) and 38% → 42% (s3).
+By true type on native, s1, paintFrom → hyp → fit:
+
+| | paintFrom | hyp → fit |
+|---|---|---|
+| Cylinder | 41% | 47% |
+| Cone | 53% | 65% |
+| Sphere | 71% | 85% |
+| Torus | 32% | 45% |
+| Plane | 61% | 62% |
+
+**Findings.**
+
+1. **The predicted surface works as a START for the exact fitter, not as a boundary.** Handing
+   a hypothesis-grown region to paintFrom gains 8 points on native meshes. The curved types
+   gain most: tori +13, cones +12, spheres +14. Using the hypothesis as the boundary (`hyp
+   only`) or as a filter on the fitted fill (`fit & hyp`) under-fills and scores below today.
+   A looser 3× gate before the handoff changes nothing.
+2. **gmsh is limited by the acceptance test, not the start.** Even s3, trained on gmsh, gains
+   only 2 points from the hypothesis start, and spill stays above 50%. What helps there is
+   the adaptive angle + veto (s3: 28% → 35%, planes 52% → 82%).
+3. **The veto's earlier gain does not transfer across models.** With v4all's membership head
+   it added about 10 points on native. With s1 and s3 it trades spill for incompleteness
+   almost one for one (spill −11, incomplete +10). Its value depends on how the membership
+   head is calibrated, so each model has to be measured, not assumed.
+4. **Game art does not benefit.** Low-poly faces have too few facets, and the hypothesis
+   start leaves 59–64% of fills incomplete.
+5. **Curvature inputs do not help the surface head** (s2 ≤ s1). **Training on gmsh repeats
+   v4all's trade:** gmsh cylinder axes fix (p90 75° → 12°), but native torus type accuracy
+   falls (68% → 39%).
+
+**Not built yet:** the hypothesis start in `js/seedNet.js` / `js/regionGrow.js` (it exists
+only in the harness), and a boundary step that resolves the spill/incompleteness trade at
+the acceptance test itself.
+
 ### Synthesis, and the statistic that has to match
 
 With disguised primitives removed, genuine revolves are 60 seeds in the 2,000-part

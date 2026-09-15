@@ -234,7 +234,7 @@ const normalOf = (facets, t) =>
  * @param {number} cosTolA min |cos| between facet normal and surface normal
  * @param {Uint8Array} taken  facets already committed to another region
  */
-function growOn(seed, facets, adjacency, type, params, tolD, cosTolA, taken) {
+function growOn(seed, facets, adjacency, type, params, tolD, cosTolA, taken, creaseDeg = Infinity) {
   const ev = surfaceEval(type, params);
   if (!ev) return new Set();
 
@@ -253,6 +253,7 @@ function growOn(seed, facets, adjacency, type, params, tolD, cosTolA, taken) {
     for (const e of adjacency.get(t) || []) {
       const nb = e.neighbor;
       if (taken[nb] || region.has(nb)) continue;
+      if (e.angle >= creaseDeg) continue;   // a crease is a wall, whatever the fit says
       if (!fits(nb)) continue;
       region.add(nb);
       queue.push(nb);
@@ -262,16 +263,73 @@ function growOn(seed, facets, adjacency, type, params, tolD, cosTolA, taken) {
 }
 
 /** Small connected neighbourhood around a seed, used to propose a primitive. */
-function neighbourhood(seed, adjacency, taken, want) {
+function neighbourhood(seed, adjacency, taken, want, creaseDeg = Infinity) {
   const out = new Set([seed]);
   const queue = [seed];
   while (queue.length && out.size < want) {
     const t = queue.shift();
     for (const e of adjacency.get(t) || []) {
-      if (taken[e.neighbor] || out.has(e.neighbor)) continue;
+      if (taken[e.neighbor] || out.has(e.neighbor) || e.angle >= creaseDeg) continue;
       out.add(e.neighbor);
       queue.push(e.neighbor);
       if (out.size >= want) break;
+    }
+  }
+  return out;
+}
+
+/**
+ * CREASE BARRIER: paintFrom never grows across an edge whose dihedral angle is at or above
+ * the angle for the surface being painted. A drifting refit cannot carry a fill over a sharp
+ * edge, whatever the fit then says about the triangles beyond it.
+ *
+ * The angle depends on the type because a curved face is tessellated with real dihedrals
+ * INSIDE it, while a plane has none. Measured on 80 ABC parts (test/creaseStats.mjs): the
+ * within-face dihedral of planes is 0.0 at p99 on every mesher, so 2 degrees costs no reach;
+ * cylinders, cones and spheres keep their full reach from about 20-30 degrees on OCCT meshes
+ * but need 30 on gmsh and game-style meshes; tori need 45.
+ *
+ * End to end (test/fillEval.mjs --declared-only, true type, no model), clean fills went from
+ * 19% to 56% on OCCT meshes, 12 to 48% on NURBS-converted, 15 to 44% on gmsh and 15 to 31%
+ * on game-style meshes. Planes gained most (OCCT plane clean 8% -> 90%). Alternatives on the
+ * same clicks: one 30-degree barrier for every type, 50/42/32/27%; plane 5 instead of 2,
+ * 51/44/43/30%; curved types at 20 or 15 instead of 30, down to 33% on gmsh and 19% on game,
+ * because those meshes put 20-30 degree dihedrals inside a single cylinder.
+ * The plane angle assumes CAD-exported meshes: a noisy scan's planes are not flat to 2 degrees.
+ *
+ * A barrier can never see a TANGENT boundary (a fillet meeting a face), which has no crease;
+ * about half the neighbouring faces of different types in ABC meet that way. Those are still
+ * the surface test's job.
+ */
+export const CREASE_BARRIER = Object.freeze({ plane: 2, cylinder: 30, cone: 30, sphere: 30, torus: 45 });
+
+/**
+ * The dihedral angle, in degrees, at which growth for `type` treats an edge as a wall.
+ * `crease` is a number for every type, a { type: degrees } table, or null for no wall.
+ */
+export function creaseFor(crease, type) {
+  if (typeof crease === 'number') return crease;
+  return crease?.[type] ?? Infinity;
+}
+
+/**
+ * The triangles of `allowed` reachable from `seed` without crossing an edge whose dihedral is
+ * at or above `creaseDeg`. The seed itself is always included. With no barrier (Infinity)
+ * nothing is cut.
+ */
+export function creaseComponent(seed, allowed, adjacency, creaseDeg) {
+  const out = new Set([seed]);
+  if (!Number.isFinite(creaseDeg)) {
+    for (const t of allowed) out.add(t);
+    return out;
+  }
+  const stack = [seed];
+  while (stack.length) {
+    const t = stack.pop();
+    for (const e of adjacency.get(t) || []) {
+      if (e.angle >= creaseDeg || out.has(e.neighbor) || !allowed.has(e.neighbor)) continue;
+      out.add(e.neighbor);
+      stack.push(e.neighbor);
     }
   }
   return out;
@@ -429,31 +487,36 @@ export function growPrimitives(facets, adjacency, opts = {}) {
  *   spanning three faces:
  *     paint PLANE on the base ....... purity 100%, recall 100%
  *     paint CYLINDER on the wall .... purity  75%, recall 100%, r=19.986 (true 20)
- *     paint PLANE on the top ........ purity  73%, recall 100%
- *   The ~25% over-reach is the tangent blend: near the junction the fillet
- *   really is inside tolerance of the cylinder. Tightening tolScale trades
- *   that purity back against recall.
+ *     paint PLANE on the top ........ purity 100%, recall 100%  (73% before CREASE_BARRIER)
+ *   The cylinder's ~25% over-reach is the tangent blend: near the junction the
+ *   fillet really is inside tolerance of the cylinder, and a tangent junction
+ *   has no crease for the barrier to stop at. Tightening tolScale trades that
+ *   purity back against recall.
  *
- *   WatchStandMedium conical faces .. 0/4, half-angles come back 22, 0.6, 0.57,
- *   89 deg. NOT a tolerance problem: flat at 0/4 across seedSize 12-80 x
- *   tolScale 0.5-1.5. The cause is the seed patch — neighbourhood() is a plain
- *   adjacency BFS, so on a face that is small next to its neighbours it crosses
- *   the boundary and the first fit is poisoned before growth starts.
+ *   WatchStandMedium conical faces .. 3/4 with CREASE_BARRIER (was 1/4): the
+ *   59 and 45 deg cones now come back to 0.04 deg. The failure before was the
+ *   seed patch: neighbourhood() was a plain adjacency BFS, so on a face small
+ *   next to its neighbours it crossed the boundary and poisoned the first fit.
+ *   The seed patch is now crease-bounded, and so is growth. The remaining miss
+ *   is a 9.85 deg cone whose 12-triangle seed recovers only 3.7 deg.
  *
- * NEXT: seed from a CREASE-bounded patch (locally coherent, never crosses a
- * sharp edge) and then switch to surface-bounded growth. Crease angle is the
- * wrong tool for the boundary but the right one for picking a clean starting
- * patch; this module currently uses it for neither.
+ * Crease angle is still the wrong tool at a TANGENT boundary (no crease), so it
+ * is a wall added to the surface test, never a replacement for it.
  */
 export function paintFrom(seedTri, type, facets, adjacency, opts = {}) {
   const tolD = (opts.tolScale ?? 0.5) * medianFacetSize(facets);
   const cosTolA = Math.cos((opts.angleTol ?? 15) * Math.PI / 180);
   const iterations = opts.iterations ?? 4;
-  const none = new Uint8Array(facets.count);
+  const creaseDeg = creaseFor(opts.crease === undefined ? CREASE_BARRIER : opts.crease, type);
+  // opts.taken: facets already painted into another group, which growth never enters.
+  const none = opts.taken ?? new Uint8Array(facets.count);
 
+  // A supplied region (a model's proposal) is cut back to the part the click can reach without
+  // crossing a crease, or a proposal spanning a bend would carry the fill over it.
   let region = opts.seedRegion && opts.seedRegion.size
-    ? new Set(opts.seedRegion)
-    : neighbourhood(seedTri, adjacency, none, opts.seedSize ?? 12);
+    ? creaseComponent(seedTri, opts.seedRegion, adjacency, creaseDeg)
+    : neighbourhood(seedTri, adjacency, none, opts.seedSize ?? 12, creaseDeg);
+  if (opts.taken) for (const t of region) if (t !== seedTri && opts.taken[t]) region.delete(t);
 
   let fit = fitRegionAs(type, region, facets);
   if (fit.degenerate || !fit.params) {
@@ -466,7 +529,7 @@ export function paintFrom(seedTri, type, facets, adjacency, opts = {}) {
   // Each refit sees more of the surface and claims more of it in turn.
   for (let i = 0; i < iterations; i++) {
     const grown = growOn(region, facets, adjacency, type, fit.params,
-                         tolD, cosTolA, none);
+                         tolD, cosTolA, none, creaseDeg);
     if (grown.size === 0) break;
 
     const refit = fitRegionAs(type, grown, facets);

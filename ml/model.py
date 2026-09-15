@@ -53,13 +53,20 @@ def mlp(sizes: list[int]) -> nn.Sequential:
 
 
 class SeedFillNet(nn.Module):
-    def __init__(self, in_features: int = 10, n_types: int = 9, width: int = 256):
+    def __init__(self, in_features: int = 10, n_types: int = 9, width: int = 256,
+                 surface: bool = False, n_surface: int = 5):
         super().__init__()
         w = width
         self.enc1 = mlp([in_features, w // 4, w // 2])     # local features
         self.enc2 = mlp([w // 2, w, w])                    # features that get pooled
         self.seg = mlp([w // 2 + w, w, w // 2, 1])         # per-facet membership
         self.cls = mlp([w, w // 2, n_types])               # per-patch surface type
+        # Optional surface hypothesis under the seed (surface_targets.py). It reads the seed
+        # facet's own local embedding as well as the pooled descriptor, because the targets
+        # are defined AT the seed. Off by default, so existing checkpoints load unchanged.
+        self.surface = surface
+        if surface:
+            self.surf = mlp([w // 2 + w, w, w // 2, n_surface])
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor):
         """x: (B, N, F)   mask: (B, N) with 1 for real facets, 0 for padding."""
@@ -73,6 +80,10 @@ class SeedFillNet(nn.Module):
         joined = torch.cat([local, glob.unsqueeze(1).expand(-1, n, -1)], dim=-1)
         same_logit = self.seg(joined).squeeze(-1)     # (B, N)
         type_logit = self.cls(glob)                   # (B, n_types)
+        if self.surface:
+            # the seed is facet 0 of every patch: k_ring starts from it
+            surface = self.surf(torch.cat([local[:, 0], glob], dim=-1))
+            return same_logit, type_logit, surface
         return same_logit, type_logit
 
 
@@ -80,26 +91,50 @@ def count_parameters(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
+class ZeroInputs(nn.Module):
+    """Hold chosen feature columns at zero, as the first operation of the graph."""
+
+    def __init__(self, inner: nn.Module, in_features: int, zero_cols):
+        super().__init__()
+        self.inner = inner
+        keep = torch.ones(in_features)
+        keep[list(zero_cols)] = 0.0
+        self.register_buffer("keep", keep)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor):
+        return self.inner(x * self.keep, mask)
+
+
 def export_onnx(model: nn.Module, path: str, n_facets: int = 512,
-                in_features: int = 10) -> None:
+                in_features: int = 10, zero_cols=()) -> None:
     """Export with a dynamic batch and facet count.
 
     Facet count is dynamic because real patches are ragged and we would rather not pad
     every browser-side call to the training width. Verify the exported graph actually
     runs in onnxruntime-web before trusting the latency budget - a model that exports
     is not automatically a model that runs fast in WASM.
+
+    `zero_cols` are columns the model was trained with at zero. They are zeroed inside
+    the exported graph, so a browser caller cannot feed them by mistake.
     """
     model.eval()
+    has_surface = getattr(model, "surface", False)
+    if zero_cols:
+        model = ZeroInputs(model, in_features, zero_cols).eval()
     x = torch.randn(1, n_facets, in_features)
     m = torch.ones(1, n_facets)
+    names = ["same_logit", "type_logit"] + (["surface"] if has_surface else [])
+    axes = {"features": {0: "batch", 1: "facets"},
+            "mask": {0: "batch", 1: "facets"},
+            "same_logit": {0: "batch", 1: "facets"},
+            "type_logit": {0: "batch"}}
+    if has_surface:
+        axes["surface"] = {0: "batch"}
     torch.onnx.export(
         model, (x, m), path,
         input_names=["features", "mask"],
-        output_names=["same_logit", "type_logit"],
-        dynamic_axes={"features": {0: "batch", 1: "facets"},
-                      "mask": {0: "batch", 1: "facets"},
-                      "same_logit": {0: "batch", 1: "facets"},
-                      "type_logit": {0: "batch"}},
+        output_names=names,
+        dynamic_axes=axes,
         opset_version=17,
     )
 

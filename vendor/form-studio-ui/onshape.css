@@ -1,0 +1,1390 @@
+/*
+ * onshape.css — the chrome of an app that sits inside Onshape and does not
+ * announce itself as a visitor.
+ *
+ * EVERY VALUE HERE WAS MEASURED, on 2026-09-11, out of a live Part Studio by
+ * `tools/style-probe.mjs`. Nothing is a designer's approximation of Onshape and
+ * nothing is copied from a screenshot. The method and the full numbers are
+ * docs/ONSHAPE_STYLE.md; the raw dump is tools/out/style-dark.json, 1,203
+ * resolved custom properties of which 585 change with the theme.
+ *
+ * HOW TO USE IT
+ *
+ *   <link rel="stylesheet" href="onshape.css">
+ *   <body data-os-theme="dark">            <-- Onshape passes ?theme= to the tab
+ *
+ * The theme goes on an ELEMENT, not on a media query, because that is how
+ * Onshape does it: measured, the host is `<body data-os-theme="dark">`, and
+ * `:root` carries the LIGHT set as the default. An app that mirrors that
+ * mechanism can be flipped by the same query parameter the host already sends,
+ * and an app that uses `prefers-color-scheme` instead will be wrong for every
+ * user whose OS and Onshape disagree.
+ *
+ * WHAT THIS IS NOT. It is not a copy of Onshape's component library and it does
+ * not try to be. Reproducing their dialogs would make an app look like a forgery
+ * of a dialog rather than a neighbour of one. What is here is the layer a guest
+ * needs: the palette, the type, and the handful of controls every panel is made
+ * of, at the sizes the product actually uses.
+ */
+
+/* ==========================================================================
+   1. Primitives — the neutral ladder, measured
+   ==========================================================================
+   Onshape's own primitive layer is named after Boston: --os-color-charles-500,
+   --os-color-aquarium, --os-color-boston-terrier, --os-color-noreaster-900.
+   Those names are theirs and carry meaning only inside their system, so this
+   keeps the ROLE layer and resolves the primitives to the values measured.
+   Keeping their private names would be cargo cult; keeping their values is the
+   point. */
+
+:root {
+  /* The greys, light theme first because that is Onshape's default at :root. */
+  --osx-white: #fff;
+  --osx-grey-10: #fafafa;
+  --osx-grey-20: #f5f5f5;
+  --osx-grey-30: #eee;
+  --osx-grey-35: #eaeaea;
+  --osx-grey-40: #d7d7d7;
+  --osx-grey-50: #ccc;
+  --osx-grey-55: #aaa;
+  --osx-grey-60: #999;
+  --osx-grey-70: #888;
+  --osx-grey-75: #666;
+  --osx-grey-80: #555;
+  --osx-grey-85: #444;
+  --osx-grey-90: #333;
+  --osx-grey-95: #2c2c2c;
+  --osx-grey-98: #1c1c1c;
+
+  /* Accents, both themes' values kept as primitives so either can reach them. */
+  --osx-blue-bright: #3e94ff;   /* --os-color-aquarium,   the dark accent   */
+  --osx-blue-deep: #1651b0;     /* --os-color-charles-500, the light accent */
+  --osx-blue-pale: #90cef1;
+  --osx-blue-paler: #b2ddf6;
+  --osx-green: #35bc35;
+  --osx-green-deep: #009400;
+  --osx-amber: #fab601;
+  --osx-amber-pale: #fcda7f;
+  --osx-amber-deep: #dba517;
+  --osx-amber-dark: #6a4f06;
+  --osx-red: #bd3039;
+  --osx-red-deep: #aa252d;
+  --osx-red-pale: #dd979b;
+
+  /* ---- roles, LIGHT (the default, as in the product) ------------------- */
+  --os-background-primary: #fff;
+  --os-background-secondary: #f5f5f5;
+  --os-background-tertiary: #fafafa;
+  --os-background-sunken: #fff;
+  --os-background-raised: #eee;
+  --os-text-primary: #333;
+  --os-text-secondary: #666;
+  --os-text-tertiary: #555;
+  --os-text-disabled: #999;
+  --os-border: #d7d7d7;
+  --os-border-strong: #aaa;
+  --os-accent: #1651b0;
+  --os-accent-contrast: #fff;
+  --os-accent-hover: #134e96;
+  --os-success: #009400;
+  --os-highlight-fill: #fcda7f;
+  --os-highlight-outline: #fab601;
+  --os-field-fill: #fff;
+  --os-field-border: #888;
+  --os-button-fill: #eee;
+  --os-button-fill-hover: #e0e0e0;
+  --os-panel-fill: #f5f5f5;
+  --os-panel-border: #d7d7d7;
+  --os-row-fill-hover: #ecf5fc;
+  --os-row-fill-selected: #b2ddf6;
+
+  /* Viewport roles. The canvas colour is the same token as the primary
+     background in both themes, which is why an app that clears its own canvas
+     to anything else reads as a hole cut in the page. */
+  --os-viewport-background: #fff;
+  --os-axis-x: #cd0000;
+  --os-axis-y: #009400;
+  --os-axis-z: #0000d0;
+  --os-box-select: #1651b0;
+
+  /* ---- geometry, measured off the real controls ------------------------ */
+  /* The TOKENS say 4px (--os-button-border-radius, --os-form-field-border-radius)
+     and the rendered controls measure 3px. Both are true: the token layer is
+     newer than the components that still hardcode 3. The measured value wins
+     here, because matching what is on screen is the whole job. */
+  --os-radius: 3px;
+  --os-radius-large: 4px;
+  --os-border-width: 1px;
+  --os-border-width-focus: 2px;
+  --os-control-height: 30px;
+  --os-button-height: 32px;
+  --os-toolbar-height: 36px;
+  --os-row-height: 26px;
+  --os-icon-size: 20px;
+  --os-gap: 6px;
+  --os-pad-x: 10px;
+  --os-pad-y: 5px;
+
+  /* ---- type ------------------------------------------------------------ */
+  /*
+   * Onshape sets Flama and really loads it. An app on a foreign origin cannot:
+   * it is licensed and served from their CDN. So the question is which
+   * available face matches its METRICS, and the answer is not the one Onshape
+   * itself declares as a fallback.
+   *
+   * Measured 2026-09-11 over eight strings at 14px, as a mean relative width
+   * against Flama:
+   *
+   *     system-ui / Segoe UI       -0.90%   (worst string -3.52%)
+   *     Arial / Helvetica          +2.39%   (worst +7.51%)
+   *     Open Sans                  +4.39%   (worst +6.32%)
+   *     Helvetica Neue / Roboto    -5.33%   (worst -8.64%)
+   *
+   * Onshape's own declaration is `Flama, "Open Sans", "Helvetica Neue",
+   * Helvetica, Arial, sans-serif`. Without Flama that resolves to Open Sans,
+   * which is +4.39% — nearly five times further off than system-ui. So copying
+   * their font-family verbatim, which is the obvious thing to do, produces one
+   * of the worst available matches and reflows every label a little wider.
+   * Flama stays first in case a future host ever serves it.
+   */
+  --os-font: Flama, system-ui, "Segoe UI", "Open Sans", "Helvetica Neue", Helvetica, Arial,
+    sans-serif;
+  --os-font-size: 14px;
+  --os-font-size-small: 13.3333px; /* list rows, inputs, most of the left panel */
+  --os-font-size-tiny: 11px;       /* shortcut keys, tool initials             */
+  --os-font-size-title: 22px;      /* the document name, and nothing else      */
+  --os-line-height: 1.5;           /* 14/21, 13.33/20, 11/16.5, 22/33 — exactly */
+  --os-font-weight: 400;
+  --os-font-weight-strong: 600;
+}
+
+[data-os-theme='dark'] {
+  --os-background-primary: #333;
+  --os-background-secondary: #2c2c2c;
+  --os-background-tertiary: #2c2c2c;
+  --os-background-sunken: #1c1c1c;
+  --os-background-raised: #555;
+  --os-text-primary: #fff;
+  --os-text-secondary: #ccc;
+  --os-text-tertiary: #d7d7d7;
+  --os-text-disabled: #999;
+  --os-border: #666;
+  --os-border-strong: #888;
+  --os-accent: #3e94ff;
+  --os-accent-contrast: #fff;
+  --os-accent-hover: #769fcc;
+  --os-success: #35bc35;
+  --os-highlight-fill: #6a4f06;
+  --os-highlight-outline: #dba517;
+  --os-field-fill: #333;
+  --os-field-border: #888;
+  --os-button-fill: #555;
+  --os-button-fill-hover: #666;
+  --os-panel-fill: #2c2c2c;
+  --os-panel-border: #666;
+  --os-row-fill-hover: #0a4780;
+  --os-row-fill-selected: #094174;
+
+  --os-viewport-background: #333;
+  /* The axis colours INVERT in weight between themes rather than staying put:
+     saturated and dark on white, pale and light on #333. An app that keeps one
+     set for both is unreadable in one of them. */
+  --os-axis-x: #dd979b;
+  --os-axis-y: #a2db7d;
+  --os-axis-z: #90cef1;
+  --os-box-select: #769fcc;
+}
+
+/* ==========================================================================
+   2. Base
+   ========================================================================== */
+
+.os-app {
+  margin: 0;
+  font-family: var(--os-font);
+  font-size: var(--os-font-size);
+  line-height: var(--os-line-height);
+  font-weight: var(--os-font-weight);
+  color: var(--os-text-primary);
+  background: var(--os-background-primary);
+  /* Onshape's chrome is FLAT. Measured across buttons, inputs, tabs, toolbars,
+     panels, dialogs and list rows: none carries a box-shadow. The two
+     exceptions, measured by tools/chrome-extract.mjs, are things that float:
+     a menu (0 5px 10px at 0.4) and a tooltip (0 1px 2px at 0.6). An elevation
+     system on the controls themselves is the fastest way to look like a
+     different product. */
+  -webkit-font-smoothing: antialiased;
+}
+
+.os-app *,
+.os-app *::before,
+.os-app *::after {
+  box-sizing: border-box;
+}
+
+/* ==========================================================================
+   3. Controls, at the measured sizes (the toolbar's own tools are in section 5)
+   ========================================================================== */
+
+.os-button {
+  height: var(--os-button-height);
+  padding: var(--os-pad-y) var(--os-pad-x);
+  font: inherit;
+  color: var(--os-text-primary);
+  background: var(--os-button-fill);
+  border: 0;
+  border-radius: var(--os-radius);
+  cursor: pointer;
+}
+
+.os-button:hover:not(:disabled) {
+  background: var(--os-button-fill-hover);
+}
+
+.os-button:disabled {
+  color: var(--os-text-disabled);
+  cursor: default;
+}
+
+.os-button--primary {
+  color: var(--os-accent-contrast);
+  background: var(--os-accent);
+}
+
+.os-button--primary:hover:not(:disabled) {
+  background: var(--os-accent-hover);
+}
+
+/* A pressed toggle is the ACCENT, not a darker grey. This is the one place
+   Onshape spends colour in the chrome, and an app that uses a grey pressed
+   state looks muted next to it. */
+.os-button[aria-pressed='true'],
+.os-button--on {
+  color: var(--os-accent-contrast);
+  background: var(--os-accent);
+}
+
+.os-field {
+  height: var(--os-control-height);
+  padding: 4px 5px;
+  font: inherit;
+  font-size: var(--os-font-size-small);
+  color: var(--os-text-primary);
+  background: var(--os-field-fill);
+  border: var(--os-border-width) solid var(--os-field-border);
+  border-radius: var(--os-radius);
+}
+
+.os-field:focus {
+  outline: none;
+  border-width: var(--os-border-width-focus);
+  border-color: var(--os-accent);
+}
+
+.os-panel {
+  background: var(--os-panel-fill);
+  border: var(--os-border-width) solid var(--os-panel-border);
+  color: var(--os-text-primary);
+}
+
+.os-toolbar {
+  height: var(--os-toolbar-height);
+  display: flex;
+  align-items: center;
+  gap: var(--os-gap);
+  background: var(--os-background-primary);
+}
+
+.os-row {
+  height: var(--os-row-height);
+  display: flex;
+  align-items: center;
+  gap: var(--os-gap);
+  padding: 0 var(--os-gap);
+  font-size: var(--os-font-size-small);
+  color: var(--os-text-primary);
+}
+
+.os-row:hover {
+  background: var(--os-row-fill-hover);
+}
+
+.os-row[aria-selected='true'] {
+  background: var(--os-row-fill-selected);
+}
+
+.os-label {
+  font-size: var(--os-font-size-small);
+  color: var(--os-text-secondary);
+}
+
+.os-title {
+  font-size: var(--os-font-size-title);
+  font-weight: var(--os-font-weight-strong);
+  color: var(--os-text-primary);
+}
+
+/* ==========================================================================
+   4. Icons
+   ==========================================================================
+   Measured: 91 distinct symbols, 82 of them on a `0 0 20 20` viewBox, rendered
+   at 20x20 — one to one, no scaling. Of 201 painted shapes across those
+   symbols, 201 are FILLED and none is stroked.
+
+   That is the loudest single mismatch available to an embedded panel. Feather,
+   Lucide, Material Symbols Outlined, Heroicons Outline and every other popular
+   set is stroked at 1.5 or 2 units on a 24 grid. Dropping one of those next to
+   Onshape's toolbar reads as a different application instantly, at any colour,
+   because the weight of the marks is wrong and the optical size is wrong with
+   it. Use filled glyphs drawn on a 20 grid, coloured with `currentColor`. */
+
+.os-icon {
+  width: var(--os-icon-size);
+  height: var(--os-icon-size);
+  display: inline-block;
+  flex: none;
+  fill: currentColor;
+  stroke: none;
+}
+
+/* ==========================================================================
+   5. The chrome, control by control — MEASURED 2026-09-11 by
+      tools/chrome-extract.mjs on a live Part Studio, each control in each of
+      its states. Dark values are measured; the light values marked (inferred)
+      follow the token sheet's light roles and were not photographed.
+   ========================================================================== */
+
+:root {
+  --os-tool-hover: #e0e0e0;              /* (inferred) */
+  --os-tool-pressed-shadow: inset 0 1px 1px rgba(0, 0, 0, 0.247);
+  --os-separator: #d7d7d7;               /* (inferred) */
+  --os-tooltip-fill: #4b5761;            /* the same in both themes */
+  --os-tooltip-text: #fff;
+  --os-menu-fill: #fff;                  /* (inferred) */
+  --os-menu-text: #333;                  /* (inferred) */
+  --os-menu-border: #ccc;                /* (inferred) */
+  --os-menu-rule: #ddd;
+  --os-menu-shadow: 0 5px 10px rgba(0, 0, 0, 0.4);
+  --os-splitter: #d7d7d7;                /* (inferred) */
+  --os-tab-bar-fill: #eee;
+  --os-tab-fill: #d7d7d7;                /* (inferred) */
+  --os-tab-text: #555;                   /* (inferred) */
+  --os-rail-border: #aaa;
+  --os-list-guide: #d7d7d7;              /* (inferred) */
+}
+
+[data-os-theme='dark'] {
+  --os-tool-hover: #666;
+  --os-separator: #666;
+  --os-menu-fill: #333;
+  --os-menu-text: #d7d7d7;
+  --os-menu-border: #d7d7d7;
+  --os-splitter: #666;
+  --os-tab-bar-fill: #555;
+  --os-tab-fill: #1c1c1c;
+  --os-tab-text: #ccc;
+  --os-list-guide: #666;
+  /* A selected list row measured rgb(19,78,150), which is #134e96 — the
+     token sheet's --os-row-fill-selected said #094174 and the pixels do not. */
+  --os-row-fill-selected: #134e96;
+}
+
+/* ---- the shell ---------------------------------------------------------- */
+
+.os-shell {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  grid-template-rows: var(--os-toolbar-height) 1fr;
+  grid-template-columns: 200px 1px 1fr;
+  grid-template-areas:
+    'toolbar toolbar toolbar'
+    'panel splitter stage';
+  background: var(--os-background-primary);
+  color: var(--os-text-primary);
+  overflow: hidden;
+}
+.os-shell--no-panel {
+  grid-template-columns: 1fr;
+  grid-template-areas:
+    'toolbar'
+    'stage';
+}
+.os-shell--left-rail {
+  grid-template-columns: 40px 200px 1px 1fr;
+  grid-template-areas:
+    'toolbar toolbar toolbar toolbar'
+    'rail panel splitter stage';
+}
+.os-shell--tab-bar {
+  grid-template-rows: var(--os-toolbar-height) 1fr 30px;
+}
+.os-shell--tab-bar:not(.os-shell--left-rail) {
+  grid-template-areas:
+    'toolbar toolbar toolbar'
+    'panel splitter stage'
+    'tabs tabs tabs';
+}
+.os-shell--tab-bar.os-shell--left-rail {
+  grid-template-areas:
+    'toolbar toolbar toolbar toolbar'
+    'rail panel splitter stage'
+    'tabs tabs tabs tabs';
+}
+.os-shell-panel {
+  /* The panel's fill is the PRIMARY background — #333, the same as the canvas
+     (measured 2026-09-13); only the 40px rail beside it is #2c2c2c. */
+  background: var(--os-background-primary);
+  border: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+.os-shell--panel-collapsed {
+  grid-template-columns: 0 1px 1fr;
+}
+.os-shell--panel-collapsed.os-shell--left-rail {
+  grid-template-columns: 40px 0 1px 1fr;
+}
+.os-shell--panel-collapsed .os-shell-panel {
+  display: none;
+}
+.os-panel-handle {
+  position: absolute;
+  left: -1px;
+  top: 50%;
+  z-index: 3;
+  width: 33px;
+  height: 34px;
+  margin-top: -17px;
+  padding: 5px;
+  color: var(--os-text-primary);
+  background: var(--os-background-primary);
+  border: 1px solid var(--os-rail-border);
+  border-left: 0;
+  cursor: pointer;
+}
+.os-panel-handle:hover {
+  background: var(--os-tool-hover);
+}
+.os-splitter {
+  width: 1px;
+  background: var(--os-splitter);
+  cursor: col-resize;
+}
+.os-stage {
+  position: relative;
+  overflow: hidden;
+  background: var(--os-viewport-background);
+}
+.os-stage > canvas:first-child {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+.os-stage-status {
+  position: absolute;
+  left: 10px;
+  bottom: 8px;
+  font-size: var(--os-font-size-tiny);
+  color: var(--os-text-secondary);
+  pointer-events: none;
+  white-space: pre;
+}
+.os-stage-message {
+  position: absolute;
+  left: 50%;
+  bottom: 10px;
+  transform: translateX(-50%);
+  font-size: 12px;
+  color: var(--os-highlight-outline);
+  pointer-events: none;
+}
+.os-stage-message--bad {
+  color: #d66e74;
+}
+.os-stage-hint {
+  position: absolute;
+  right: 10px;
+  bottom: 8px;
+  font-size: var(--os-font-size-tiny);
+  color: var(--os-text-secondary);
+  opacity: 0.65;
+  pointer-events: none;
+}
+
+/* ---- the toolbar -------------------------------------------------------- */
+
+.os-toolbar {
+  height: var(--os-toolbar-height);
+  display: flex;
+  align-items: center;
+  gap: 0;
+  padding: 0 4px 0 0;
+  background: var(--os-background-primary);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.os-toolbar::-webkit-scrollbar {
+  display: none;
+}
+.os-tool {
+  width: 32px;
+  height: 32px;
+  flex: none;
+  margin: 1px;
+  padding: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font: inherit;
+  color: var(--os-text-primary);
+  background: none;
+  border: 0;
+  border-radius: var(--os-radius);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.os-tool:hover:not(:disabled) {
+  background: var(--os-tool-hover);
+}
+.os-tool:active:not(:disabled) {
+  background: var(--os-tool-hover);
+  box-shadow: var(--os-tool-pressed-shadow);
+}
+.os-tool:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+/* A tool that stays on is the ACCENT — the one place the chrome spends colour. */
+.os-tool[aria-pressed='true'] {
+  color: var(--os-accent-contrast);
+  background: var(--os-accent);
+}
+.os-tool--labelled {
+  width: auto;
+  padding: 6px 10px 6px 6px;
+}
+.os-tool--accent {
+  color: var(--os-accent);
+}
+.os-tool-label {
+  font-size: var(--os-font-size);
+}
+.os-toolgroup {
+  display: flex;
+  flex: none;
+  margin: 1px;
+  border-radius: var(--os-radius);
+}
+.os-toolgroup .os-tool {
+  margin: 0;
+  border-radius: var(--os-radius) 0 0 var(--os-radius);
+}
+.os-toolgroup .os-tool-caret {
+  width: 18px;
+  padding: 0 4px;
+  border-radius: 0 var(--os-radius) var(--os-radius) 0;
+}
+.os-tool-caret svg {
+  width: 10px;
+  height: 10px;
+}
+.os-toolset-separator {
+  width: 2px;
+  height: 26px;
+  flex: none;
+  margin: 5px 0;
+  background: var(--os-separator);
+}
+.os-toolbar-spacer {
+  flex: 1;
+}
+.os-search {
+  height: 32px;
+  flex: none;
+  margin-left: 10px;
+  padding: 5px 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font: inherit;
+  text-align: left;
+  color: var(--os-text-primary);
+  background: var(--os-background-raised);
+  border: 0;
+  border-radius: var(--os-radius);
+  cursor: pointer;
+}
+.os-search-keys {
+  display: inline-flex;
+  gap: 0;
+}
+.os-key {
+  display: inline-block;
+  min-width: 17px;
+  padding: 0 2px;
+  font: inherit;
+  font-size: var(--os-font-size-tiny);
+  line-height: 16.5px;
+  text-align: center;
+  color: var(--os-text-primary);
+  border: 1px solid var(--os-border-strong);
+  border-bottom-width: 2px;
+  border-radius: 2px;
+}
+
+/* ---- the tooltip -------------------------------------------------------- */
+
+.os-tooltip {
+  position: fixed;
+  z-index: 9999;
+  max-width: 400px;
+  padding: 4px;
+  font: 500 12px / 18px var(--os-font);
+  color: var(--os-tooltip-text);
+  background: var(--os-tooltip-fill);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}
+.os-tooltip[hidden] {
+  display: none;
+}
+
+/* ---- menus -------------------------------------------------------------- */
+
+.os-menu {
+  position: fixed;
+  z-index: 1000;
+  min-width: 121px;
+  padding: 0;
+  font: 400 12px / 18px var(--os-font);
+  color: var(--os-menu-text);
+  background: var(--os-menu-fill);
+  border: 1px solid var(--os-menu-border);
+  border-radius: var(--os-radius-large);
+  box-shadow: var(--os-menu-shadow);
+  user-select: none;
+}
+.os-menu-item {
+  height: 22px;
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.os-menu-item:hover:not(.os-menu-item--disabled) {
+  background: var(--os-row-fill-hover);
+}
+.os-menu-item--disabled {
+  color: var(--os-text-disabled);
+  cursor: default;
+}
+.os-menu-icon {
+  width: 27px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.os-menu-icon svg {
+  width: 16px;
+  height: 16px;
+  fill: currentColor;
+}
+.os-menu-label {
+  flex: 1;
+  padding-right: 10px;
+}
+.os-menu-arrow {
+  width: 16px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-right: 2px;
+  /* the capture (tools/out/panel-extract/menu-empty.png) shows the triangle
+     grey, not the entry's white, and about 6px on a side; read off the 3x
+     frame, not the DOM, since it is a pseudo-element there */
+  color: #999;
+}
+.os-menu-arrow svg {
+  width: 8px;
+  height: 8px;
+}
+.os-menu-separator {
+  height: 0;
+  border-bottom: 1px solid var(--os-menu-rule);
+}
+.os-menu--compact .os-menu-item {
+  padding: 2px 8px 2px 16px;
+}
+.os-menu--compact .os-menu-label {
+  padding-right: 0;
+}
+/* Their "list-has-icons" context menu: a 17px glyph at 10px, the label at 35px. */
+.os-menu--icons .os-menu-item {
+  padding: 2px 8px 2px 35px;
+  position: relative;
+}
+.os-menu--icons .os-menu-icon {
+  position: absolute;
+  left: 10px;
+  top: 2.5px;
+  width: 17px;
+  height: 17px;
+}
+.os-menu--icons .os-menu-icon svg {
+  width: 17px;
+  height: 17px;
+}
+.os-menu-item--open {
+  background: var(--os-row-fill-hover);
+}
+[data-os-theme='dark'] .os-menu--compact {
+  color: #fff;
+  border-color: #ccc;
+}
+
+/* ---- the panel ---------------------------------------------------------- */
+
+.os-panel-body {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+  font-size: var(--os-font-size-small);
+  line-height: 20px;
+}
+.os-panel-filter {
+  height: 37px;
+  flex: none;
+  display: flex;
+  align-items: flex-start;
+  padding: 7px 0 0;
+}
+:root {
+  --os-filter-icon: #1651b0;     /* (inferred) */
+}
+[data-os-theme='dark'] {
+  --os-filter-icon: #90cef1;
+}
+.os-panel-filter-button {
+  width: 30px;
+  height: 30px;
+  flex: none;
+  margin: 0 3px;
+  padding: 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--os-filter-icon);
+  background: none;
+  border: 0;
+  border-radius: var(--os-radius);
+  cursor: pointer;
+}
+.os-panel-filter-button:hover {
+  background: var(--os-tool-hover);
+}
+.os-panel-pane {
+  flex: 1 1 0;
+}
+.os-panel-pane--bottom {
+  flex: 0 0 35%;
+}
+.os-panel-splitter {
+  flex: none;
+  height: 1px;
+  background: var(--os-splitter);
+  cursor: row-resize;
+}
+.os-panel-header-button:disabled {
+  opacity: 0.5;
+  color: rgba(255, 255, 255, 0.3);
+  cursor: default;
+}
+.os-panel-header-button:disabled:hover {
+  background: none;
+}
+.os-list-expander {
+  width: 20px;
+  height: 26px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--os-text-disabled);
+}
+.os-list-expander .os-icon {
+  width: 20px;
+  height: 20px;
+  padding: 4px;
+}
+.os-list-item--collapsed .os-list-expander .os-icon {
+  transform: rotate(-90deg);
+}
+.os-list-item--group .os-list-item-name {
+  margin-left: 3px;
+}
+.os-list-children[hidden] {
+  display: none;
+}
+.os-rollback-bar {
+  height: 6px;
+  margin: 8px 7px 4px;
+  background: #b8b8b8;
+  cursor: row-resize;
+}
+.os-field--search {
+  flex: 1;
+  min-width: 30px;
+  height: 30px;
+  margin: 0 3px;
+  padding: 4px 22px 4px 5px;
+  background: var(--os-background-primary);
+}
+.os-field--search::placeholder {
+  color: var(--os-text-secondary);
+  font-style: italic;
+}
+.os-panel-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden auto;
+}
+.os-panel-section-header {
+  height: 30px;
+  display: flex;
+  align-items: center;
+  padding: 0 10px 0 0;
+}
+.os-panel-section-title {
+  flex: 1;
+  min-width: 0;
+  padding-left: 4px;
+  font-weight: 500;
+  line-height: 30px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.os-panel-header-button {
+  width: 30px;
+  height: 30px;
+  flex: none;
+  padding: 0 5px;
+  color: var(--os-text-primary);
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+.os-panel-header-button:hover {
+  background: var(--os-tool-hover);
+}
+.os-list-item {
+  height: 26px;
+  display: flex;
+  align-items: center;
+  padding: 0 10px 0 0;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.os-list-item:hover {
+  background: var(--os-row-fill-hover);
+}
+.os-list-item[aria-selected='true'] {
+  background: var(--os-row-fill-selected);
+}
+.os-list-item-icon {
+  width: 20px;
+  height: 20px;
+  flex: none;
+  margin-left: 3px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.os-list-item-icon .os-icon {
+  width: 17px;
+  height: 17px;
+}
+.os-list-item-name {
+  flex: 1;
+  min-width: 0;
+  margin: 0 0 1px 3px;
+  padding-right: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.os-list-item-value {
+  flex: none;
+  margin-left: auto;
+  color: var(--os-text-secondary);
+}
+.os-list-item--dim .os-list-item-icon,
+.os-list-item--dim .os-list-item-name {
+  opacity: 0.5;
+}
+.os-list-children,
+.os-panel-section--bottom .os-list {
+  position: relative;
+  padding-left: 19px;   /* a group's children, and the Parts pane's rows, sit 19px in */
+}
+.os-list-children::before {
+  content: '';
+  position: absolute;
+  left: 12px;
+  top: 0;
+  bottom: 0;
+  border-left: 1px solid var(--os-list-guide);
+}
+.os-tool-initials {
+  width: 17px;
+  height: 15px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  line-height: 15px;
+  border: 1px solid var(--os-text-disabled);
+  border-radius: 2px;
+}
+.os-panel-footer {
+  flex: none;
+  padding: 8px;
+  border-top: 1px solid var(--os-border);
+  display: grid;
+  gap: 6px;
+}
+.os-panel-footer[hidden] {
+  display: none;
+}
+
+/* ---- rails and the tab bar ---------------------------------------------- */
+
+.os-rail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  background: var(--os-background-secondary);
+}
+.os-rail--left {
+  width: 40px;
+  padding-top: 1px;
+}
+.os-rail-button {
+  width: 39px;
+  height: 31px;
+  flex: none;
+  margin: 0 0 4px;
+  padding: 5px;
+  color: var(--os-text-primary);
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+.os-rail-button:hover {
+  background: var(--os-tool-hover);
+}
+.os-rail--right {
+  position: absolute;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  background: none;
+  align-items: flex-end;
+}
+.os-rail--right .os-rail-button {
+  width: 33px;
+  height: 34px;
+  margin: -1px -1px 0 0;
+  background: var(--os-background-primary);
+  border: 1px solid var(--os-rail-border);
+}
+.os-rail-gap {
+  height: 10px;
+}
+.os-tab-bar {
+  height: 30px;
+  display: flex;
+  align-items: flex-start;
+  background: var(--os-tab-bar-fill);
+  overflow: hidden;
+}
+.os-tab-add {
+  width: 34px;
+  height: 30px;
+  flex: none;
+  padding: 5px 7px;
+  color: var(--os-text-primary);
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+.os-tab-list {
+  display: flex;
+  padding-left: 5px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.os-tab {
+  height: 28px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 2px 4px 0;
+  padding: 3px 10px 0;
+  font-size: var(--os-font-size);
+  color: var(--os-tab-text);
+  background: var(--os-tab-fill);
+  border: 0;
+  cursor: pointer;
+}
+.os-tab--active {
+  color: var(--os-text-primary);
+  background: var(--os-background-primary);
+}
+
+/* ---- the view cube's corner --------------------------------------------- */
+
+.os-view-cube {
+  position: absolute;
+  top: 15px;
+  right: 15px;
+  width: 150px;
+  height: 150px;
+  user-select: none;
+}
+.os-graphics-dropdown {
+  position: absolute;
+  top: 142px;
+  right: 15px;
+  box-sizing: border-box;
+  width: 44px;
+  height: 28px;
+  padding: 4px;
+  border-radius: var(--os-radius);
+  background: rgba(51, 51, 51, 0.35);
+  color: var(--os-text-primary);
+  cursor: pointer;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  z-index: 2;
+}
+[data-os-theme='light'] .os-graphics-dropdown,
+:root:not([data-os-theme]) .os-graphics-dropdown {
+  background: rgba(255, 255, 255, 0.35); /* (inferred) */
+}
+.os-graphics-dropdown:hover,
+.os-graphics-dropdown.open {
+  background: var(--os-tool-hover);
+}
+.os-graphics-dropdown svg {
+  display: block;
+  width: 20px;
+  height: 20px;
+}
+.os-graphics-dropdown .os-dropdown-caret {
+  display: inline-block;
+  width: 0;
+  height: 0;
+  margin-left: 7px;
+  border-top: 4px solid currentColor;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+}
+
+/* ==========================================================================
+   6. The docked dialog — MEASURED 2026-09-11 (tools/dialog-extract.mjs) with
+      Graphics preferences open: 300 wide at the canvas's top-left, a 29px
+      header, 27px tabs, 25px section toggles, 42px slider rows.
+   ========================================================================== */
+
+:root {
+  --os-dialog-fill: rgba(255, 255, 255, 0.95);      /* (inferred) */
+  --os-dialog-header-fill: #fff;                     /* (inferred) */
+  --os-dialog-rule: #d7d7d7;                         /* (inferred) */
+  --os-dialog-commit: #009400;
+  --os-dialog-cancel: #bd3039;
+  --os-dialog-tab-active: #1651b0;                   /* (inferred) */
+  --os-dialog-tab-rule: #3e94ff;
+  --os-dialog-section: #999;
+  --os-dialog-track: #999;
+  --os-dialog-thumb: #fff;                           /* (inferred) */
+  --os-dialog-thumb-ring: #666;                      /* (inferred) */
+}
+[data-os-theme='dark'] {
+  --os-dialog-fill: rgba(51, 51, 51, 0.95);
+  --os-dialog-header-fill: #333;
+  --os-dialog-rule: #666;
+  --os-dialog-tab-active: #90cef1;
+  --os-dialog-thumb: #333;
+  --os-dialog-thumb-ring: #ccc;
+}
+
+.os-dialog {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  width: 300px;
+  max-height: 100%;
+  font: 400 12px / 1.8 var(--os-font);
+  color: var(--os-text-primary);
+  background: var(--os-dialog-fill);
+  box-shadow: 0 5px 10px rgba(0, 0, 0, 0.4);
+  user-select: none;
+}
+.os-dialog-header {
+  height: 29px;
+  flex: none;
+  display: flex;
+  justify-content: space-between;
+  background: var(--os-dialog-header-fill);
+  border-bottom: 1px solid var(--os-dialog-rule);
+  cursor: grab;
+}
+.os-dialog-title {
+  padding: 3px 0 0 10px;
+  font: 500 16px / 21.6px var(--os-font);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.os-dialog-header-buttons {
+  display: flex;
+  flex: none;
+}
+.os-dialog-header-button {
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  color: #fff;
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+.os-dialog-header-button--commit {
+  background: var(--os-dialog-commit);
+}
+.os-dialog-header-button--commit:disabled {
+  opacity: 0.2;
+  cursor: default;
+}
+.os-dialog-header-button--cancel {
+  color: var(--os-dialog-cancel);
+}
+.os-dialog-tabs {
+  height: 27px;
+  flex: none;
+  display: flex;
+}
+.os-dialog-tab {
+  flex: 1;
+  padding: 2px 0;
+  font: 500 12px / 21.6px var(--os-font);
+  color: var(--os-text-primary);
+  text-align: center;
+  background: none;
+  border: 0;
+  border-bottom: 1px solid #d7d7d7;
+  cursor: pointer;
+}
+.os-dialog-tab--active {
+  color: var(--os-dialog-tab-active);
+  border-bottom-color: var(--os-dialog-tab-rule);
+  box-shadow: inset 0 -1px 0 0 var(--os-dialog-tab-rule);
+}
+.os-dialog-content {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden auto;
+  margin: 4px 8px 0;
+}
+.os-dialog-pane[hidden] {
+  display: none;
+}
+.os-dialog-section-toggle {
+  width: 100%;
+  height: 25px;
+  display: flex;
+  align-items: center;
+  padding: 4px 0;
+  font: 400 13.3333px / 17.3333px var(--os-font);
+  color: var(--os-dialog-section);
+  text-align: left;
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+.os-dialog-chevron {
+  width: 13px;
+  height: 17px;
+  margin: 0 6px 0 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.os-dialog-section-toggle--collapsed .os-dialog-chevron {
+  transform: rotate(-90deg);
+}
+.os-dialog-section-body {
+  position: relative;
+  padding: 0 0 3px 20px;
+}
+.os-dialog-section-body::before {
+  content: '';
+  position: absolute;
+  left: 6px;
+  top: 0;
+  bottom: 8px;
+  border-left: 1px solid var(--os-dialog-rule);
+}
+.os-dialog-section-body[hidden] {
+  display: none;
+}
+.os-dialog-row {
+  display: flex;
+  align-items: flex-start;
+  margin: 0 0 5px;
+}
+.os-dialog-row-main {
+  flex: 1;
+  min-width: 0;
+}
+.os-dialog-row--slider .os-dialog-row-main {
+  height: 42px;
+}
+.os-dialog-row--color .os-dialog-row-main {
+  height: 26px;
+}
+.os-dialog-row-line {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 8px;
+}
+.os-dialog-label {
+  font-size: 12px;
+  line-height: 22px;
+  white-space: nowrap;
+}
+.os-dialog-value {
+  flex: 1;
+  min-width: 60px;
+  height: 22px;
+  padding: 0;
+  font: 400 14px / 22px var(--os-font);
+  color: var(--os-text-primary);
+  text-align: right;
+  background: none;
+  border: 0;
+  border-bottom: 1px solid var(--os-text-primary);
+  border-radius: 0;
+  outline: none;
+}
+.os-dialog-slider {
+  display: block;
+  width: 100%;
+  height: 12px;
+  margin: 8px 0 0;
+  padding: 0;
+  background: none;
+  appearance: none;
+  cursor: pointer;
+}
+.os-dialog-slider::-webkit-slider-runnable-track {
+  height: 2px;
+  background: var(--os-dialog-track);
+}
+.os-dialog-slider::-webkit-slider-thumb {
+  width: 12px;
+  height: 12px;
+  margin-top: -5px;
+  border-radius: 50%;
+  background: var(--os-dialog-thumb);
+  border: 1px solid var(--os-dialog-thumb-ring);
+  appearance: none;
+}
+.os-dialog-slider::-moz-range-track {
+  height: 2px;
+  background: var(--os-dialog-track);
+}
+.os-dialog-slider::-moz-range-thumb {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--os-dialog-thumb);
+  border: 1px solid var(--os-dialog-thumb-ring);
+}
+.os-dialog-swatch {
+  width: 96px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  background: none;
+  cursor: pointer;
+}
+.os-dialog-swatch::-webkit-color-swatch-wrapper {
+  padding: 2px;
+}
+.os-dialog-swatch::-webkit-color-swatch {
+  border: 0;
+  border-radius: 2px;
+}
+.os-dialog-check {
+  justify-content: flex-start;
+  align-items: center;
+  cursor: pointer;
+}
+.os-dialog-info {
+  width: 14px;
+  flex: none;
+  margin: 4px 0 0 13px;
+  color: var(--os-text-secondary);
+  display: flex;
+}
+.os-dialog-footer {
+  height: 20px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  margin: 10px 0 8px;
+}
+.os-dialog-ghost-button {
+  height: 20px;
+  margin: 0 13px 0 0;
+  padding: 0 10px;
+  font: 400 12px / 18px var(--os-font);
+  color: var(--os-text-primary);
+  background: var(--os-background-primary);
+  border: 1px solid var(--os-border-strong);
+  border-radius: 2px;
+  cursor: pointer;
+}
+.os-dialog-ghost-button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.os-dialog-help {
+  width: 14px;
+  height: 14px;
+  margin: 0 8px 0 0;
+  color: var(--os-text-primary);
+  display: flex;
+}

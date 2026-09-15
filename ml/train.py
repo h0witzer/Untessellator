@@ -43,14 +43,19 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from model import SeedFillNet, count_parameters  # noqa: E402
 from occ_tessellate import TYPE_NAMES  # noqa: E402
-from patches import BakedPatches, N_FEATURES, N_TYPES, collate  # noqa: E402
+from patches import (BakedPatches, FEATURE_NAMES, FEATURE_NAMES_V6, N_TYPES, collate,  # noqa: E402
+                     collate_surface)
 
 
 class PatchStream(IterableDataset):
     def __init__(self, files: list[Path], max_facets: int, seeds_per_mesh: int,
                  densities: tuple[str, ...], type_weights=None, seed: int = 0,
-                 relabel_root: Path | None = None):
+                 relabel_root: Path | None = None, surface_root: Path | None = None,
+                 extended: bool = False, exclude_prob: float = 0.0):
+        self.extended = extended
+        self.exclude_prob = exclude_prob
         self.relabel_root = relabel_root
+        self.surface_root = surface_root
         self.files = files
         self.max_facets = max_facets
         self.seeds_per_mesh = seeds_per_mesh
@@ -65,12 +70,11 @@ class PatchStream(IterableDataset):
         ds = BakedPatches(root=Path("."), densities=self.densities,
                           max_facets=self.max_facets, seeds_per_mesh=self.seeds_per_mesh,
                           type_weights=self.type_weights, seed=self.seed + wid * 977,
-                          files=mine, relabel_root=self.relabel_root)
+                          files=mine, relabel_root=self.relabel_root,
+                          surface_root=self.surface_root, extended=self.extended,
+                          exclude_prob=self.exclude_prob)
         for s in ds:
             yield s
-
-
-CURV_COLS = (10, 11)
 
 
 class Collate:
@@ -82,23 +86,41 @@ class Collate:
     than at the collate function, so it is worth not rediscovering.
     """
 
-    def __init__(self, max_facets: int, drop_curvature: bool = False):
+    def __init__(self, max_facets: int, zero_cols: tuple[int, ...] = (), surface: bool = False):
         self.max_facets = max_facets
-        self.drop_curvature = drop_curvature
+        self.zero_cols = list(zero_cols)
+        self.surface = surface
 
     def __call__(self, batch):
         x, y, m, t = collate(batch, self.max_facets)
-        if self.drop_curvature:
-            x[:, :, CURV_COLS[0]:CURV_COLS[1] + 1] = 0.0
-        return (torch.from_numpy(x), torch.from_numpy(y),
-                torch.from_numpy(m), torch.from_numpy(t))
+        if self.zero_cols:
+            x[:, :, self.zero_cols] = 0.0
+        out = (torch.from_numpy(x), torch.from_numpy(y), torch.from_numpy(m), torch.from_numpy(t))
+        if self.surface:
+            s, k = collate_surface(batch)
+            out += (torch.from_numpy(s), torch.from_numpy(k))
+        return out
 
 
-def make_loader(files, args, type_weights, shuffle_seed):
+def surface_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor):
+    """Axis (sign-free: 1 - cos^2), asinh(kn) and asinh(ks), each averaged over the patches
+    that carry that target."""
+    pred = pred.float()
+    ax = F.normalize(pred[:, :3], dim=1)
+    la = ((1 - (ax * target[:, :3]).sum(1) ** 2) * mask[:, 0]).sum() / mask[:, 0].sum().clamp(min=1)
+    lk = (F.smooth_l1_loss(pred[:, 3], target[:, 3], reduction="none") * mask[:, 1]).sum() \
+        / mask[:, 1].sum().clamp(min=1)
+    ls = (F.smooth_l1_loss(pred[:, 4], target[:, 4], reduction="none") * mask[:, 2]).sum() \
+        / mask[:, 2].sum().clamp(min=1)
+    return la + lk + ls
+
+
+def make_loader(files, args, type_weights, shuffle_seed, exclude_prob=0.0):
     stream = PatchStream(files, args.max_facets, args.seeds_per_mesh,
                          tuple(args.densities.split(",")), type_weights, shuffle_seed,
-                         args.relabel)
-    return DataLoader(stream, batch_size=args.batch, collate_fn=Collate(args.max_facets, args.no_curvature),
+                         args.relabel, args.surface_root, args.features == "v6", exclude_prob)
+    return DataLoader(stream, batch_size=args.batch,
+                      collate_fn=Collate(args.max_facets, args.zero_cols, args.surface_root is not None),
                       num_workers=args.workers, persistent_workers=args.workers > 0,
                       prefetch_factor=4 if args.workers > 0 else None)
 
@@ -128,13 +150,28 @@ def evaluate(model, loader, device, max_batches: int):
     tp = fp = fn_ = 0.0
     type_hit = np.zeros(N_TYPES, np.int64)
     type_tot = np.zeros(N_TYPES, np.int64)
+    axis_err, kn_sign, kn_err = [], [], []
     seen = 0
-    for i, (x, y, m, t) in enumerate(loader):
+    for i, batch in enumerate(loader):
         if i >= max_batches:
             break
-        x, y, m, t = x.to(device), y.to(device), m.to(device), t.to(device)
+        x, y, m, t = (b.to(device) for b in batch[:4])
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            sl, tl = model(x, m)
+            outs = model(x, m)
+        sl, tl = outs[0], outs[1]
+        if len(batch) == 6 and len(outs) == 3:
+            sp = outs[2].float().cpu()
+            st, sk = batch[4], batch[5]
+            a = F.normalize(sp[:, :3], dim=1)
+            sel = sk[:, 0] > 0
+            if sel.any():
+                cos = (a[sel] * st[sel, :3]).sum(1).abs().clamp(max=1.0)
+                axis_err.extend(torch.rad2deg(torch.acos(cos)).tolist())
+            sel = sk[:, 1] > 0
+            if sel.any():
+                kn_err.extend((sp[sel, 3] - st[sel, 3]).abs().tolist())
+                curved = sel & (st[:, 3].abs() > 1e-6)
+                kn_sign.extend((torch.sign(sp[curved, 3]) == torch.sign(st[curved, 3])).float().tolist())
         pred = ((sl.float().sigmoid() > 0.5).float()) * m
         truth = y * m
         tp += float((pred * truth).sum())
@@ -151,8 +188,11 @@ def evaluate(model, loader, device, max_batches: int):
     prec = tp / max(tp + fp, 1e-9)
     rec = tp / max(tp + fn_, 1e-9)
     model.train()
+    med = lambda v: float(np.median(v)) if v else None
     return {"iou": iou, "precision": prec, "recall": rec,
-            "type_hit": type_hit, "type_tot": type_tot, "batches": seen}
+            "type_hit": type_hit, "type_tot": type_tot, "batches": seen,
+            "axis_err_p50": med(axis_err), "kn_asinh_err_p50": med(kn_err),
+            "kn_sign_acc": float(np.mean(kn_sign)) if kn_sign else None}
 
 
 def main(argv=None) -> int:
@@ -190,7 +230,31 @@ def main(argv=None) -> int:
                     help="zero the two curvature columns. The control arm: any gain from "
                          "curvature has to be measured against an otherwise identical run, "
                          "not against a previous run with different hyperparameters.")
+    ap.add_argument("--surface-root", type=Path, default=None,
+                    help="surface_sidecar.py output: adds the surface-hypothesis head and its loss")
+    ap.add_argument("--surface-loss-weight", type=float, default=1.0)
+    ap.add_argument("--features", choices=("base", "v6"), default="base",
+                    help="base: the 12 inputs of patches.FEATURE_NAMES; v6: plus the 13 extended "
+                         "columns of seedfeatures.py (checked against js/seedFeatures.js by "
+                         "test/netparity.mjs)")
+    ap.add_argument("--exclude-prob", type=float, default=0.0,
+                    help="training patches drawn with some neighbouring faces already painted "
+                         "(removed from the patch); validation always uses full patches")
+    ap.add_argument("--zero-features", default="",
+                    help="comma list of patches.FEATURE_NAMES to hold at zero, e.g. "
+                         "log_area,ring: inputs that describe the triangulation rather than "
+                         "the surface. The columns are stored in the checkpoint as zero_cols; "
+                         "rescore.py and export_onnx.py zero the same ones.")
     args = ap.parse_args(argv)
+    zero = [n for n in args.zero_features.split(",") if n]
+    if args.no_curvature:
+        zero += ["k1s", "k2s"]
+    names = FEATURE_NAMES_V6 if args.features == "v6" else FEATURE_NAMES
+    unknown = sorted(set(zero) - set(names))
+    if unknown:
+        ap.error(f"unknown features {unknown}; choose from {', '.join(names)}")
+    args.zero_cols = tuple(sorted({names.index(n) for n in zero}))
+    args.n_features = len(names)
 
     args.out.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -268,8 +332,13 @@ def main(argv=None) -> int:
     cls_w = torch.tensor((1.0 / np.maximum(types, 1)) / (1.0 / np.maximum(types, 1)).sum()
                          * N_TYPES, dtype=torch.float32, device=device)
 
-    model = SeedFillNet(in_features=N_FEATURES, n_types=N_TYPES).to(device)
+    model = SeedFillNet(in_features=args.n_features, n_types=N_TYPES,
+                        surface=args.surface_root is not None).to(device)
+    print(f"surface     {'head on, sidecars ' + str(args.surface_root) if args.surface_root else 'off'}")
     print(f"curvature   {'DISABLED (control arm)' if args.no_curvature else 'enabled'}")
+    print(f"inputs      {args.features} ({args.n_features} columns); painted-neighbour "
+          f"augmentation p={args.exclude_prob}")
+    print(f"zeroed      {', '.join(names[i] for i in args.zero_cols) or 'none'}")
     print(f"parameters  {count_parameters(model):,} "
           f"(~{count_parameters(model) * 4 / 1e6:.2f} MB fp32)")
 
@@ -278,7 +347,7 @@ def main(argv=None) -> int:
                                                 total_steps=args.steps, pct_start=0.05)
     pos_w = torch.tensor(pw, device=device)
 
-    train_loader = make_loader(train_files, args, tw, args.seed)
+    train_loader = make_loader(train_files, args, tw, args.seed, args.exclude_prob)
     val_loader = make_loader(val_files, args, None, args.seed + 1)
 
     best = -1.0
@@ -292,15 +361,20 @@ def main(argv=None) -> int:
 
     done = False
     while not done:
-        for x, y, m, t in train_loader:
-            x, y, m, t = (x.to(device, non_blocking=True), y.to(device, non_blocking=True),
-                          m.to(device, non_blocking=True), t.to(device, non_blocking=True))
+        for batch in train_loader:
+            batch = [b.to(device, non_blocking=True) for b in batch]
+            x, y, m, t = batch[:4]
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-                sl, tl = model(x, m)
+                outs = model(x, m)
+                sl, tl = outs[0], outs[1]
                 seg = F.binary_cross_entropy_with_logits(
                     sl.float(), y, weight=m, pos_weight=pos_w, reduction="sum") / m.sum().clamp(min=1)
                 cls = F.cross_entropy(tl.float(), t, weight=cls_w)
                 loss = seg + args.type_loss_weight * cls
+                surf = torch.zeros((), device=device)
+                if len(outs) == 3:
+                    surf = surface_loss(outs[2], batch[4], batch[5])
+                    loss = loss + args.surface_loss_weight * surf
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -309,12 +383,13 @@ def main(argv=None) -> int:
             sched.step()
 
             run_loss += float(loss); run_seg += float(seg); run_cls += float(cls)
+            run_surf = (run_surf if step % 100 else 0.0) + float(surf)
             step += 1
 
             if step % 100 == 0:
                 rate_s = step / (time.time() - t0)
                 print(f"  step {step:>6,}/{args.steps:,}  loss {run_loss / 100:.4f} "
-                      f"(seg {run_seg / 100:.4f} cls {run_cls / 100:.4f})  "
+                      f"(seg {run_seg / 100:.4f} cls {run_cls / 100:.4f} surf {run_surf / 100:.4f})  "
                       f"lr {sched.get_last_lr()[0]:.2e}  {rate_s:.1f} it/s", flush=True)
                 run_loss = run_seg = run_cls = 0.0
 
@@ -326,10 +401,18 @@ def main(argv=None) -> int:
                 macro = np.mean([v for v in per.values() if v is not None])
                 print(f"\n  [eval @ {step:,}] membership IoU {ev['iou']:.4f}  "
                       f"precision {ev['precision']:.4f}  recall {ev['recall']:.4f}")
-                print(f"              type macro-acc {macro:.3f}  {per}\n", flush=True)
+                print(f"              type macro-acc {macro:.3f}  {per}", flush=True)
+                if ev["axis_err_p50"] is not None or ev["kn_sign_acc"] is not None:
+                    print(f"              surface: axis error p50 {ev['axis_err_p50']} deg  "
+                          f"asinh(kn) error p50 {ev['kn_asinh_err_p50']}  kn sign {ev['kn_sign_acc']}",
+                          flush=True)
+                print("", flush=True)
                 logf.write(json.dumps({"step": step, "iou": ev["iou"],
                                        "precision": ev["precision"], "recall": ev["recall"],
-                                       "type_macro": float(macro), "per_type": per}) + "\n")
+                                       "type_macro": float(macro), "per_type": per,
+                                       "axis_err_p50": ev["axis_err_p50"],
+                                       "kn_asinh_err_p50": ev["kn_asinh_err_p50"],
+                                       "kn_sign_acc": ev["kn_sign_acc"]}) + "\n")
                 logf.flush()
                 if ev["iou"] > best:
                     best = ev["iou"]

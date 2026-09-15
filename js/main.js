@@ -15,6 +15,7 @@ import {
   setGroupHighlight, setGroupHoverCallback,
   setBrepOverlay, setBrepOverlayVisible,
   setBrepFacesOverlay, setBrepFacesVisible,
+  pickTriangle, setExclusionOverlay, setHoverPreview,
 } from './viewer.js';
 import { loadModelFile, computeBounds, getTriangleCount } from './stlLoader.js';
 import { t, initLang, setLang, getLang, applyTranslations } from './i18n.js';
@@ -36,6 +37,11 @@ let isBusy          = false;
 let _triangleToGroup = null;
 // The currently highlighted group index (-1 = none)
 let _highlightedGroup = -1;
+
+// Paint (experimental): prepared once per mesh on the first paint click
+let paintMesh      = null;
+let paintSelection = new Set();
+let paintBusy      = false;
 
 // ── DOM refs ─────────────────────────────────────────────────────────────────
 
@@ -59,6 +65,15 @@ const fitBtn        = document.getElementById('fit-btn');
 const classifierMode = document.getElementById('classifier-mode');
 const classifierDiff = document.getElementById('classifier-diff');
 const surfaceList   = document.getElementById('surface-list');
+
+// Paint panel (experimental)
+const paintToggle    = document.getElementById('paint-toggle');
+const paintMethod    = document.getElementById('paint-method');
+const paintType      = document.getElementById('paint-type');
+const paintModel     = document.getElementById('paint-model');
+const paintShowModel = document.getElementById('paint-show-model');
+const paintClearBtn  = document.getElementById('paint-clear');
+const paintStatus    = document.getElementById('paint-status');
 
 // Export panel
 const schemaSelect  = document.getElementById('step-schema');
@@ -142,6 +157,8 @@ async function handleModelFile(file) {
     const { geometry } = await loadModelFile(file);
     currentGeometry = geometry;
     currentGroups = null;
+    clearPaint();
+    paintMesh = null;
 
     loadGeometry(geometry);
     dropHint.classList.add('loaded');   // hide hint via CSS (does not affect the file input)
@@ -469,6 +486,86 @@ function renderSurfaceList() {
   }
 }
 
+// ── Paint (experimental) ──────────────────────────────────────────────────────
+
+/** Overlay geometry for a set of triangle indices of the loaded mesh. */
+function trianglesToGeometry(geometry, triangles) {
+  const pos = geometry.attributes.position;
+  const out = new Float32Array(triangles.size * 9);
+  let i = 0;
+  for (const t of triangles) {
+    for (let v = 0; v < 3; v++) {
+      out[i++] = pos.getX(t * 3 + v);
+      out[i++] = pos.getY(t * 3 + v);
+      out[i++] = pos.getZ(t * 3 + v);
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(out, 3));
+  geo.computeVertexNormals();
+  return geo;
+}
+
+function clearPaint() {
+  paintSelection = new Set();
+  setExclusionOverlay(null);
+  setHoverPreview(null);
+  if (paintStatus) paintStatus.textContent = '';
+}
+
+/** One-line description of a fitted surface for the paint status. */
+function describePaintFit(type, fit) {
+  const p = fit?.params;
+  if (!p) return fit?.reason ? `fit failed: ${fit.reason}` : '';
+  const res = Number.isFinite(fit.relResidual) ? `, residual ${fit.relResidual.toExponential(1)}` : '';
+  if (type === 'cylinder') return `r = ${p.radius.toFixed(3)}${res}`;
+  if (type === 'sphere') return `r = ${p.radius.toFixed(3)}${res}`;
+  if (type === 'cone') return `half-angle ${(p.halfAngle / DEG_RAD).toFixed(2)}°${res}`;
+  if (type === 'torus') return `R = ${p.majorRadius.toFixed(3)}, r = ${p.minorRadius.toFixed(3)}${res}`;
+  return res.replace(/^, /, '');
+}
+const DEG_RAD = Math.PI / 180;
+
+async function handlePaintClick(e) {
+  if (paintBusy || !currentGeometry) return;
+  const tri = pickTriangle(e.clientX, e.clientY);
+  if (tri < 0) return;
+  paintBusy = true;
+  try {
+    const tool = await import('./paintTool.js');
+    if (!paintMesh) {
+      paintStatus.textContent = 'Preparing mesh…';
+      await yieldToUI();
+      paintMesh = tool.preparePaintMesh(currentGeometry);
+    }
+    paintStatus.textContent = 'Filling…';
+    await yieldToUI();
+    const r = await tool.paintAt(tri, paintMesh, {
+      method: paintMethod.value, type: paintType.value, modelUrl: paintModel.value,
+    });
+
+    paintSelection = e.shiftKey ? new Set([...paintSelection, ...r.region]) : r.region;
+    setExclusionOverlay(trianglesToGeometry(currentGeometry, paintSelection), 0xff6600, 0.8);
+    setHoverPreview(paintShowModel.checked && r.modelRegion
+      ? trianglesToGeometry(currentGeometry, r.modelRegion) : null);
+
+    const lines = [];
+    if (r.predicted) lines.push(`Model says: ${r.predicted} (${Math.round(100 * r.confidence)}%)`);
+    lines.push(`Filled ${r.region.size.toLocaleString()} triangles as ${r.fitter ?? 'model region'}` +
+      (e.shiftKey ? ` · selection ${paintSelection.size.toLocaleString()}` : ''));
+    const fitText = r.fitter ? describePaintFit(r.fitter, r.fit) : '';
+    if (fitText) lines.push(fitText);
+    lines.push(`${r.calls} model call${r.calls === 1 ? '' : 's'} · ${Math.round(r.ms)} ms`);
+    lines.push(...r.notes);
+    paintStatus.textContent = lines.join('\n');
+  } catch (err) {
+    console.error('Paint failed:', err);
+    paintStatus.textContent = `Paint failed: ${err.message}`;
+  } finally {
+    paintBusy = false;
+  }
+}
+
 // ── STEP export ───────────────────────────────────────────────────────────────
 
 async function handleExport() {
@@ -540,13 +637,19 @@ function wireEvents() {
     _pointerDownPos = { x: e.clientX, y: e.clientY };
   });
   canvas.addEventListener('click', e => {
-    if (!currentGeometry && _pointerDownPos) {
+    if (_pointerDownPos) {
       const dx = e.clientX - _pointerDownPos.x;
       const dy = e.clientY - _pointerDownPos.y;
-      if (dx * dx + dy * dy < 25) stlFileInput.click(); // < 5px movement = genuine click
+      const genuine = dx * dx + dy * dy < 25;   // < 5px movement = a click, not an orbit drag
+      if (genuine && !currentGeometry) stlFileInput.click();
+      else if (genuine && paintToggle?.checked) handlePaintClick(e);
     }
     _pointerDownPos = null;
   });
+
+  // Paint (experimental)
+  paintClearBtn?.addEventListener('click', clearPaint);
+  paintShowModel?.addEventListener('change', () => { if (!paintShowModel.checked) setHoverPreview(null); });
 
   // Crease angle slider
   creaseSlider.addEventListener('input', () => {

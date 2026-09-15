@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from meshcore import adjacency_csr, build_adjacency, build_facets  # noqa: E402
 from model import SeedFillNet  # noqa: E402
 from occ_tessellate import TYPE_NAMES  # noqa: E402
-from patches import N_FEATURES, N_TYPES, collate, extract_patch  # noqa: E402
+from patches import FEATURE_NAMES, N_FEATURES, N_TYPES, collate, extract_patch  # noqa: E402
 from relabel_sidecar import val_split  # noqa: E402
 
 
@@ -53,6 +53,9 @@ def main(argv=None):
     ap.add_argument("--max-facets", type=int, default=512)
     ap.add_argument("--zero-curvature", action="store_true", default=True,
                     help="columns 10-11 at zero, as the control arm was trained")
+    ap.add_argument("--zero-features", default=None,
+                    help="comma list of FEATURE_NAMES to zero. Default: the columns the "
+                         "checkpoint was trained with at zero (train.py --zero-features)")
     args = ap.parse_args(argv)
 
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -60,6 +63,14 @@ def main(argv=None):
     net = SeedFillNet(in_features=N_FEATURES, n_types=N_TYPES)
     net.load_state_dict(ck["model"])
     net.to(dev).eval()
+    if args.zero_features is not None:
+        zero_cols = {FEATURE_NAMES.index(n) for n in args.zero_features.split(",") if n}
+    else:
+        # checkpoints from before --zero-features carry no zero_cols; curvature is added below
+        zero_cols = set(ck["args"].get("zero_cols", ()))
+    if args.zero_curvature:
+        zero_cols |= {FEATURE_NAMES.index("k1s"), FEATURE_NAMES.index("k2s")}
+    zero_cols = sorted(zero_cols)
 
     val, _ = val_split(args.split_bake)
     if args.bake != args.split_bake:
@@ -106,15 +117,16 @@ def main(argv=None):
                 stored_lab.append(int(fty[seed]))
                 canon_lab.append(int(canon[fid[seed]]))
 
-    print(f"checkpoint {args.ckpt}  (step {ck.get('step')})")
+    print(f"checkpoint {args.ckpt}  (step {ck.get('step')})  "
+          f"zeroed: {', '.join(FEATURE_NAMES[i] for i in zero_cols) or 'none'}")
     print(f"validation models used {used:,}   without sidecar {missing:,}   patches {len(samples):,}\n")
 
     preds, tps, fps, fns = [], [], [], []
     with torch.no_grad():
         for i in range(0, len(samples), 256):
             x, y, m, _ = collate(samples[i:i + 256], args.max_facets)
-            if args.zero_curvature:
-                x[:, :, 10:12] = 0.0
+            if zero_cols:
+                x[:, :, zero_cols] = 0.0
             sl, tl = net(torch.from_numpy(x).to(dev), torch.from_numpy(m).to(dev))
             preds.append(tl.float().argmax(1).cpu().numpy())
             member = (sl.float().sigmoid().cpu().numpy() > 0.5) & (m > 0)

@@ -8,12 +8,12 @@
  *        These edges define the exact face boundary regardless of what surface
  *        types are involved — plane/plane, plane/cylinder, cylinder/cone, etc.
  *   3. Build one face per surface group:
- *        • Planar faces — walk the mesh boundary edges into an ordered polygon,
- *          project every vertex onto the analytical plane (eliminating mesh-noise
- *          offset), then call MakeFace_16(gp_Pln, wire).  Works for any mix of
- *          neighbouring surface types.
- *        • Curved faces (cylinder / cone / sphere) — build a UV-bounded patch
- *          from mesh vertex projections with a tiny safety margin (0.1 % + 1e-6).
+ *        • Planar faces — every boundary loop of the group, snapped onto the fitted
+ *          plane: the largest is the outer wire (MakeFace_16(gp_Pln, wire)), the
+ *          rest are added as holes (planeBoundary).
+ *        • Curved faces (cylinder / cone / sphere / torus) — a UV-bounded patch in
+ *          OCCT's own parameterisation, framed so it covers exactly the angular and
+ *          axial range the group's triangles cover (patchBounds).
  *        • Fallback — a mesh-vertex bounding-rectangle large patch for planes
  *          whose boundary-edge walk fails, or any surface that throws.
  *   4. Sew with an adaptive tolerance = 5 e-3 × model bounding-box diagonal.
@@ -25,6 +25,8 @@
  * opencascade.js is loaded lazily via dynamic import() when the user first
  * clicks "Export STEP" so the 35 MB WASM does not block page load.
  */
+
+import { weldQuantum } from './meshCore.js';
 
 // ── Build version ─────────────────────────────────────────────────────────────
 
@@ -340,6 +342,277 @@ function _sphereVExtentsFromVertices(group, geometry, center, radius) {
   return { vmin, vmax };
 }
 
+// ── Planar face boundaries ───────────────────────────────────────────────────
+//
+// A planar face is exported as the polygon of its mesh boundary. The walk this replaces
+// (_orderBoundaryLoop) followed ONE loop from whichever boundary vertex a Map yielded first, so a
+// face with a hole went out filled - and when the walk began on the hole, the face went out AS the
+// hole: a disc of surface where the part has none. 15% of the plane faces on 40 ABC validation
+// parts have more than one boundary loop. Every loop is kept now, the largest in the plane is the
+// outer boundary, and the rest are holes.
+
+/**
+ * Every boundary loop of a group's triangles: edges used by exactly one of its triangles, walked
+ * in the direction their triangle winds them, so an outer loop runs counter-clockwise about the
+ * facet normals and a hole clockwise.
+ *
+ * @returns {number[][][]}  loops of [x, y, z]
+ */
+export function groupBoundaryLoops(triangleIndices, pos, quant) {
+  const key = (i) => `${Math.round(pos.getX(i) * quant)}_${Math.round(pos.getY(i) * quant)}_${Math.round(pos.getZ(i) * quant)}`;
+  const edges = new Map();
+  for (const t of triangleIndices) {
+    for (let e = 0; e < 3; e++) {
+      const a = t * 3 + e, b = t * 3 + (e + 1) % 3;
+      const ka = key(a), kb = key(b);
+      if (ka === kb) continue;
+      const ek = ka < kb ? ka + '|' + kb : kb + '|' + ka;
+      const hit = edges.get(ek);
+      if (hit) hit.n++;
+      else edges.set(ek, { n: 1, a, ka, kb });
+    }
+  }
+  const from = new Map();
+  for (const e of edges.values()) {
+    if (e.n !== 1) continue;
+    if (!from.has(e.ka)) from.set(e.ka, []);
+    from.get(e.ka).push(e);
+  }
+  const used = new Set();
+  const loops = [];
+  for (const list of from.values()) {
+    for (const start of list) {
+      if (used.has(start)) continue;
+      const loop = [];
+      let e = start;
+      while (e && !used.has(e)) {
+        used.add(e);
+        loop.push([pos.getX(e.a), pos.getY(e.a), pos.getZ(e.a)]);
+        e = (from.get(e.kb) ?? []).find(x => !used.has(x));
+      }
+      if (loop.length >= 3) loops.push(loop);
+    }
+  }
+  return loops;
+}
+
+/**
+ * A planar group's boundary on its fitted plane: the outer loop (largest area, counter-clockwise
+ * about the plane normal) and holes (clockwise), every point snapped onto the plane.
+ *
+ * @returns {{outer?:number[][], holes?:number[][][], frame?:{xA:number[], yA:number[]}}}
+ */
+export function planeBoundary(params, triangleIndices, geometry, quant) {
+  const pos = geometry.attributes.position;
+  const loops = groupBoundaryLoops(triangleIndices, pos, quant ?? weldQuantum(pos.array));
+  if (!loops.length) return {};
+  const { origin } = params;
+  const n = _u3(params.normal);
+  const ref = Math.abs(n[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0];
+  const xA = _u3(_x3(n, ref));
+  const yA = _x3(n, xA);
+  const flat = loops.map(l => l.map(p => snapToPlane(p, origin, n)));
+  const areas = flat.map((l) => {
+    let a = 0;
+    for (let i = 0; i < l.length; i++) {
+      const p = _sub3(l[i], origin), q = _sub3(l[(i + 1) % l.length], origin);
+      a += _d3(p, xA) * _d3(q, yA) - _d3(q, xA) * _d3(p, yA);
+    }
+    return a / 2;
+  });
+  let oi = 0;
+  for (let i = 1; i < flat.length; i++) if (Math.abs(areas[i]) > Math.abs(areas[oi])) oi = i;
+  const orient = (i, sign) => (Math.sign(areas[i]) === sign ? flat[i] : [...flat[i]].reverse());
+  return {
+    outer: orient(oi, 1),
+    holes: flat.map((_, i) => i).filter(i => i !== oi).map(i => orient(i, -1)),
+    frame: { xA, yA },
+  };
+}
+
+// ── Patch parameter ranges ───────────────────────────────────────────────────
+//
+// WHERE A CURVED FACE IS EMITTED IS DECIDED HERE, not by the fitter. Scored against the true
+// surfaces with every labelled patch given its exact fit (test/emitTruth.mjs, ml/emit_truth_occ.py;
+// 40 ABC parts x native/gmsh/game), the emission itself put surfaces in the wrong places:
+//
+//   cone V was passed as AXIAL distance from the apex, but OCCT's cone V runs ALONG THE GENERATOR
+//     (axial = v cos a), so the exported band slid toward the apex: axial overlap with the true
+//     patch had a median of 0.08-0.21 and a tenth of cones did not overlap it at all
+//   U was always 0..2pi, so a quarter-round cylinder or a spherical cap went out as a full tube or
+//     band: on gmsh meshes a median 43% of each exported cylinder lay off its patch
+//   there was no torus branch: 0 of 389 tori were drawn or exported
+//
+// So every curved face gets a frame whose X direction starts its angular range, and U/V ranges in
+// OCCT's own parameterisation (gp_Ax3 with Y = Z x X), which evalPatch() evaluates for the preview
+// so the preview and the STEP face are the same surface patch:
+//
+//   cylinder  P = O + r (cos u X + sin u Y) + v Z
+//   cone      P = O + v sin a (cos u X + sin u Y) + v cos a Z          O = apex, reference radius 0
+//   sphere    P = O + R cos v (cos u X + sin u Y) + R sin v Z
+//   torus     P = O + (R + r cos v)(cos u X + sin u Y) + r sin v Z
+
+const TAU = 2 * Math.PI;
+const wrap = (x) => ((x % TAU) + TAU) % TAU;
+
+/**
+ * The smallest arc containing the union of the triangles' own arcs, or the full circle.
+ *
+ * From TRIANGLES, not vertex angles: a closed ring has no uncovered angle at all, while a patch's
+ * opening is an arc no triangle spans. Vertex angles alone cannot tell an opening from an uneven
+ * sampling step, and any threshold for it would be a guess.
+ *
+ * @param {number[][]} triAngles  per triangle, its three vertex angles
+ * @returns {{start:number, span:number, full:boolean}}
+ */
+function arcOfTriangles(triAngles) {
+  const spans = [];
+  for (const t of triAngles) {
+    const a = t.map(wrap).sort((p, q) => p - q);
+    const gaps = [a[1] - a[0], a[2] - a[1], a[0] + TAU - a[2]];
+    const gi = gaps.indexOf(Math.max(...gaps));
+    const s = a[(gi + 1) % 3];
+    const span = TAU - gaps[gi];
+    if (s + span <= TAU) spans.push([s, s + span]);
+    else { spans.push([s, TAU]); spans.push([0, s + span - TAU]); }
+  }
+  if (!spans.length) return { start: 0, span: TAU, full: true };
+  spans.sort((p, q) => p[0] - q[0]);
+  const merged = [spans[0].slice()];
+  for (const [s, e] of spans.slice(1)) {
+    const last = merged[merged.length - 1];
+    if (s <= last[1] + 1e-12) last[1] = Math.max(last[1], e);
+    else merged.push([s, e]);
+  }
+  let best = { len: 0, end: 0 };
+  for (let i = 0; i < merged.length; i++) {
+    const gapStart = merged[i][1];
+    const gapEnd = i + 1 < merged.length ? merged[i + 1][0] : merged[0][0] + TAU;
+    if (gapEnd - gapStart > best.len) best = { len: gapEnd - gapStart, end: gapEnd };
+  }
+  if (best.len <= 1e-9) return { start: 0, span: TAU, full: true };
+  return { start: wrap(best.end), span: TAU - best.len, full: false };
+}
+
+/**
+ * Frame and OCCT parameter ranges of the patch a group's triangles cover on its fitted surface.
+ *
+ * @param {'cylinder'|'cone'|'sphere'|'torus'} type
+ * @param {object} params        fitted parameters
+ * @param {Iterable<number>} triangles  triangle indices
+ * @param {{getX,getY,getZ}} pos  position attribute of a non-indexed geometry
+ * @returns {{type, origin:number[], axis:number[], xDir:number[], umin, umax, vmin, vmax, uFull:boolean}|null}
+ */
+export function patchBounds(type, params, triangles, pos) {
+  const tris = [...triangles];
+  if (!tris.length) return null;
+  const vert = (i) => [pos.getX(i), pos.getY(i), pos.getZ(i)];
+  let origin, axis;
+  if (type === 'cylinder') { origin = params.axisPoint; axis = _u3(params.axis); }
+  else if (type === 'cone') { origin = params.apex; axis = _u3(params.axis); }
+  else if (type === 'torus') { origin = params.center; axis = _u3(params.axis); }
+  else if (type === 'sphere') {
+    // Put the poles AWAY from the patch - perpendicular to its mean direction from the centre - so
+    // latitude stays well inside (-pi/2, pi/2) and the angular range is the patch's own width.
+    origin = params.center;
+    let m = [0, 0, 0];
+    for (const t of tris) for (let k = 0; k < 3; k++) {
+      const d = _u3(_sub3(vert(t * 3 + k), origin));
+      m = [m[0] + d[0], m[1] + d[1], m[2] + d[2]];
+    }
+    m = _u3(m);
+    const ref = Math.abs(m[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
+    axis = _u3(_x3(m, ref));
+  } else {
+    return null;
+  }
+
+  // float32 coordinates are exact to ~6e-8 of their magnitude. A vertex that close to the apex or
+  // the axis IS on it: a drill point or countersink meshed to its tip has a vertex at the apex that
+  // rounding puts 1e-7 on either side, and 18 exactly fitted cones (of 257) were rejected as
+  // straddling the apex until this was allowed for.
+  let big = 0;
+  for (const t of tris) for (let k = 0; k < 3; k++) for (const c of vert(t * 3 + k)) big = Math.max(big, Math.abs(c));
+  for (const c of origin) big = Math.max(big, Math.abs(c));
+  const quantum = 6e-8 * big;
+
+  // A cone patch lies on one nappe; orient the axis to open toward it.
+  if (type === 'cone') {
+    let pos_ = 0, neg = 0;
+    for (const t of tris) for (let k = 0; k < 3; k++) {
+      const z = _d3(_sub3(vert(t * 3 + k), origin), axis);
+      if (z > quantum) pos_++; else if (z < -quantum) neg++;
+    }
+    if (pos_ && neg) return null;               // straddles the apex: not one conical face
+    if (neg) axis = [-axis[0], -axis[1], -axis[2]];
+  }
+
+  const ref = Math.abs(axis[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
+  const x0 = _u3(_x3(ref, axis));
+  const y0 = _x3(axis, x0);
+  const ca = type === 'cone' ? Math.cos(params.halfAngle) : 1;
+  const uAngles = [], vAngles = [];
+  let vmin = Infinity, vmax = -Infinity;
+  for (const t of tris) {
+    const ua = [], va = [];
+    for (let k = 0; k < 3; k++) {
+      const d = _sub3(vert(t * 3 + k), origin);
+      const z = _d3(d, axis), rx = _d3(d, x0), ry = _d3(d, y0);
+      const rho = Math.hypot(rx, ry);
+      // On the axis (a cone's apex) the angle is undefined: it bounds nothing, so leave it out.
+      if (rho > quantum) ua.push(Math.atan2(ry, rx));
+      let v;
+      if (type === 'cylinder') v = z;
+      else if (type === 'cone') v = z / ca;
+      else if (type === 'sphere') v = Math.atan2(z, rho);
+      else { va.push(Math.atan2(z, rho - params.majorRadius)); continue; }
+      if (v < vmin) vmin = v;
+      if (v > vmax) vmax = v;
+    }
+    if (ua.length === 3) uAngles.push(ua);
+    else if (ua.length === 2) uAngles.push([ua[0], ua[1], ua[1]]);
+    if (va.length) vAngles.push(va);
+  }
+
+  const u = arcOfTriangles(uAngles);
+  const c = Math.cos(u.start), s = Math.sin(u.start);
+  const xDir = _u3([c * x0[0] + s * y0[0], c * x0[1] + s * y0[1], c * x0[2] + s * y0[2]]);
+  let umin = 0, umax = u.span;
+  if (!u.full) { const p = u.span * 1e-3 + 1e-9; umin -= p; umax += p; }
+
+  if (type === 'torus') {
+    const v = arcOfTriangles(vAngles);
+    vmin = v.start; vmax = v.start + v.span;
+    if (!v.full) { const p = v.span * 1e-3 + 1e-9; vmin -= p; vmax += p; }
+  } else {
+    if (!(vmax > vmin)) return null;
+    const p = (vmax - vmin) * 1e-3 + 1e-9;
+    vmin -= p; vmax += p;
+    if (type === 'cone') vmin = Math.max(0, vmin);
+    if (type === 'sphere') { vmin = Math.max(-Math.PI / 2, vmin); vmax = Math.min(Math.PI / 2, vmax); }
+  }
+  return { type, origin, axis, xDir, umin, umax, vmin, vmax, uFull: u.full };
+}
+
+/** A point of a patch at OCCT parameters (u, v): the same surface the STEP face is built on. */
+export function evalPatch(params, b, u, v) {
+  const Z = b.axis, X = b.xDir, Y = _x3(Z, X);
+  const cu = Math.cos(u), su = Math.sin(u);
+  let rr, zz;
+  if (b.type === 'cylinder') { rr = params.radius; zz = v; }
+  else if (b.type === 'cone') { rr = v * Math.sin(params.halfAngle); zz = v * Math.cos(params.halfAngle); }
+  else if (b.type === 'sphere') { rr = params.radius * Math.cos(v); zz = params.radius * Math.sin(v); }
+  else { rr = params.majorRadius + params.minorRadius * Math.cos(v); zz = params.minorRadius * Math.sin(v); }
+  const O = b.origin;
+  return [
+    O[0] + rr * (cu * X[0] + su * Y[0]) + zz * Z[0],
+    O[1] + rr * (cu * X[1] + su * Y[1]) + zz * Z[1],
+    O[2] + rr * (cu * X[2] + su * Y[2]) + zz * Z[2],
+  ];
+}
+
+function _sub3(a, b) { return [a[0] - b[0], a[1] - b[1], a[2] - b[2]]; }
+
 // ── Public pure-JS boundary computation (no OCCT) ────────────────────────────
 
 /**
@@ -356,6 +629,7 @@ function _sphereVExtentsFromVertices(group, geometry, center, radius) {
 export function computeAnalyticalBoundaries(groups, geometry) {
   const adjacency = buildGroupAdjacencyMap(groups, geometry);
   const boundaries = new Map();
+  const quant = weldQuantum(geometry.attributes.position.array);
 
   for (let gi = 0; gi < groups.length; gi++) {
     const g = groups[gi];
@@ -391,16 +665,17 @@ export function computeAnalyticalBoundaries(groups, geometry) {
           [o[0]+umax*xA[0]+vmax*yA[0], o[1]+umax*xA[1]+vmax*yA[1], o[2]+umax*xA[2]+vmax*yA[2]],
           [o[0]+umin*xA[0]+vmax*yA[0], o[1]+umin*xA[1]+vmax*yA[1], o[2]+umin*xA[2]+vmax*yA[2]],
         ];
-        boundaries.set(gi, { type: 'plane', loop });
+        // `loop` is the old bounding rectangle; `outer`/`holes` are the face as exported.
+        boundaries.set(gi, { type: 'plane', loop, ...planeBoundary(params, g.triangleIndices, geometry, quant) });
       }
-    } else if (type === 'cylinder') {
-      const vr = _cylinderVExtentsFromVertices(g, geometry, params.axisPoint, params.axis);
-      boundaries.set(gi, { type: 'cylinder', vmin: vr?.vmin ?? null, vmax: vr?.vmax ?? null });
-    } else if (type === 'cone') {
-      const vr = _cylinderVExtentsFromVertices(g, geometry, params.apex, params.axis);
-      boundaries.set(gi, { type: 'cone', vmin: vr?.vmin ?? null, vmax: vr?.vmax ?? null });
-    } else if (type === 'sphere') {
-      boundaries.set(gi, { type: 'sphere' });
+    } else if (type === 'cylinder' || type === 'cone' || type === 'sphere' || type === 'torus') {
+      // `patch` is where the face really is (see patchBounds). vmin/vmax keep their old AXIAL
+      // meaning for any caller still reading them.
+      const patch = patchBounds(type, params, g.triangleIndices, geometry.attributes.position);
+      const vr = type === 'cylinder' ? _cylinderVExtentsFromVertices(g, geometry, params.axisPoint, params.axis)
+               : type === 'cone' ? _cylinderVExtentsFromVertices(g, geometry, params.apex, params.axis)
+               : null;
+      boundaries.set(gi, { type, vmin: vr?.vmin ?? null, vmax: vr?.vmax ?? null, patch });
     }
   }
 
@@ -498,49 +773,29 @@ function _buildLargePatch(oc, group, geometry, toDelete) {
       return mf.IsDone() ? mf.Face() : null;
     }
 
-    if (type === 'cylinder') {
-      const { axisPoint, axis, radius } = params;
-      const vr = _cylinderVExtentsFromVertices(group, geometry, axisPoint, axis);
-      if (!vr) return null;
-      const ax3 = makeAx3(oc, axisPoint, axis);
+    if (type === 'cylinder' || type === 'cone' || type === 'sphere' || type === 'torus') {
+      // Frame and UV ranges from patchBounds, in OCCT's own parameterisation: the face covers the
+      // patch its triangles cover, where the old branches emitted full-circle tubes and bands, slid
+      // cone bands toward the apex (axial V passed as generator V), and skipped tori altogether.
+      const b = patchBounds(type, params, group.triangleIndices, geometry.attributes.position);
+      if (!b) return null;
+      const ax3 = new oc.gp_Ax3_3(makePnt(oc, b.origin), makeDir(oc, b.axis), makeDir(oc, b.xDir));
       toDelete.push(ax3);
-      const cyl = new oc.gp_Cylinder_2(ax3, radius);
-      toDelete.push(cyl);
-      const pad = (vr.vmax - vr.vmin) * 1e-3 + 1e-6;
-      const mf = new oc.BRepBuilderAPI_MakeFace_10(cyl, 0.0, 2*Math.PI, vr.vmin - pad, vr.vmax + pad);
-      toDelete.push(mf);
-      return mf.IsDone() ? mf.Face() : null;
-    }
-
-    if (type === 'cone') {
-      const { apex, axis, halfAngle } = params;
-      const vr = _cylinderVExtentsFromVertices(group, geometry, apex, axis);
-      if (!vr || vr.vmin < -1e-6) return null;
-      const ax3 = makeAx3(oc, apex, axis);
-      toDelete.push(ax3);
-      const cone = new oc.gp_Cone_2(ax3, halfAngle, 0.0);
-      toDelete.push(cone);
-      const pad = (vr.vmax - vr.vmin) * 1e-3 + 1e-6;
-      const mf = new oc.BRepBuilderAPI_MakeFace_11(cone, 0.0, 2*Math.PI, Math.max(0, vr.vmin - pad), vr.vmax + pad);
-      toDelete.push(mf);
-      return mf.IsDone() ? mf.Face() : null;
-    }
-
-    if (type === 'sphere') {
-      const { center, radius } = params;
-      const vr = _sphereVExtentsFromVertices(group, geometry, center, radius);
-      if (!vr) return null;
-      const ax3 = new oc.gp_Ax3_4(makePnt(oc, center), makeDir(oc, [0, 0, 1]));
-      toDelete.push(ax3);
-      const sph = new oc.gp_Sphere_2(ax3, radius);
-      toDelete.push(sph);
-      const pad = Math.max((vr.vmax - vr.vmin) * 1e-3 + 1e-6, 0);
-      const mf = new oc.BRepBuilderAPI_MakeFace_12(
-        sph, 0.0, 2*Math.PI,
-        Math.max(-Math.PI/2, vr.vmin - pad),
-        Math.min( Math.PI/2, vr.vmax + pad),
-      );
-      toDelete.push(mf);
+      let surf, mf;
+      if (type === 'cylinder') {
+        surf = new oc.gp_Cylinder_2(ax3, params.radius);
+        mf = new oc.BRepBuilderAPI_MakeFace_10(surf, b.umin, b.umax, b.vmin, b.vmax);
+      } else if (type === 'cone') {
+        surf = new oc.gp_Cone_2(ax3, params.halfAngle, 0.0);
+        mf = new oc.BRepBuilderAPI_MakeFace_11(surf, b.umin, b.umax, b.vmin, b.vmax);
+      } else if (type === 'sphere') {
+        surf = new oc.gp_Sphere_2(ax3, params.radius);
+        mf = new oc.BRepBuilderAPI_MakeFace_12(surf, b.umin, b.umax, b.vmin, b.vmax);
+      } else {
+        surf = new oc.gp_Torus_2(ax3, params.majorRadius, params.minorRadius);
+        mf = new oc.BRepBuilderAPI_MakeFace_13(surf, b.umin, b.umax, b.vmin, b.vmax);
+      }
+      toDelete.push(surf, mf);
       return mf.IsDone() ? mf.Face() : null;
     }
 
@@ -568,8 +823,8 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
 
   onStatus?.('Building B-rep faces…', 20);
 
-  const bdyEdgeMap = _buildBoundaryEdgeMap(groups, geometry);
-  const toDelete   = [];
+  const quant    = weldQuantum(geometry.attributes.position.array);
+  const toDelete = [];
 
   // ── Compute adaptive sewing tolerance ────────────────────────────────────────
   // For all-planar models the mesh boundary vertices coincide exactly on shared
@@ -620,27 +875,25 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
     let face = null;
 
     if (g.surface.type === 'plane') {
-      const loop = _orderBoundaryLoop(
-        bdyEdgeMap.get(i) ?? [], geometry.attributes.position,
-      );
-      if (loop) {
-        try {
-          const { origin, normal } = g.surface.params;
-          const nu  = _u3(normal);
-          // Project every vertex onto the analytical plane to cancel any
-          // sub-micron mesh-normal offset noise.
-          const projected = loop.map(p => snapToPlane(p, origin, normal));
-          const pln  = new oc.gp_Pln_3(makePnt(oc, origin), makeDir(oc, nu));
+      try {
+        const { origin, normal } = g.surface.params;
+        const { outer, holes } = planeBoundary(g.surface.params, g.triangleIndices, geometry, quant);
+        if (outer) {
+          const pln = new oc.gp_Pln_3(makePnt(oc, origin), makeDir(oc, _u3(normal)));
           toDelete.push(pln);
-          const wire = buildWire(oc, projected, toDelete);
+          const wire = buildWire(oc, outer, toDelete);
           if (wire) {
             const mf = new oc.BRepBuilderAPI_MakeFace_16(pln, wire, true);
             toDelete.push(mf);
+            for (const hole of holes) {
+              const hw = buildWire(oc, hole, toDelete);
+              if (hw) mf.Add(hw);
+            }
             if (mf.IsDone()) face = mf.Face();
           }
-        } catch (e) {
-          console.warn(`Planar face ${i} boundary wire:`, e?.message ?? e);
         }
+      } catch (e) {
+        console.warn(`Planar face ${i} boundary wire:`, e?.message ?? e);
       }
     }
 

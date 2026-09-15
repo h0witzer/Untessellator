@@ -829,6 +829,28 @@ export function setGroupHoverCallback(cb) {
   _onGroupHoverCallback = cb;
 }
 
+const _pickRaycaster = new THREE.Raycaster();
+
+/**
+ * Triangle index under a screen point, or -1 when nothing is hit. Indices match the
+ * loaded geometry's triangle order, which is what meshCore's facets use.
+ *
+ * @param {number} clientX
+ * @param {number} clientY
+ * @returns {number}
+ */
+export function pickTriangle(clientX, clientY) {
+  if (!currentMesh || !renderer) return -1;
+  const rect = renderer.domElement.getBoundingClientRect();
+  const ndc = new THREE.Vector2(
+    ((clientX - rect.left) / rect.width)  *  2 - 1,
+    ((clientY - rect.top)  / rect.height) * -2 + 1,
+  );
+  _pickRaycaster.setFromCamera(ndc, camera);
+  const hits = _pickRaycaster.intersectObject(currentMesh);
+  return hits.length > 0 ? hits[0].faceIndex : -1;
+}
+
 /**
  * Replace the current B-rep analytic-surface overlay with a new Three.js group.
  * Pass null to remove any existing overlay without adding a new one.

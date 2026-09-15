@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>stlToStep Studio</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="vendor/form-studio-ui/onshape.css">
+  <link rel="stylesheet" href="studio.css">
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
+      "fflate": "https://cdn.jsdelivr.net/npm/fflate@0.8.2/esm/browser.js",
+      "onnxruntime-web": "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.wasm.min.mjs"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="app"></div>
+  <script>
+    // Browsers refuse ES modules from file://, which leaves this page blank. Say so instead.
+    if (location.protocol === 'file:') {
+      document.getElementById('app').innerHTML =
+        '<p style="font:14px sans-serif;color:#ddd;background:#333;margin:0;padding:40px;height:100vh;box-sizing:border-box">' +
+        'This page has to be served, not opened as a file. Run the local server and open ' +
+        '<a style="color:#3e94ff" href="http://localhost:3000/studio.html">http://localhost:3000/studio.html</a></p>';
+    }
+  </script>
+  <script type="module" src="js/studio/studio.js"></script>
+</body>
+</html>

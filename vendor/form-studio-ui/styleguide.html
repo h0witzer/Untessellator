@@ -1,0 +1,927 @@
+<!--
+  The Onshape UI kit, to look at and to click.
+
+    npm run serve
+    http://127.0.0.1:8787/src/ui/styleguide.html
+    http://127.0.0.1:8787/src/ui/styleguide.html?theme=light
+
+  Every value on this page was MEASURED out of a live Part Studio (see
+  docs/ONSHAPE_STYLE.md for where each came from) and every control is the kit's
+  own — the frame below is built by src/ui/shell.js exactly as an app would
+  build it, so what you see is what an app gets. docs/UI_KIT.md is the how-to.
+-->
+<meta charset="utf-8" />
+<title>Onshape UI kit</title>
+<link rel="stylesheet" href="onshape.css" />
+<style>
+  body {
+    margin: 0;
+    padding: 28px 32px 60px;
+    font-family: var(--os-font);
+    font-size: var(--os-font-size);
+    line-height: var(--os-line-height);
+    color: var(--os-text-primary);
+    background: var(--os-background-primary);
+  }
+  h1 {
+    font-size: var(--os-font-size-title);
+    font-weight: var(--os-font-weight-strong);
+    margin: 0 0 4px;
+  }
+  .sub {
+    color: var(--os-text-secondary);
+    font-size: var(--os-font-size-small);
+    margin-bottom: 28px;
+  }
+  h2 {
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--os-text-secondary);
+    font-weight: 600;
+    margin: 34px 0 10px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--os-border);
+  }
+  .note {
+    color: var(--os-text-secondary);
+    font-size: var(--os-font-size-small);
+    max-width: 78ch;
+    margin: 0 0 14px;
+  }
+  .swatches {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+    gap: 10px;
+  }
+  .swatch {
+    border: 1px solid var(--os-border);
+    border-radius: var(--os-radius);
+    overflow: hidden;
+  }
+  .chip {
+    height: 52px;
+  }
+  .swatch dl {
+    margin: 0;
+    padding: 7px 9px;
+    font-size: 11px;
+    line-height: 1.45;
+    background: var(--os-background-secondary);
+  }
+  .swatch dt {
+    font-weight: 600;
+  }
+  .swatch dd {
+    margin: 0;
+    color: var(--os-text-secondary);
+    font-family: ui-monospace, Consolas, monospace;
+  }
+  .strip {
+    display: flex;
+    gap: 10px;
+    align-items: flex-end;
+    flex-wrap: wrap;
+    margin-bottom: 14px;
+  }
+  table {
+    border-collapse: collapse;
+    font-size: var(--os-font-size-small);
+  }
+  th,
+  td {
+    text-align: left;
+    padding: 5px 14px 5px 0;
+    border-bottom: 1px solid var(--os-border);
+    vertical-align: top;
+  }
+  th {
+    color: var(--os-text-secondary);
+    font-weight: 600;
+  }
+  td.mono,
+  .mono {
+    font-family: ui-monospace, Consolas, monospace;
+  }
+  .specimen {
+    border: 1px solid var(--os-border);
+    border-radius: var(--os-radius);
+    padding: 14px 16px;
+    background: var(--os-background-secondary);
+    margin-bottom: 14px;
+  }
+  canvas.sphere {
+    display: block;
+    border: 1px solid var(--os-border);
+    border-radius: var(--os-radius);
+  }
+  .wrong {
+    color: var(--os-text-secondary);
+  }
+  .wrong b {
+    color: var(--os-highlight-outline);
+  }
+  .caption {
+    margin-top: 8px;
+    font-size: 11px;
+    color: var(--os-text-secondary);
+  }
+  pre {
+    margin: 0;
+    padding: 12px 14px;
+    font: 12px / 1.5 ui-monospace, Consolas, monospace;
+    color: var(--os-text-primary);
+    background: var(--os-background-secondary);
+    border: 1px solid var(--os-border);
+    border-radius: var(--os-radius);
+    overflow-x: auto;
+  }
+  /* The live frame: the kit's shell, boxed instead of filling the window. */
+  .demo-frame {
+    position: relative;
+    height: 520px;
+    border: 1px solid var(--os-border);
+    overflow: hidden;
+    margin-bottom: 8px;
+  }
+  .demo-frame .os-shell {
+    position: absolute;
+  }
+  /* Static specimens of things that normally float. */
+  .os-menu--inline {
+    position: static;
+    display: inline-block;
+    vertical-align: top;
+  }
+  .os-tooltip--inline {
+    position: static;
+    display: inline-block;
+  }
+  .net-demo {
+    position: relative;
+    height: 120px;
+    background: var(--os-background-primary);
+    outline: 1px solid var(--os-border);
+  }
+  .net-demo span {
+    position: absolute;
+    left: 22%;
+    top: 20%;
+    width: 56%;
+    height: 60%;
+  }
+  .frame-demo {
+    position: relative;
+    width: 100%;
+    max-width: 640px;
+    aspect-ratio: 1600 / 1000;
+    border: 1px solid var(--os-border);
+    background: var(--os-background-primary);
+    margin-bottom: 14px;
+    font-size: 9px;
+    color: var(--os-text-secondary);
+  }
+  .frame-demo div {
+    position: absolute;
+    display: grid;
+    place-items: center;
+    outline: 1px solid var(--os-border);
+    overflow: hidden;
+  }
+</style>
+
+<body class="os-app">
+  <h1>Onshape UI kit</h1>
+  <div class="sub">
+    The frame and every control an app inside Onshape needs, measured 2026-09-11 from a live Part
+    Studio and built once in <span class="mono">src/ui/</span>. Nothing on this page was designed;
+    each value came out of <span class="mono">tools/style-probe.mjs</span>,
+    <span class="mono">tools/chrome-extract.mjs</span>,
+    <span class="mono">tools/viewcube-extract.mjs</span> or
+    <span class="mono">tools/look-compare.mjs</span>. Add <span class="mono">?theme=light</span> to
+    flip. Building on it: <span class="mono">docs/UI_KIT.md</span>.
+  </div>
+
+  <h2>The frame, live</h2>
+  <p class="note">
+    This is <span class="mono">createShell</span>, <span class="mono">createToolbar</span>,
+    <span class="mono">createPanel</span> and <span class="mono">mountViewCube</span>, called the
+    way an app calls them, with the product's rails and tab bar switched on so the whole frame can
+    be compared with a Part Studio. Hover a tool for its tooltip, open the caret on the split tool,
+    right-click the stage, right-drag it to orbit, click the cube, open the dropdown under it.
+  </p>
+  <div class="demo-frame" id="frameDemo"></div>
+  <table id="frame"></table>
+
+  <h2>The toolbar, tool by tool</h2>
+  <p class="note">
+    Every tool in Onshape's toolbar has a label in the DOM and every one is hidden except Sketch: one
+    labelled action, the rest icons with tooltips. A row of text buttons is the clearest sign a panel
+    was built without looking at a Part Studio. The sizes are theirs.
+  </p>
+  <table id="toolbarSpec"></table>
+
+  <h2>Menus and the tooltip</h2>
+  <p class="note">
+    The two things in the chrome that float, and the two that carry a shadow. The dropdown menu is
+    their camera menu reproduced entry for entry; the compact one is their context menu. Both are
+    the same component with a <span class="mono">compact</span> flag.
+  </p>
+  <div class="strip" style="align-items: flex-start" id="menuSpecimens"></div>
+  <table id="menuSpec"></table>
+
+  <h2>The panel</h2>
+  <p class="note">
+    The filter row, a section header with its 30px buttons, and 26px rows with a 20px icon box and
+    a 17px glyph. Children indent 19px under a guide line; default geometry is dimmed to 0.5; a
+    custom feature gets an initials chip. Hover is <span class="mono">#0a4780</span>, selection is
+    <span class="mono">#134e96</span> — measured from pixels, where the token sheet's
+    <span class="mono">--os-row-fill-selected</span> said <span class="mono">#094174</span>.
+  </p>
+  <table id="panelSpec"></table>
+
+  <h2>The twelve that matter most</h2>
+  <p class="note wrong">
+    Ordered by how fast a person notices. Each one decides, on its own, whether a panel reads as
+    part of the product.
+  </p>
+  <table id="eight"></table>
+
+  <h2>Colour</h2>
+  <p class="note">
+    The accent is not the same blue in both themes and not a lightened version of one:
+    <b class="mono">#3e94ff</b> on dark, <b class="mono">#1651b0</b> on light. Axis colours invert
+    in weight rather than staying put — saturated and dark on white, pale and light on #333.
+  </p>
+  <div class="swatches" id="swatches"></div>
+
+  <h2>Type</h2>
+  <p class="note">
+    Onshape uses Flama and really loads it; a guest origin cannot. Measured over eight strings at
+    14px, <b>system-ui is −0.90%</b> off Flama's metrics while Onshape's own declared fallback
+    lands on Open Sans at <b>+4.39%</b>. Copying their font-family verbatim is nearly the worst
+    available choice. Line-height is 1.5 everywhere.
+  </p>
+  <div id="type"></div>
+
+  <h2>Controls</h2>
+  <p class="note">
+    No button, input, tab, toolbar, panel, dialog or row carries a <span class="mono">box-shadow</span>;
+    only the menu and the tooltip do. A pressed toggle takes the accent, not a darker grey.
+  </p>
+  <div class="strip">
+    <button class="os-button">Secondary</button>
+    <button class="os-button os-button--primary">Primary</button>
+    <button class="os-button os-button--on">Pressed</button>
+    <button class="os-button" disabled>Disabled</button>
+    <input class="os-field" value="Text field" size="14" />
+  </div>
+  <table id="controls"></table>
+
+  <h2>Icons</h2>
+  <p class="note">
+    <b>Filled</b> glyphs on a <span class="mono">0 0 20 20</span> grid, drawn at 20×20 — measured,
+    82 of 91 symbols on that viewBox and 201 of 201 painted shapes filled, none stroked. The row
+    below puts a filled mark next to the stroked equivalent every popular icon set ships. The
+    difference is the loudest single mismatch available to an embedded panel.
+  </p>
+  <div class="specimen">
+    <div class="strip" style="align-items: center">
+      <svg class="os-icon" viewBox="0 0 20 20" aria-label="filled">
+        <path d="M10 2 18 7v9a1 1 0 0 1-1 1h-4v-6H7v6H3a1 1 0 0 1-1-1V7z" />
+      </svg>
+      <svg class="os-icon" viewBox="0 0 24 24" aria-label="stroked, the usual mistake"
+           style="fill:none;stroke:currentColor;stroke-width:1.8">
+        <path d="M3 10.5 12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1z" />
+      </svg>
+      <span class="caption" style="margin: 0 0 0 6px">← theirs &nbsp;·&nbsp; every popular set →</span>
+    </div>
+    <div class="strip" style="margin: 14px 0 0; align-items: center" id="iconRow"></div>
+    <div class="caption">the kit's set, drawn to their conventions; names are what the tool does</div>
+  </div>
+
+  <h2>How it behaves</h2>
+  <p class="note">
+    Colour and type decide whether a panel <em>looks</em> like the product. This decides whether it
+    <em>feels</em> like it. Orbiting on the right button is the one that surprises people, and it is
+    felt on the first drag.
+  </p>
+  <table id="mouse"></table>
+
+  <p class="note" style="margin-top: 18px">
+    <b>Box select</b>, captured mid-drag — a net exists only while a button is held, is drawn in
+    WebGL, and has no CSS token to read. Direction decides the rule, and the mode is marked by
+    <b>both</b> colour and dash, which survives a glance and survives colour blindness.
+  </p>
+  <div class="strip">
+    <div class="specimen" style="flex: 1; min-width: 260px">
+      <div class="net-demo" id="netWindow"></div>
+      <div class="caption">
+        left &rarr; right &mdash; takes what is <b>entirely inside</b> &mdash; solid
+      </div>
+    </div>
+    <div class="specimen" style="flex: 1; min-width: 260px">
+      <div class="net-demo" id="netCrossing"></div>
+      <div class="caption">
+        right &rarr; left &mdash; takes anything it <b>touches</b> &mdash; dashed
+      </div>
+    </div>
+  </div>
+
+  <p class="note">
+    <b>A click toggles an entity in the selection; a box select adds what it catches; a click on
+    empty space clears, and so does Space.</b> Running a command does not clear it: the selection
+    is what the tool acts on. Picking a different kind of entity starts a new set.
+  </p>
+
+  <h2>Geometry highlights amber</h2>
+  <p class="note">
+    This catches people out, because the chrome's accent is the blue <span class="mono">#3e94ff</span>,
+    so a viewport that highlights in blue looks self-consistent and still reads as the wrong
+    application. The blue is for interface state; the amber is for geometry.
+  </p>
+  <div class="swatches" id="highlight"></div>
+
+  <h2>Manipulators</h2>
+  <p class="note">
+    A white line in a dark casing, so it reads against a lit face, a dark face and the flat
+    background without changing colour. The casing is the whole trick. Hover and drag colours
+    <b>swap</b> between themes rather than lightening.
+  </p>
+  <div class="specimen">
+    <svg id="manipulator" viewBox="0 0 400 90" width="400" height="90"></svg>
+    <div class="caption">line, outline, and the same handle on a lit face and on the background</div>
+  </div>
+  <div class="swatches" id="manip"></div>
+
+  <h2>The view cube</h2>
+  <p class="note">
+    Read out of Onshape's own client code, not drawn from a picture of it — it is live in the frame
+    above. Each face is <b>two rounded plates</b>: a 97% plate in the back colour under a 75% plate
+    in the canvas colour, which is the light frame around a dark centre. Each corner is a disc.
+    <b>14 pick regions</b>: 6 faces, 8 corners, no edges. A face is an axis view; a corner is a
+    <i>trimetric</i>, 30&deg; off the nearer of front and back and 30&deg; up. The arrows turn
+    15&deg; (shift 90&deg;, ctrl 5&deg;). Right-drag is a turntable about world Z at three turns per
+    canvas diagonal, and the model follows the mouse.
+  </p>
+  <table id="cubeSpec"></table>
+
+  <h2>The viewport</h2>
+  <p class="note">
+    Flat <b class="mono">#333</b>, zero gradient, and <b>the light follows the camera</b>: the
+    product's own shader is a Phong headlight fixed in eye space, transcribed from its client bundle
+    into <span class="mono">PART_GLSL</span>. Ambient 0.5, diffuse 0.5&nbsp;N&middot;L, a #999
+    specular at exponent 30, screen-space ambient occlusion at 37.5%, no gamma. Edges are 1px
+    black. The sphere below is drawn with that shader.
+  </p>
+  <div class="strip">
+    <canvas class="sphere" id="sphere" width="280" height="280"></canvas>
+    <table id="viewport"></table>
+  </div>
+
+  <h2>Using it</h2>
+  <p class="note">
+    One stylesheet, one import. The shell gives you the hosts; the components fill them; the camera
+    and cube take the stage's corner. <span class="mono">docs/UI_KIT.md</span> has the rest.
+  </p>
+  <pre id="usage"></pre>
+
+  <script type="module">
+    const params = new URLSearchParams(location.search);
+    const theme = params.get('theme') === 'light' ? 'light' : 'dark';
+    document.body.dataset.osTheme = theme;
+
+    const ui = await import('./index.js');
+    const style = getComputedStyle(document.body);
+    const token = (name) => style.getPropertyValue(name).trim();
+    const icon = (...names) => names.find((n) => n in ui.ICONS) ?? Object.keys(ui.ICONS)[0];
+
+    // ---- the frame, live -------------------------------------------------
+    const shell = ui.createShell(document.getElementById('frameDemo'), {
+      theme, leftRail: true, rightRail: true, tabBar: true,
+    });
+    let pressedMode = 'faceMode';
+    const modeTool = (id) => ({
+      kind: 'toggle', id, icon: icon(id), title: { vertex: 'Select vertices', edge: 'Select edges', faceMode: 'Select faces' }[id],
+      pressed: pressedMode === id,
+      onClick: (event, bar) => { pressedMode = id; for (const m of ['vertex', 'edge', 'faceMode']) bar.setPressed(m, m === id); },
+    });
+    const tool = (id, title, shortcut) => ({ kind: 'tool', id, icon: icon(id), title, shortcut, onClick: () => shell.say(title) });
+    const toolbar = ui.createToolbar(shell.toolbar, [
+      { kind: 'tool', id: 'undo', icon: icon('undo'), title: 'Undo', shortcut: 'ctrl+z', onClick: () => shell.say('Undo') },
+      { kind: 'tool', id: 'redo', icon: icon('redo'), title: 'Redo', shortcut: 'ctrl+y', onClick: () => shell.say('Redo') },
+      { kind: 'separator' },
+      { kind: 'labelled', id: 'sketch', icon: icon('face', 'faceMode'), label: 'Sketch', title: 'Sketch (shift+s)', onClick: () => shell.say('Sketch') },
+      { kind: 'separator' },
+      tool('subdivide', 'Subdivide', 'shift+e'),
+      tool('deleteFace', 'Delete face'),
+      tool('eraseFill', 'Erase and fill'),
+      { kind: 'split', id: 'bridge', icon: icon('bridge', 'fillHole'), title: 'Bridge', onClick: () => shell.say('Bridge'),
+        menu: [
+          { id: 'bridge', label: 'Bridge', icon: ui.iconMarkup(icon('bridge', 'fillHole')), onSelect: () => shell.say('Bridge') },
+          { id: 'fillHole', label: 'Fill hole', icon: ui.iconMarkup(icon('fillHole')), onSelect: () => shell.say('Fill hole') },
+          { separator: true },
+          { id: 'weld', label: 'Weld vertices', disabled: true },
+        ] },
+      { kind: 'separator' },
+      modeTool('vertex'), modeTool('edge'), modeTool('faceMode'),
+      { kind: 'separator' },
+      tool('crease', 'Crease'), tool('uncrease', 'Uncrease'), tool('insertLoop', 'Insert edge loop'),
+      { kind: 'separator' },
+      tool('thicken', 'Thicken'), tool('straighten', 'Straighten'), tool('flatten', 'Flatten'),
+      { kind: 'spacer' },
+      { kind: 'search', label: 'Search tools…', keys: ['alt/⌥', 'c'], onClick: () => shell.say('Search tools') },
+    ]);
+    toolbar.setDisabled('redo', 'Nothing to redo');
+    toolbar.setDisabled('flatten', 'Flatten needs a face selected');
+
+    // the left rail
+    for (const [name, title] of [['faceMode', 'Features'], ['cage', 'Parts'], ['commit', 'Comments'], ['subdivide', 'Configurations']]) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'os-rail-button';
+      button.setAttribute('data-tooltip', title);
+      button.innerHTML = ui.iconMarkup(icon(name));
+      shell.leftRail.append(button);
+    }
+
+    // the right rail: bordered 33 x 34 buttons, a 10px gap between the groups
+    for (const [name, title] of [['surface', 'Appearance'], ['edges', 'Display'], ['cage', 'Section view'], [null, ''], ['commit', 'Measure'], ['vertex', 'Mass properties']]) {
+      if (!name) { const gap = document.createElement('div'); gap.className = 'os-rail-gap'; shell.rightRail.append(gap); continue; }
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'os-rail-button';
+      button.setAttribute('data-tooltip', title);
+      button.innerHTML = ui.iconMarkup(icon(name));
+      shell.rightRail.append(button);
+    }
+
+    // the panel
+    const panel = ui.createPanel(shell.panel, { filter: { placeholder: 'Filter by name or type' }, split: true });
+    const features = panel.addSection({
+      id: 'features', title: 'Features (5)',
+      buttons: [
+        { icon: icon('fillHole', 'box'), title: 'New folder', disabled: true },
+        { icon: icon('undo'), title: 'Pause rollback' },
+        { icon: icon('redo'), title: 'Rollback to end' },
+      ],
+      rollback: true,
+    });
+    let selected = 'Top';
+    const rows = () => [
+      { id: 'default', label: 'Default geometry', children: [
+        { id: 'Origin', label: 'Origin', icon: icon('vertex'), dim: true, selected: selected === 'Origin', onClick: (row) => { selected = row.id; features.setRows(rows()); } },
+        { id: 'Top', label: 'Top', icon: icon('face', 'faceMode'), dim: true, selected: selected === 'Top', onClick: (row) => { selected = row.id; features.setRows(rows()); } },
+        { id: 'Front', label: 'Front', icon: icon('face', 'faceMode'), dim: true, selected: selected === 'Front', onClick: (row) => { selected = row.id; features.setRows(rows()); } },
+        { id: 'Right', label: 'Right', icon: icon('face', 'faceMode'), dim: true, selected: selected === 'Right', onClick: (row) => { selected = row.id; features.setRows(rows()); } },
+      ] },
+      { id: 'form', label: 'oracle fit box-s2', initials: 'Fo', selected: selected === 'form', onClick: (row) => { selected = row.id; features.setRows(rows()); } },
+    ];
+    features.setRows(rows());
+    const parts = panel.addSection({ id: 'parts', title: 'Parts (1)' }, { pane: 'bottom' });
+    parts.setRows([{ id: 'part1', label: 'Part 1', icon: icon('box'), iconOpacity: 0.8, onClick: () => shell.say('Part 1') }]);
+
+    // the tab bar
+    const add = document.createElement('button');
+    add.type = 'button';
+    add.className = 'os-tab-add';
+    add.setAttribute('data-tooltip', 'Insert new tab');
+    add.innerHTML = '<svg class="os-icon" viewBox="0 0 20 20" aria-hidden="true"><path d="M9 3h2v6h6v2h-6v6H9v-6H3V9h6z" fill="currentColor"/></svg>';
+    const tabs = document.createElement('div');
+    tabs.className = 'os-tab-list';
+    for (const [label, active, name] of [['Part Studio 1', true, 'box'], ['Form Studio', false, 'face'], ['Assembly 1', false, 'cage']]) {
+      const tab = document.createElement('button');
+      tab.type = 'button';
+      tab.className = `os-tab${active ? ' os-tab--active' : ''}`;
+      tab.innerHTML = `${ui.iconMarkup(icon(name))}<span>${label}</span>`;
+      tabs.append(tab);
+    }
+    shell.tabBar.append(add, tabs);
+
+    // the stage: a flat canvas colour, the view cube and its dropdown, orbit on
+    // the right button, a context menu on the right click
+    const corner = ui.mountViewCube(shell.stage, { theme, onZoomFit: () => shell.say('Zoom to fit') });
+    shell.setStatus('face   0 selected');
+    shell.hint.textContent = 'right-drag orbits · right-click for the menu';
+    let drag = null;
+    shell.stage.addEventListener('pointerdown', (event) => {
+      if (event.button !== 2 || event.target !== shell.stage) return;
+      drag = { x: event.clientX, y: event.clientY, moved: 0 };
+      shell.stage.setPointerCapture(event.pointerId);
+    });
+    shell.stage.addEventListener('pointermove', (event) => {
+      if (!drag) return;
+      const rect = shell.stage.getBoundingClientRect();
+      corner.camera.drag(event.clientX - drag.x, event.clientY - drag.y, rect.width, rect.height);
+      drag.moved += Math.abs(event.clientX - drag.x) + Math.abs(event.clientY - drag.y);
+      drag.x = event.clientX;
+      drag.y = event.clientY;
+    });
+    shell.stage.addEventListener('pointerup', () => { drag = null; });
+    ui.bindContextMenu(shell.stage, (event) => (event.target === shell.stage && !(drag && drag.moved > 4) ? [
+      { label: 'Show all', onSelect: () => shell.say('Show all') },
+      { separator: true },
+      { label: 'Select', children: [
+        { label: 'Select all faces', onSelect: () => shell.say('Select all faces') },
+        { label: 'Select all edges', onSelect: () => shell.say('Select all edges') },
+        { label: 'Select all vertices', onSelect: () => shell.say('Select all vertices') },
+      ] },
+      { separator: true },
+      { label: 'Zoom to fit', onSelect: () => shell.say('Zoom to fit') },
+      { label: 'Isometric', onSelect: () => corner.camera.animateToView(ui.STANDARD_VIEWS.Isometric, ui.ANIMATION_MS.long) },
+    ] : []));
+    function tick(now) {
+      corner.camera.step(now);
+      corner.update();
+      requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+
+    const L = ui.LAYOUT;
+    document.getElementById('frame').innerHTML =
+      '<tr><th>region</th><th>measured</th></tr>' +
+      [
+        ['navbar', `${L.navbarHeight}px tall — the host's, outside an embedded tab`],
+        ['toolbar', `${L.toolbarHeight}px tall, no border below`],
+        ['left icon rail', `${L.leftRailWidth}px wide; ${L.leftRailButton.width} x ${L.leftRailButton.height} buttons`],
+        ['left panel', `${L.leftPanelWidth}px wide, then a ${L.splitterWidth}px #666 splitter`],
+        ['panel filter row', `${L.panelFilterHeight}px`],
+        ['section header', `${L.panelHeaderHeight}px, 13.3333px at weight 500`],
+        ['list row', `${L.listRowHeight}px, children indented ${L.listIndent}px`],
+        ['view cube', '150 x 150, inset 15 from the stage top right; dropdown 44 x 28 under it'],
+        ['right rail', `${L.rightRailButton.width} x ${L.rightRailButton.height} bordered buttons, mid-height`],
+        ['tab bar', `${L.tabBarHeight}px, fill ${L.tabBarFill[theme]}; tabs 28px, active in the primary background`],
+      ]
+        .map(([a, b]) => `<tr><td>${a}</td><td class="mono">${b}</td></tr>`)
+        .join('');
+
+    document.getElementById('toolbarSpec').innerHTML =
+      '<tr><th>part</th><th>measured</th></tr>' +
+      [
+        ['tool', `${L.toolbarTool.size} x ${L.toolbarTool.size}, margin ${L.toolbarTool.margin}, padding ${L.toolbarTool.inset}, radius ${L.toolbarTool.radius}; a ${L.toolbarTool.icon}px icon`],
+        ['hover', `${token('--os-tool-hover')}`],
+        ['pressed', `${token('--os-tool-hover')} and inset 0 1px 1px rgba(0,0,0,.247)`],
+        ['on (a toggle)', `${token('--os-accent')} — the accent, the one place the chrome spends colour`],
+        ['disabled', 'opacity 0.5, cursor not-allowed; the tooltip says why'],
+        ['split tool', `a 50 x 32 group: the tool, then an ${L.toolbarCaret.width}px caret with a ${L.toolbarCaret.chevron}px chevron`],
+        ['labelled', 'icon then 14px text; exactly one per bar (theirs is Sketch)'],
+        ['separator', `${L.toolbarSeparator.width} x ${L.toolbarSeparator.height}, margin ${L.toolbarSeparator.margin}px 0, ${token('--os-separator')}`],
+        ['search', `160 x 32 at the right, ${token('--os-background-raised')}, radius 3; key chips 11px with a 2px bottom border`],
+        ['tooltip', `${token('--os-tooltip-fill')}, 500 12px/18px, padding 4, shadow 0 1px 2px .6; centred below, after a pause`],
+      ]
+        .map(([a, b]) => `<tr><td>${a}</td><td class="mono">${b}</td></tr>`)
+        .join('');
+
+    // ---- menus and the tooltip, as static specimens ------------------------
+    const specimens = document.getElementById('menuSpecimens');
+    const inlineMenu = (items, compact, minWidth) => {
+      const holder = document.createElement('div');
+      holder.style.position = 'relative';
+      const { element } = ui.openMenu(items, { at: { x: 0, y: 0 }, compact, minWidth: minWidth ?? (compact ? 121 : 224) });
+      element.classList.add('os-menu--inline');
+      element.style.left = '';
+      element.style.top = '';
+      holder.append(element);
+      ui.closeMenu();
+      holder.append(element);
+      return holder;
+    };
+    const gear = '<svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M8.6 1h2.8l.5 2.3 1.5.7 2-1.3 2 2-1.3 2 .7 1.5 2.3.5v2.8l-2.3.5-.7 1.5 1.3 2-2 2-2-1.3-1.5.7-.5 2.3H8.6l-.5-2.3-1.5-.7-2 1.3-2-2 1.3-2-.7-1.5L1 11.4V8.6l2.3-.5.7-1.5-1.3-2 2-2 2 1.3 1.5-.7zM10 7a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"/></svg>';
+    specimens.append(
+      inlineMenu([
+        { label: 'Isometric' }, { label: 'Dimetric' }, { label: 'Trimetric' }, { separator: true },
+        { label: 'Graphics preferences…', icon: gear }, { separator: true },
+        { label: 'Named views…' }, { label: 'Previous view', disabled: true }, { separator: true },
+        { label: 'Zoom to fit' }, { label: 'Zoom to window' }, { separator: true },
+        { label: 'Perspective view' }, { label: 'Orient normal to sketch on edit' }, { separator: true },
+        { label: 'Shaded with edges', checked: true, submenu: true },
+        { label: 'Hidden edges removed', checked: true, submenu: true },
+        { label: 'Tangent edges visible', checked: true, submenu: true }, { separator: true },
+        { label: 'View in high quality' }, { separator: true },
+        { label: 'Highlight boundary edges' }, { separator: true },
+        { label: 'Section view…', icon: ui.iconMarkup(icon('flatten', 'face')).replace('class="os-icon"', 'width="16" height="16"') },
+      ], false),
+      inlineMenu([
+        { label: 'Show all' }, { separator: true }, { label: 'Select', submenu: true }, { separator: true },
+        { label: 'Zoom to fit' }, { label: 'Isometric' },
+      ], true),
+      inlineMenu([
+        { label: 'Edit oracle fit box-s2…' }, { label: 'Show dependencies of oracle fit box-s2…' }, { separator: true },
+        { label: 'Hide Part 1', icon: ui.iconMarkup(icon('surface', 'face')).replace('class="os-icon"', 'width="17" height="17"') },
+        { label: 'Isolate…' }, { label: 'Make transparent…' }, { separator: true },
+        { label: 'Copy Part 1', icon: ui.iconMarkup(icon('box')).replace('class="os-icon"', 'width="17" height="17"') }, { separator: true },
+        { label: 'Select', submenu: true }, { label: 'Select other…' }, { separator: true },
+        { label: 'Zoom to fit' }, { separator: true },
+        { label: 'Delete Part 1…', icon: ui.iconMarkup(icon('deleteFace')).replace('class="os-icon"', 'width="17" height="17"') },
+      ], true, 250),
+    );
+    const tip = document.createElement('div');
+    tip.className = 'os-tooltip os-tooltip--inline';
+    tip.textContent = 'Revolve (shift+w)';
+    specimens.append(tip);
+    document.getElementById('menuSpec').innerHTML =
+      '<tr><th>part</th><th>measured</th></tr>' +
+      [
+        ['menu', `${token('--os-menu-fill')}, text ${token('--os-menu-text')} at 12px/18px, 1px ${token('--os-menu-border')} border, radius 4, shadow 0 5px 10px .4`],
+        ['entry', `${L.menuRowHeight}px; a 27px icon column for a check or a 16px glyph; hover ${token('--os-row-fill-hover')}; disabled ${token('--os-text-disabled')}`],
+        ['separator', `1px ${token('--os-menu-rule')}`],
+        ['placement', 'top edge on the button’s bottom, right edges aligned; a context menu at the pointer'],
+        ['context menu', 'on empty canvas 121px, entries padded 2px 8px 2px 16px, no icon column; on an entity 250px with a 17px glyph at 10px and the label at 35px; border #ccc'],
+        ['submenu', 'an arrow at the right; the child opens beside the entry on hover'],
+      ]
+        .map(([a, b]) => `<tr><td>${a}</td><td class="mono">${b}</td></tr>`)
+        .join('');
+
+    document.getElementById('panelSpec').innerHTML =
+      '<tr><th>part</th><th>measured</th></tr>' +
+      [
+        ['fill', '#333 — the same as the canvas; the 40px rail beside it is #2c2c2c'],
+        ['filter row', '37px: padding-top 7, a 30 x 30 funnel in #90cef1 (margin 0 3px), a 30px field with a 1px #888 border, radius 3'],
+        ['split', 'two panes, Features over Parts, a 1px #666 splitter between; the lower heading is a group row'],
+        ['rollback bar', '6px, #b8b8b8, inset 7px, after the feature list'],
+        ['handle', 'a 33 x 34 button on the panel edge at mid-height, 1px #aaa top/right/bottom, that collapses the panel'],
+        ['section header', '30px; title 500 13.3333px/30px, padding-left 4; 30 x 30 icon buttons, padding 0 5px'],
+        ['row', '26px, padding-right 10; icon box 20 x 20 margin-left 3 with a 17px glyph; name 13.3333px/20px, margin 0 0 1px 3px'],
+        ['children', 'indented 19px under a 1px guide'],
+        ['dimmed', 'icon and name at opacity 0.5'],
+        ['hover / selected', `${token('--os-row-fill-hover')} / ${token('--os-row-fill-selected')}`],
+        ['initials chip', '17 x 15, 1px #999 border, radius 2, 10px/15px'],
+      ]
+        .map(([a, b]) => `<tr><td>${a}</td><td class="mono">${b}</td></tr>`)
+        .join('');
+
+    // ---- the twelve -------------------------------------------------------
+    const EIGHT = [
+      ['Viewport background', 'flat #333, zero gradient', 'a vertical gradient, because SolidWorks has one'],
+      ['Edge lines', 'pure black, ~2% of the body', 'shade without them — reads as a mesh viewer'],
+      ['Icon weight', 'filled, 20 grid, drawn 20×20', 'stroked 1.5–2px on a 24 grid'],
+      ['Font fallback', 'Flama; else system-ui at −0.90%', "copy Onshape's chain → Open Sans, +4.39%"],
+      ['Elevation', 'none on any control; a shadow only under a menu or a tooltip', 'a shadow scale'],
+      ['Part hue', '202.5°, only ~25% saturated', 'neutral grey, or a far bluer blue'],
+      ['Pressed state', 'the accent', 'a darker grey'],
+      ['Theme switch', 'attribute on &lt;body&gt;, from ?theme=', 'prefers-color-scheme'],
+      ['Toolbar labels', 'icons with tooltips, ONE labelled action', 'a row of text buttons'],
+      ['Orbit', 'the right button, a turntable about Z, the model follows the mouse', 'the left button, or a trackball'],
+      ['Selection colour', 'amber for geometry; blue is interface', 'highlight in the brand accent'],
+      ['Selection lifetime', 'persistent; Space clears', 'clear on a click into empty space'],
+    ];
+    document.getElementById('eight').innerHTML =
+      '<tr><th>#</th><th>the thing</th><th>Onshape</th><th>what people do instead</th></tr>' +
+      EIGHT.map(
+        ([what, right, wrong], index) =>
+          `<tr><td>${index + 1}</td><td><b>${what}</b></td><td>${right}</td>` +
+          `<td class="wrong">${wrong}</td></tr>`,
+      ).join('');
+
+    // ---- swatches ---------------------------------------------------------
+    const ROLES = [
+      ['--os-background-primary', 'panels, canvas'],
+      ['--os-background-secondary', 'the left panel'],
+      ['--os-background-sunken', 'deepest'],
+      ['--os-background-raised', 'buttons, search'],
+      ['--os-text-primary', 'primary text'],
+      ['--os-text-secondary', 'secondary text'],
+      ['--os-border', 'borders'],
+      ['--os-field-border', 'field borders'],
+      ['--os-accent', 'accent'],
+      ['--os-accent-hover', 'accent hover'],
+      ['--os-tool-hover', 'tool hover'],
+      ['--os-row-fill-hover', 'row and menu hover'],
+      ['--os-row-fill-selected', 'row selected'],
+      ['--os-tooltip-fill', 'tooltip'],
+      ['--os-success', 'success'],
+      ['--os-highlight-outline', 'highlight'],
+      ['--os-axis-x', 'axis X'],
+      ['--os-axis-y', 'axis Y'],
+      ['--os-axis-z', 'axis Z'],
+      ['--os-box-select', 'box select'],
+    ];
+    document.getElementById('swatches').innerHTML = ROLES.map(([name, role]) => {
+      const value = token(name);
+      return (
+        `<div class="swatch"><div class="chip" style="background:${value}"></div>` +
+        `<dl><dt>${role}</dt><dd>${name}</dd><dd>${value}</dd></dl></div>`
+      );
+    }).join('');
+
+    // ---- type -------------------------------------------------------------
+    const SIZES = [
+      ['14px', '21px', '400', 'the workhorse: buttons, tool labels, most chrome'],
+      ['13.3333px', '20px', '400', 'list rows, inputs, the left panel'],
+      ['12px', '18px', '400', 'menus; tooltips at 500'],
+      ['11px', '16.5px', '400', 'shortcut keys'],
+      ['22px', '33px', '600', 'the document name, and nothing else'],
+      ['10px', '15px', '400', 'tool initials'],
+    ];
+    document.getElementById('type').innerHTML = SIZES.map(
+      ([size, leading, weight, use]) =>
+        `<div class="specimen"><div style="font-size:${size};line-height:${leading};` +
+        `font-weight:${weight}">Extrude Revolve Sweep Loft — Handgloves 0123</div>` +
+        `<div class="mono" style="font-size:11px;color:var(--os-text-secondary);margin-top:5px">` +
+        `${size} / ${leading} / ${weight} &nbsp; ${use}</div></div>`,
+    ).join('');
+
+    // ---- controls ---------------------------------------------------------
+    const CONTROLS = [
+      ['button (secondary)', '32px', '3px', '5px 10px', '14px/400', 'none'],
+      ['button (primary)', '33.5px', '5.25px', '5.25px 10.5px', '14px/400', '1px accent'],
+      ['text input', '30px', '3px', '4px 22px 4px 5px', '13.33px', '1px #888'],
+      ['toolbar tool', '32px', '3px', '6px', '—', 'none'],
+      ['toolbar', '36px', '0', '0 4px 0 0', '—', 'none'],
+      ['menu', '—', '4px', '0', '12px/400', '1px #d7d7d7'],
+      ['tooltip', '26px', '0', '4px', '12px/500', 'none'],
+      ['list row', '26px', '0', '0 10px 0 0', '13.33px', 'none'],
+      ['tab', '28px', '0', '3px 10px 0', '14px/400', 'none'],
+    ];
+    document.getElementById('controls').innerHTML =
+      '<tr><th>control</th><th>height</th><th>radius</th><th>padding</th><th>font</th>' +
+      '<th>border</th></tr>' +
+      CONTROLS.map(
+        (row) => `<tr>${row.map((cell, index) =>
+          `<td${index ? ' class="mono"' : ''}>${cell}</td>`).join('')}</tr>`,
+      ).join('');
+
+    // ---- icons ------------------------------------------------------------
+    document.getElementById('iconRow').innerHTML = Object.keys(ui.ICONS)
+      .map((name) => `<span title="${name}" style="display:inline-flex">${ui.iconMarkup(name)}</span>`)
+      .join('');
+
+    // ---- the mouse --------------------------------------------------------
+    document.getElementById('mouse').innerHTML =
+      '<tr><th>gesture</th><th>what it does</th></tr>' +
+      [
+        ['<b>right</b> drag', 'orbit — about world Z, the model follows the mouse, 3 turns per canvas diagonal'],
+        ['<b>left</b> click', 'select what is under the cursor'],
+        ['<b>left</b> drag', 'box select'],
+        ['shift + click', 'add to the selection'],
+        ['wheel', 'zoom'],
+        ['<b>right</b> click', 'the context menu'],
+        ['<b>Space</b>, or a click on empty space', 'clear the selection'],
+      ]
+        .map(([a, b]) => `<tr><td>${a}</td><td>${b}</td></tr>`)
+        .join('');
+    void ui.MOUSE;
+
+    for (const [id, mode] of [['netWindow', ui.BOX_SELECT.window], ['netCrossing', ui.BOX_SELECT.crossing]]) {
+      const colour = mode.colour[theme];
+      document.getElementById(id).innerHTML =
+        `<span style="background:${ui.rgba(colour, mode.fillAlpha)};` +
+        `border:1px ${mode.dashed ? 'dashed' : 'solid'} ${ui.rgba(colour, mode.borderAlpha)}"></span>`;
+    }
+
+    // ---- highlight and manipulators ---------------------------------------
+    const amber = ui.HIGHLIGHT[theme];
+    document.getElementById('highlight').innerHTML = [
+      ['selected outline', amber.outline],
+      ['selected fill', amber.fill],
+      ['pre-highlight', amber.preHighlight],
+      ['interface accent — NOT for geometry', token('--os-accent')],
+    ]
+      .map(
+        ([role, value]) =>
+          `<div class="swatch"><div class="chip" style="background:${value}"></div>` +
+          `<dl><dt>${role}</dt><dd>${value}</dd></dl></div>`,
+      )
+      .join('');
+
+    const manip = ui.MANIPULATOR[theme];
+    document.getElementById('manip').innerHTML = [
+      ['line', manip.line],
+      ['outline (the casing)', manip.outline],
+      ['line, hover', manip.lineHover],
+      ['outline, hover', manip.outlineHover],
+      ['line, drag', manip.lineDrag],
+      ['outline, drag', manip.outlineDrag],
+      ['displacement readout', manip.displacement],
+    ]
+      .map(
+        ([role, value]) =>
+          `<div class="swatch"><div class="chip" style="background:${value}"></div>` +
+          `<dl><dt>${role}</dt><dd>${value}</dd></dl></div>`,
+      )
+      .join('');
+    document.getElementById('manipulator').innerHTML =
+      `<rect x="0" y="0" width="200" height="90" fill="#7294a9" />` +
+      [30, 230].map((x) =>
+        `<g>
+           <line x1="${x}" y1="60" x2="${x + 120}" y2="60" stroke="${manip.outline}" stroke-width="5" />
+           <line x1="${x}" y1="60" x2="${x + 120}" y2="60" stroke="${manip.line}" stroke-width="2" />
+           <rect x="${x + 112}" y="52" width="16" height="16" fill="${manip.outline}" />
+           <rect x="${x + 114}" y="54" width="12" height="12" fill="${manip.line}" />
+           <text x="${x}" y="38" fill="${manip.displacement}" font-size="11"
+                 font-family="ui-monospace, monospace">12.40 mm</text>
+         </g>`,
+      ).join('');
+
+    // ---- the view cube ----------------------------------------------------
+    const counts = ui.REGIONS.reduce((acc, r) => ({ ...acc, [r.kind]: (acc[r.kind] ?? 0) + 1 }), {});
+    document.getElementById('cubeSpec').innerHTML =
+      '<tr><th>what</th><th>read from their code</th></tr>' +
+      [
+        ['regions', `${ui.REGIONS.length} — ${counts.face} faces, ${counts.corner} corners; edges pick nothing`],
+        ['box', '150 x 150, inset 15 from the stage top right; the cube is 59 across'],
+        ['face', 'a 97% plate in the back colour under a 75% plate in the front colour, corner radius 20%'],
+        ['front / back', `${ui.COLOURS[theme].front} / ${ui.COLOURS[theme].back}`],
+        ['corner', 'a disc 0.24 of a half-face across, 0.8 out on the diagonal, drawn over the plates'],
+        ['hover', `${ui.COLOURS[theme].highlight}; label to ${ui.COLOURS[theme].textHover}`],
+        ['labels', '12px, the UI font, centred and sheared onto the face'],
+        ['arrows', 'outward triangles 0.13 x 0.10 of the box; arcs 45–72° and 108–135°, 0.04 wide'],
+        ['click', 'face: axis view, 500ms; corner: trimetric; arrow: 15° (shift 90°, ctrl 5°), 250ms'],
+        ['drag', '3 turns per canvas diagonal, about world Z then camera right; no clamp, no inertia'],
+        ['dropdown', '44 x 28 under the box, right-aligned; the four-tone cube icon and a caret'],
+      ]
+        .map(([a, b]) => `<tr><td>${a}</td><td class="mono">${b}</td></tr>`)
+        .join('');
+
+    // ---- the viewport -----------------------------------------------------
+    const { PART_GLSL, BACKGROUND, PART_COLOR, LIGHTING, EDGES, HIGHLIGHT_STYLE } = ui;
+    document.getElementById('viewport').innerHTML =
+      '<tr><th>what</th><th>read from their shader</th></tr>' +
+      [
+        ['background', `${BACKGROUND[theme].hex} — flat, spread 0`],
+        ['part colour', `${PART_COLOR.hex} — the part's appearance from the API`],
+        ['light', 'a Phong headlight in EYE space: L = normalize(1, 1, 1); it turns with the camera'],
+        ['ambient / diffuse', `${LIGHTING.ambientFactor} · colour, ${LIGHTING.lightDiffuse} · colour · N.L`],
+        ['specular', `#999 · pow(N.H, ${LIGHTING.shininess}); the dialog says ${LIGHTING.shininessPercent} %`],
+        ['occlusion', `SSAO at ${LIGHTING.occlusion.percent} %, half resolution, pow(1 − ao, factor)`],
+        ['projection', `orthographic by default — "Perspective view" is unchecked in their menu; on, ${LIGHTING.fieldOfViewDegrees}° vertical`],
+        ['gamma', 'none'],
+        ['edges', `${EDGES.hex}, 1px`],
+        ['pre-highlight', `rgb(${HIGHLIGHT_STYLE.preHighlight.rgb}) — a 2px face border, a 5px edge band (1px rim, 0.78 inside), a 12px point`],
+        ['selected', `rgb(${HIGHLIGHT_STYLE.selected.rgb}) — face: mix(lit, orange · (0.73 + 0.26 N.L), 0.88) with a 2px border; edge: the same band`],
+        ['pick', `vertex over edge over face within ${HIGHLIGHT_STYLE.pickRadiusPx}px`],
+      ]
+        .map(([a, b]) => `<tr><td>${a}</td><td class="mono">${b}</td></tr>`)
+        .join('');
+
+    const canvas = document.getElementById('sphere');
+    const gl = canvas.getContext('webgl2');
+    if (gl) {
+      const compile = (type, source) => {
+        const shader = gl.createShader(type);
+        gl.shaderSource(shader, source);
+        gl.compileShader(shader);
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(shader));
+        return shader;
+      };
+      const program = gl.createProgram();
+      gl.attachShader(program, compile(gl.VERTEX_SHADER,
+        `#version 300 es
+         in vec2 xy; out vec2 vXy;
+         void main() { vXy = xy; gl_Position = vec4(xy, 0.0, 1.0); }`));
+      gl.attachShader(program, compile(gl.FRAGMENT_SHADER,
+        `#version 300 es
+         precision highp float;
+         in vec2 vXy; out vec4 color;
+         ${PART_GLSL}
+         uniform vec3 uAlbedo;
+         void main() {
+           float r2 = dot(vXy, vXy);
+           if (r2 > 0.81) { color = vec4(${theme === 'dark' ? '0.2, 0.2, 0.2' : '1.0, 1.0, 1.0'}, 1.0); return; }
+           // A ray-traced sphere in EYE space, 3 units in front of the camera.
+           vec3 n = normalize(vec3(vXy.x, vXy.y, sqrt(max(0.81 - r2, 0.0))));
+           vec3 positionEye = n * 0.9 + vec3(0.0, 0.0, -3.0);
+           vec3 lit = onshapeLight(uAlbedo, positionEye, n, 0.0);
+           color = vec4(lit, 1.0);
+         }`));
+      gl.linkProgram(program);
+      gl.useProgram(program);
+      ui.setLightingUniforms(gl, program, { viewportSize: [canvas.width, canvas.height], albedo: PART_COLOR.unit });
+      const buffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+      const slot = gl.getAttribLocation(program, 'xy');
+      gl.enableVertexAttribArray(slot);
+      gl.vertexAttribPointer(slot, 2, gl.FLOAT, false, 0, 0);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    }
+
+    // ---- using it ---------------------------------------------------------
+    document.getElementById('usage').textContent = `<link rel="stylesheet" href="src/ui/onshape.css">
+<div id="app"></div>
+<script type="module">
+  import * as ui from './src/ui/index.js';
+
+  const shell = ui.createShell(document.getElementById('app'), { theme: 'dark' });
+  const bar = ui.createToolbar(shell.toolbar, [
+    { kind: 'tool', id: 'subdivide', icon: 'subdivide', title: 'Subdivide', onClick: () => run('subdivide') },
+    { kind: 'separator' },
+    { kind: 'labelled', id: 'commit', icon: 'commit', label: 'Commit', onClick: commit },
+  ]);
+  const panel = ui.createPanel(shell.panel, { filter: null });
+  const section = panel.addSection({ title: 'Form' });
+  section.setRows([{ icon: 'faceMode', label: 'Faces', value: 24 }]);
+
+  const canvas = document.createElement('canvas');   // your WebGL goes here
+  shell.stage.prepend(canvas);
+  const corner = ui.mountViewCube(shell.stage, { theme: 'dark', onZoomFit: fit });
+  function frame(now) {
+    corner.camera.step(now);
+    const view = corner.camera.viewMatrix();           // draw with this
+    corner.update();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+<\/script>`;
+  </script>
+</body>

@@ -28,7 +28,8 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import { buildFacets, buildAdjacency } from '../js/meshCore.js';
-import { buildFeatures, kRing, N_FEATURES } from '../js/seedNet.js';
+import { buildFeatures, kRing, N_FEATURES, N_FEATURES_V6 } from '../js/seedNet.js';
+import { EXT_FEATURE_NAMES } from '../js/seedFeatures.js';
 import { attachCurvature } from '../js/curvature.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -131,6 +132,88 @@ for (const name of ['ball-seat.stl', 'cone-sweep.stl', 'countersunk-plate.stl'])
   const seeds = [];
   for (let s = 0; s < facets.count && seeds.length < 7; s += step) seeds.push(s);
   allOk = compare(name.replace('.stl', ''), positions, seeds, 512, 1e4) && allOk;
+}
+
+// ── v6: the extended columns (js/seedFeatures.js vs ml/seedfeatures.py), with and without
+// facets excluded as if already painted into other groups.
+
+const PY_DRIVER_V6 = `
+import sys, json
+import numpy as np
+sys.path.insert(0, r"${ML.replace(/\\/g, '\\\\')}")
+from meshcore import build_facets, build_adjacency, facet_curvature
+from patches import extract_patch
+from seedfeatures import adjacency_csr_angles
+
+cfg = json.load(open(sys.argv[1]))
+pos = np.array(cfg["positions"], dtype=np.float64).reshape(-1, 9)
+facets = build_facets(pos)
+pairs, ang = build_adjacency(pos, facets, cfg["quant"])
+indptr, indices, eang = adjacency_csr_angles(pairs, ang, facets["count"])
+curv = facet_curvature(pos, facets)
+fid = np.zeros(facets["count"], np.int32)
+fty = np.zeros(facets["count"], np.uint8)
+exc = np.array(cfg["excluded"], dtype=bool) if cfg["excluded"] is not None else None
+out = []
+for seed in cfg["seeds"]:
+    p = extract_patch(facets, indptr, indices, fid, fty, int(seed), cfg["max_facets"], rng=None,
+                      spin=False, curv=curv, extended=True, eangles=eang, excluded=exc)
+    out.append({"ids": p["ids"].tolist(), "features": p["features"].ravel().tolist()}
+               if p is not None else None)
+json.dump(out, open(sys.argv[2], "w"))
+`;
+
+function compareV6(label, positions, seeds, maxFacets, quant, excludeEvery) {
+  const facets = buildFacets(positions);
+  const adjacency = buildAdjacency(positions, facets, quant);
+  attachCurvature(positions, facets);
+  let excluded = null;
+  if (excludeEvery) {
+    excluded = new Uint8Array(facets.count);
+    for (let t = 0; t < facets.count; t++) if (t % excludeEvery === 3 && !seeds.includes(t)) excluded[t] = 1;
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'netparity6-'));
+  writeFileSync(join(dir, 'cfg.json'), JSON.stringify({
+    positions: Array.from(positions), seeds, max_facets: maxFacets, quant,
+    excluded: excluded ? Array.from(excluded) : null,
+  }));
+  writeFileSync(join(dir, 'drv.py'), PY_DRIVER_V6);
+  execFileSync(PY, [join(dir, 'drv.py'), join(dir, 'cfg.json'), join(dir, 'out.json')], { stdio: ['ignore', 'inherit', 'inherit'] });
+  const py = JSON.parse(readFileSync(join(dir, 'out.json'), 'utf8'));
+
+  const W = N_FEATURES_V6;
+  const worst = new Float64Array(W);
+  let idMismatch = 0, sizeMismatch = 0, checked = 0;
+  for (let s = 0; s < seeds.length; s++) {
+    const ref = py[s];
+    if (!ref) continue;
+    const got = buildFeatures(seeds[s], facets, adjacency, maxFacets, null, excluded, true);
+    checked++;
+    if (ref.ids.length !== got.n) { sizeMismatch++; continue; }
+    for (let i = 0; i < got.n; i++) if (ref.ids[i] !== got.ids[i]) { idMismatch++; break; }
+    for (let i = 0; i < got.n * W; i++) {
+      const d = Math.abs(ref.features[i] - got.features[i]);
+      if (d > worst[i % W]) worst[i % W] = d;
+    }
+  }
+  const baseWorst = Math.max(...worst.slice(0, N_FEATURES));
+  const extWorst = Math.max(...worst.slice(N_FEATURES));
+  const extCol = worst.indexOf(extWorst);
+  const ok = !sizeMismatch && !idMismatch && baseWorst < 2e-5 && extWorst < 1e-4;
+  console.log(`  ${label.padEnd(34)} seeds ${String(checked).padStart(3)}   size/id mismatches ${sizeMismatch}/${idMismatch}` +
+    `   base ${baseWorst.toExponential(2)}   extended ${extWorst.toExponential(2)} (${EXT_FEATURE_NAMES[extCol - N_FEATURES] ?? '-'})   ${ok ? 'ok' : 'MISMATCH'}`);
+  return ok;
+}
+
+console.log('\nv6 extended-feature parity: js/seedFeatures.js vs ml/seedfeatures.py\n');
+for (const name of ['tangent-fillet.stl', 'ball-seat.stl', 'cone-sweep.stl', 'countersunk-plate.stl']) {
+  const positions = readSTL(join(FIX, name));
+  const facets = buildFacets(positions);
+  const step = Math.max(1, Math.floor(facets.count / 6));
+  const seeds = [];
+  for (let s = 0; s < facets.count && seeds.length < 6; s += step) seeds.push(s);
+  allOk = compareV6(name.replace('.stl', ''), positions, seeds, 512, 1e4, 0) && allOk;
+  allOk = compareV6(`${name.replace('.stl', '')} (painted)`, positions, seeds, 512, 1e4, 7) && allOk;
 }
 
 console.log(allOk ? '\nPASS — features agree\n' : '\nFAIL — features diverge\n');
