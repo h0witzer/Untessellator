@@ -44,7 +44,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from model import build_from_args, count_parameters  # noqa: E402
 from occ_tessellate import TYPE_NAMES  # noqa: E402
 from patches import (BakedPatches, FEATURE_NAMES, FEATURE_NAMES_V6, N_TYPES, collate,  # noqa: E402
-                     collate_facet_surface, collate_graph, collate_surface, collate_weights)
+                     collate_facet_surface, collate_graph, collate_pairs, collate_surface,
+                     collate_weights)
 
 
 class PatchStream(IterableDataset):
@@ -52,8 +53,10 @@ class PatchStream(IterableDataset):
                  densities: tuple[str, ...], type_weights=None, seed: int = 0,
                  relabel_root: Path | None = None, surface_root: Path | None = None,
                  extended: bool = False, exclude_prob: float = 0.0, gnn: bool = False,
-                 hard_rings: int = 0, boundary_seed_prob: float = 0.0, facet_surface: bool = False):
+                 hard_rings: int = 0, boundary_seed_prob: float = 0.0, facet_surface: bool = False,
+                 pair_roots=None, pair_prob: float = 0.0, native_root=None):
         self.facet_surface = facet_surface
+        self.pair_roots, self.pair_prob, self.native_root = pair_roots, pair_prob, native_root
         self.gnn = gnn
         self.hard_rings = hard_rings
         self.boundary_seed_prob = boundary_seed_prob
@@ -80,7 +83,10 @@ class PatchStream(IterableDataset):
                           exclude_prob=self.exclude_prob, gnn=self.gnn,
                           hard_rings=getattr(self, "hard_rings", 0),
                           boundary_seed_prob=getattr(self, "boundary_seed_prob", 0.0),
-                          facet_surface=getattr(self, "facet_surface", False))
+                          facet_surface=getattr(self, "facet_surface", False),
+                          pair_roots=getattr(self, "pair_roots", None),
+                          pair_prob=getattr(self, "pair_prob", 0.0),
+                          native_root=getattr(self, "native_root", None))
         for s in ds:
             yield s
 
@@ -95,8 +101,10 @@ class Collate:
     """
 
     def __init__(self, max_facets: int, zero_cols: tuple[int, ...] = (), surface: bool = False,
-                 gnn: bool = False, hard_weight: float = 1.0, facet_surface: bool = False):
+                 gnn: bool = False, hard_weight: float = 1.0, facet_surface: bool = False,
+                 pairs: bool = False):
         self.facet_surface = facet_surface
+        self.pairs = pairs
         self.max_facets = max_facets
         self.zero_cols = list(zero_cols)
         self.surface = surface
@@ -115,6 +123,8 @@ class Collate:
         # - the graph stays last; batch_index() names the positions.
         if getattr(self, "facet_surface", False):
             out += tuple(torch.from_numpy(a) for a in collate_facet_surface(batch, self.max_facets))
+        if getattr(self, "pairs", False):
+            out += tuple(torch.from_numpy(a) for a in collate_pairs(batch, self.max_facets, self.zero_cols))
         if getattr(self, "hard_weight", 1.0) != 1.0:
             out += (torch.from_numpy(collate_weights(batch, self.max_facets, self.hard_weight)),)
         if self.gnn:
@@ -132,9 +142,37 @@ def batch_index(args) -> dict:
     if getattr(args, "facet_surface", False):
         at["fsurf"], at["fsurf_mask"], at["ftype"] = i, i + 1, i + 2
         i += 3
+    if getattr(args, "pair_bakes", None):
+        at["pairs"] = i                      # 7 tensors: index, x, mask, nbr, eattr, main labels, partner labels
+        i += 7
     if args.hard_weight != 1.0:
         at["weight"] = i
     return at
+
+
+def contrastive_loss(net, batch, at, local, extra_graph, tau: float):
+    """Multi-positive InfoNCE between each paired main patch and its partner from another mesher:
+    a facet's positives are the partner's facets on the same face. Both directions; facets with no
+    positive are skipped. Returns 0 when the batch carries no pairs."""
+    j = at["pairs"]
+    idx, xp, mp, nbp, eap, fa, fb = batch[j:j + 7]
+    if idx.numel() == 0:
+        return local.new_zeros(())
+    lp = net.embed(xp, mp, nbp, eap) if extra_graph else net.embed(xp, mp)
+    za = F.normalize(net.cproj(local[idx]).float(), dim=-1)
+    zb = F.normalize(net.cproj(lp).float(), dim=-1)
+    s = torch.einsum("pad,pbd->pab", za, zb) / tau
+    va, vb = fa >= 0, fb >= 0
+    pos = (fa.unsqueeze(2) == fb.unsqueeze(1)) & va.unsqueeze(2) & vb.unsqueeze(1)
+
+    def side(sim, pos, valid_q, valid_k):
+        sim = sim.masked_fill(~valid_k.unsqueeze(1), -1e4)
+        lse_all = torch.logsumexp(sim, dim=-1)
+        lse_pos = torch.logsumexp(sim.masked_fill(~pos, -1e4), dim=-1)
+        use = valid_q & pos.any(-1)
+        return ((lse_all - lse_pos) * use).sum() / use.sum().clamp(min=1)
+
+    return 0.5 * (side(s, pos, va, vb) + side(s.transpose(1, 2), pos.transpose(1, 2), vb, va))
 
 
 def facet_surface_loss(pred, tgt, msk, ftype, m, cls_w):
@@ -173,11 +211,14 @@ def make_loader(files, args, type_weights, shuffle_seed, exclude_prob=0.0, train
                          args.relabel, args.surface_root, args.features == "v6", exclude_prob,
                          args.gnn_layers > 0, args.hard_rings if hard else 0,
                          args.boundary_seeds if training else 0.0,
-                         facet_surface=args.facet_surface and training)
+                         facet_surface=args.facet_surface and training,
+                         pair_roots=args.pair_bakes if training else None,
+                         pair_prob=args.pair_prob if training else 0.0, native_root=args.bake)
     return DataLoader(stream, batch_size=args.batch,
                       collate_fn=Collate(args.max_facets, args.zero_cols, args.surface_root is not None,
                                          args.gnn_layers > 0, args.hard_weight,
-                                         facet_surface=args.facet_surface and training),
+                                         facet_surface=args.facet_surface and training,
+                                         pairs=bool(args.pair_bakes) and training),
                       num_workers=args.workers, persistent_workers=args.workers > 0,
                       prefetch_factor=4 if args.workers > 0 else None)
 
@@ -334,6 +375,13 @@ def main(argv=None) -> int:
                     help="training-only head: every facet regresses its own face's surface and type "
                          "(needs --surface-root); never exported")
     ap.add_argument("--facet-loss-weight", type=float, default=0.5)
+    ap.add_argument("--pair-bakes", type=Path, nargs="*", default=[],
+                    help="re-meshed bakes to pair native patches with (experiment 4): a training-only "
+                         "contrastive space where the same face from two meshers lands together")
+    ap.add_argument("--pair-prob", type=float, default=0.5)
+    ap.add_argument("--contrastive-dim", type=int, default=64)
+    ap.add_argument("--contrastive-weight", type=float, default=0.1)
+    ap.add_argument("--contrastive-tau", type=float, default=0.1)
     ap.add_argument("--ema", type=float, default=0.0,
                     help="also keep an exponential moving average of the weights with this decay, "
                          "evaluated and saved separately (best_ema.pt); the trained weights are untouched")
@@ -434,6 +482,8 @@ def main(argv=None) -> int:
         return 2
     model = build_from_args(vars(args), N_TYPES).to(device)
     model.emit_aux = args.facet_surface
+    model.keep_local = bool(args.pair_bakes)
+    print(f"pairs       {'off' if not args.pair_bakes else f'p={args.pair_prob} with ' + ', '.join(Path(b).name for b in args.pair_bakes) + f' (dim {args.contrastive_dim}, weight {args.contrastive_weight}, tau {args.contrastive_tau})'}")
     print(f"variants    agg {args.agg}, seed concat {args.seed_concat}, seed attention heads "
           f"{args.seed_attn}, per-facet surface head {args.facet_surface} "
           f"(weight {args.facet_loss_weight}), EMA {args.ema or 'off'}")
@@ -465,6 +515,7 @@ def main(argv=None) -> int:
     val_loader = make_loader(val_files, args, None, args.seed + 1)
 
     best = best_ema = -1.0
+    run_con = 0.0
     step = 0
     t0 = time.time()
     run_loss = run_seg = run_cls = 0.0
@@ -496,6 +547,11 @@ def main(argv=None) -> int:
                     fl = facet_surface_loss(outs[-1], batch[at["fsurf"]], batch[at["fsurf_mask"]],
                                             batch[at["ftype"]], m, cls_w)
                     loss = loss + args.facet_loss_weight * fl
+                if args.pair_bakes:
+                    cl = contrastive_loss(model, batch, at, model.last_local, args.gnn_layers > 0,
+                                          args.contrastive_tau)
+                    loss = loss + args.contrastive_weight * cl
+                    run_con = (run_con if step % 100 else 0.0) + float(cl)
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -514,7 +570,8 @@ def main(argv=None) -> int:
             if step % 100 == 0:
                 rate_s = step / (time.time() - t0)
                 print(f"  step {step:>6,}/{args.steps:,}  loss {run_loss / 100:.4f} "
-                      f"(seg {run_seg / 100:.4f} cls {run_cls / 100:.4f} surf {run_surf / 100:.4f})  "
+                      f"(seg {run_seg / 100:.4f} cls {run_cls / 100:.4f} surf {run_surf / 100:.4f}"
+                      + (f" pair {run_con / 100:.4f}" if args.pair_bakes else "") + ")  "
                       f"lr {sched.get_last_lr()[0]:.2e}  {rate_s:.1f} it/s", flush=True)
                 run_loss = run_seg = run_cls = 0.0
 

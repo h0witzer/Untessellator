@@ -119,7 +119,7 @@ class SeedFillNet(nn.Module):
     def __init__(self, in_features: int = 10, n_types: int = 9, width: int = 256,
                  surface: bool = False, n_surface: int = 5, gnn_layers: int = 0,
                  edge_dim: int = 1, agg: str = "max", seed_concat: bool = False,
-                 seed_attn: int = 0, facet_surface: bool = False):
+                 seed_attn: int = 0, facet_surface: bool = False, contrastive: int = 0):
         super().__init__()
         w = width
         self.enc1 = mlp([in_features, w // 4, w // 2])     # local features
@@ -156,6 +156,26 @@ class SeedFillNet(nn.Module):
         self.emit_aux = False
         if facet_surface:
             self.fsurf = mlp([w // 2, w // 2, n_surface + n_types])
+        # TRAINING-ONLY CROSS-MESHER SPACE (experiment 4). A projection of each facet's embedding in
+        # which the same face meshed by another mesher lands together (train.py --pair-bakes). Never
+        # exported; keep_local makes forward() keep the per-facet embeddings for the loss.
+        self.contrastive = contrastive
+        self.keep_local = False
+        self.last_local = None
+        if contrastive:
+            self.cproj = mlp([w // 2, w // 2, contrastive])
+
+    def embed(self, x: torch.Tensor, mask: torch.Tensor, nbr: torch.Tensor | None = None,
+              eattr: torch.Tensor | None = None) -> torch.Tensor:
+        """The per-facet embeddings the heads read (after enc1 and the MeshConv layers)."""
+        m = mask.unsqueeze(-1)
+        local = self.enc1(x) * m
+        if self.gnn_layers:
+            emask = ((nbr >= 0) & (mask.unsqueeze(-1) > 0)).to(local.dtype)
+            safe = torch.where(nbr >= 0, nbr, torch.zeros_like(nbr))
+            for conv in self.convs:
+                local = conv(local, safe, emask, eattr) * m
+        return local
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor, nbr: torch.Tensor | None = None,
                 eattr: torch.Tensor | None = None):
@@ -164,12 +184,9 @@ class SeedFillNet(nn.Module):
         the dihedral of each of those edges / 90, or (B, N, 3, E) with edge_dim > 1. Only models
         with gnn_layers read them."""
         m = mask.unsqueeze(-1)
-        local = self.enc1(x) * m                      # (B, N, w/2)
-        if self.gnn_layers:
-            emask = ((nbr >= 0) & (mask.unsqueeze(-1) > 0)).to(local.dtype)
-            safe = torch.where(nbr >= 0, nbr, torch.zeros_like(nbr))
-            for conv in self.convs:
-                local = conv(local, safe, emask, eattr) * m
+        local = self.embed(x, mask, nbr, eattr)       # (B, N, w/2)
+        if self.keep_local:
+            self.last_local = local
         pooled_in = self.enc2(local)                  # (B, N, w)
         pooled_in = pooled_in.masked_fill(m == 0, NEG)
         glob = pooled_in.max(dim=1).values            # (B, w)
@@ -214,7 +231,8 @@ def build_from_args(args: dict, n_types: int = 9) -> SeedFillNet:
                        edge_dim=int(a.get("edge_dim", 1) or 1), agg=a.get("agg", "max") or "max",
                        seed_concat=bool(a.get("seed_concat", False)),
                        seed_attn=int(a.get("seed_attn", 0) or 0),
-                       facet_surface=bool(a.get("facet_surface", False)))
+                       facet_surface=bool(a.get("facet_surface", False)),
+                       contrastive=int(a.get("contrastive_dim", 0) or 0) if a.get("pair_bakes") else 0)
 
 
 class ZeroInputs(nn.Module):

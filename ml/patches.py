@@ -300,6 +300,34 @@ def collate_facet_surface(samples: list[dict], max_facets: int):
     return tgt, msk, typ
 
 
+def collate_pairs(samples: list[dict], max_facets: int, zero_cols=()):
+    """Partner patches of the samples that carry one: (main sample index, features, mask, nbr, eattr,
+    main face labels, partner face labels); -1 labels are padding or unlabelled."""
+    idx = [i for i, s in enumerate(samples) if "partner" in s]
+    p = len(idx)
+    nf = samples[0]["features"].shape[1]
+    x = np.zeros((p, max_facets, nf), np.float32)
+    m = np.zeros((p, max_facets), np.float32)
+    nbr = np.full((p, max_facets, 3), -1, np.int64)
+    ea = np.zeros((p, max_facets, 3), np.float32)
+    fa = np.full((p, max_facets), -1, np.int64)
+    fb = np.full((p, max_facets), -1, np.int64)
+    for r, i in enumerate(idx):
+        s, q = samples[i], samples[i]["partner"]
+        k = min(q["n"], max_facets)
+        x[r, :k] = q["features"][:k]
+        m[r, :k] = 1.0
+        g = q["nbr"][:k]
+        nbr[r, :k] = np.where(g < k, g, -1)
+        ea[r, :k] = q["eattr"][:k]
+        fb[r, :k] = q["fid"][:k]
+        ka = min(s["n"], max_facets)
+        fa[r, :ka] = s["fid"][:ka]
+    if zero_cols:
+        x[:, :, list(zero_cols)] = 0.0
+    return np.asarray(idx, np.int64), x, m, nbr, ea, fa, fb
+
+
 def collate_surface(samples: list[dict]):
     """Surface targets and their masks; samples without a sidecar contribute zeros, masked out."""
     b = len(samples)
@@ -325,7 +353,9 @@ class BakedPatches:
                  files: list[Path] | None = None, relabel_root: Path | None = None,
                  surface_root: Path | None = None, extended: bool = False,
                  exclude_prob: float = 0.0, gnn: bool = False, hard_rings: int = 0,
-                 boundary_seed_prob: float = 0.0, facet_surface: bool = False):
+                 boundary_seed_prob: float = 0.0, facet_surface: bool = False,
+                 pair_roots: list[Path] | None = None, pair_prob: float = 0.0,
+                 native_root: Path | None = None):
         self.root = Path(root)
         self.densities = tuple(densities)
         self.max_facets = max_facets
@@ -358,6 +388,16 @@ class BakedPatches:
         self.hard_rings = hard_rings
         self.boundary_seed_prob = boundary_seed_prob
         self.facet_surface = facet_surface
+        # CROSS-MESHER PAIRS (experiment 4, 2026-10-03). With probability `pair_prob`, a patch from a
+        # native-bake file also carries a PARTNER patch: the same part from one of `pair_roots`
+        # (NURBS / gmsh / game-style bakes), seeded at the facet nearest the main seed. The partner's
+        # facets take the main mesh's face labels by nearest centroid, because gmsh bakes do not keep
+        # face ids. Partners feed only the training-only contrastive loss, and draw from their own
+        # RNG, so the main patch stream is identical to a run without pairing.
+        self.pair_roots = [Path(p) for p in (pair_roots or [])]
+        self.pair_prob = pair_prob
+        self.native_root = Path(native_root) if native_root else None
+        self.pair_rng = np.random.default_rng(seed + 7919)
 
     def _excluded_faces(self, s: int, indptr, indices, face_id, face_type):
         ids0, _ = k_ring(s, indptr, indices, self.max_facets)
@@ -422,6 +462,7 @@ class BakedPatches:
             seeds = self._choose_seeds(face_type, ntri)
             if bprob > 0:
                 seeds = self._boundary_seeds(seeds, face_id, face_type, indptr, indices, eangles, bprob)
+            partner_cache = {}
             for s in seeds:
                 excluded = None
                 if self.exclude_prob > 0 and self.rng.random() < self.exclude_prob:
@@ -434,6 +475,8 @@ class BakedPatches:
                                     facet_surface=getattr(self, "facet_surface", False))
                 if out is not None:
                     out["density"] = dens
+                    if self.pair_prob > 0 and self.pair_rng.random() < self.pair_prob:
+                        self._attach_partner(out, path, dens, facets, face_id, partner_cache)
                     yield out
 
     def _boundary_seeds(self, seeds, face_id, face_type, indptr, indices, eangles, prob):
@@ -456,6 +499,67 @@ class BakedPatches:
                 p = w / w.sum()
         seeds[swap] = self.rng.choice(cand, size=k, replace=True, p=p)
         return seeds
+
+    def _partner_mesh(self, path: Path, dens: str, cache: dict):
+        """A random re-meshed copy of this native file at `dens` (or any density it has), derived
+        once per file and density. None when there is none."""
+        if self.native_root is None:
+            return None
+        try:
+            rel = path.relative_to(self.native_root)
+        except ValueError:
+            return None                       # not a native file: re-meshed copies are not paired
+        roots = [r for r in self.pair_roots if (r / rel).exists()]
+        if not roots:
+            return None
+        root = roots[int(self.pair_rng.integers(len(roots)))]
+        key = (str(root), dens)
+        if key not in cache:
+            try:
+                data = np.load(root / rel)
+                d = dens if f"{dens}_positions" in data.files else next(
+                    k[:-10] for k in data.files if k.endswith("_positions"))
+                pos = data[f"{d}_positions"]
+                if pos.shape[0] < 32:
+                    raise ValueError
+                facets, indptr, indices, curv, eangles = derive(pos, with_angles=True)
+                cache[key] = (facets, indptr, indices, curv, eangles,
+                              data[f"{d}_face_id"], data[f"{d}_face_type"], float(data["diag"]))
+            except Exception:
+                cache[key] = None
+        return cache[key]
+
+    def _attach_partner(self, out: dict, path: Path, dens: str, facets: dict, face_id: np.ndarray,
+                        cache: dict):
+        part = self._partner_mesh(path, dens, cache)
+        if part is None:
+            return
+        pf, pptr, pidx, pcurv, pang, pfid, ptype, diag = part
+        ca = facets["centroids"]
+        seed_c = ca[out["seed"]]
+        cb = pf["centroids"]
+        ps = int(np.argmin(((cb - seed_c) ** 2).sum(1)))
+        p = extract_patch(pf, pptr, pidx, pfid, ptype, ps, self.max_facets, self.pair_rng, curv=pcurv,
+                          extended=self.extended, eangles=pang, gnn=True)
+        if p is None:
+            return
+        # the main mesh's labels on the partner's facets, by nearest centroid (chunked, no scipy)
+        q = cb[p["ids"]].astype(np.float32)
+        a = ca.astype(np.float32)
+        a2 = (a * a).sum(1)
+        lab = np.empty(len(q), np.int64)
+        dist = np.empty(len(q), np.float32)
+        for s in range(0, len(q), 128):
+            d2 = a2[None, :] - 2.0 * q[s:s + 128] @ a.T
+            j = d2.argmin(1)
+            lab[s:s + 128] = face_id[j]
+            dist[s:s + 128] = np.sqrt(np.maximum(d2[np.arange(len(j)), j] + (q[s:s + 128] ** 2).sum(1), 0))
+        lab[dist > 0.03 * diag] = -1          # no main facet near: unlabelled, ignored by the loss
+        if lab[0] != face_id[out["seed"]]:
+            return                             # the partner seed is not on the same face
+        out["fid"] = face_id[out["ids"]].astype(np.int64)
+        out["partner"] = {"features": p["features"], "nbr": p["nbr"], "eattr": p["eattr"],
+                          "n": p["n"], "fid": lab}
 
     def _choose_seeds(self, face_type: np.ndarray, ntri: int) -> np.ndarray:
         k = min(self.seeds_per_mesh, ntri)
