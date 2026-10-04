@@ -2695,6 +2695,22 @@ h_i − h_seed.
 The hypothesis behind it, that the membership head misses the seed's own embedding, is not supported,
 and no fill gate was run. The whole-region errors stay where they are.
 
+### Experiment 2b: seed cross-attention in the membership head (2026-10-04)
+
+`runs/v7seedattn` is v7gnn's recipe plus `--seed-attn 4`: four heads with the seed as the query add a
+seed-focused context vector and each facet's scores to the membership head's input.
+- **Training validation:** best IoU 0.8660 against 0.8592, +0.007 on average over the last seven
+  evaluations. That is the largest validation gain of any seed arm.
+- **Held-out patches:** 0.853 / 0.756 / 0.732 / 0.731, pooled **0.772**, unchanged.
+- **Whole-region errors:** 2.5% against 2.6%. Type 70.3%; tori 34%.
+
+Seed comparison, whether as a concat or as attention, does not reach the whole-region errors. Attention
+has now paid nothing in either the refiner or the seed model.
+
+**The training validation set misleads here.** Arms 2a and 2b gain 0.004–0.007 on it (OCCT meshes,
+random seeds) and nothing on the held-out four-mesher patches (fillEval's clicks). Experiment 1 is the one
+seed change whose gain carried over. Judge seed arms by `patch_eval.py`, never by the training log.
+
 **EMA (experiment 5, riding along).** In experiments 1 and 2a the EMA copy matches the raw best checkpoint
 on held-out patches to within 0.002 IoU. It gives a smoother curve and no gain.
 
@@ -2810,6 +2826,64 @@ contention as much as code.
 **Open:**
 - the Python harness (`ml/solid_rebuild.py`) has none of this;
 - slivers that are real small features are only protected by the 8e-4 × diagonal size limit.
+
+### Engineering-intent relations (2026-10-04)
+
+The user asked for the relations a CAD model carries: symmetry, repeated sizes, planes through axes. They
+were added to `js/knit/axes.js`; none rounds a value.
+- **Planes through an axis.** A plane running along a shared axis line that passes within its precision of
+  the line is made to contain it.
+- **Equal sizes, part-wide.** Cylinder radii, cone half-angles and torus tube radii that agree within the
+  fits' precision take one value. Each member is refitted with the value fixed. Surfaces fixed by tangency
+  are references: a group takes their value, and two that disagree never share.
+- **Mirror symmetry.** Two directions that are mirror images across a frame direction become exact mirror
+  images. The frame is the heaviest shared direction and the shared directions exactly square to it.
+  Mirroring across an oblique four-face chamfer direction had once mapped the frame's x onto z.
+- **Intent tolerances.** Mirror and parallel relations may join within 0.25°, and equal sizes within 2e-4
+  relative. The surfaces moved may stray up to 2e-5 of the diagonal.
+  - **Only fits that cannot defend themselves move.** A fit with at least 3 vertices beyond its DOF sets
+    the shared value; two such fits that disagree stay apart.
+  - **Only on inexact meshes.** The median fit of the firm curved surfaces must be above the 1e-6
+    exactness bar. The mirror pass is gated the same way.
+  - **Why the gating.** Ungated, intent moved 77 exact fill-set planes off their true faces (real small
+    drafts). The firm rule brought that to 29, and the mesh gate to 12.
+
+The chain needed intent because its mesh is exact on the planes but inexact on the curved faces. A 4-vertex
+chamfer plane sits exactly at 44.90° on two vertices of a cone ring that is 0.015 off the CAD, against its
+mirror partners at 45.00°. Its mesh noise is 7.8e-6 of the diagonal; 22 of 120 fill parts score higher,
+from loose fits rather than noisy vertices, and they hold the 12 regressions left.
+
+**Chain:** every chamfer at one angle and exactly tangent to its cone, 11 of 12 tangent joins exact. The last
+is the inconsistent four-face corner.
+
+**Against the true surfaces** (pairs anywhere in the part for the new relations):
+
+| relation | Onshape (300) | fill_eval (120) |
+|---|---|---|
+| equal cylinder radius | 4.2 → 83.4% | 1.4 → 5.7% |
+| equal cone half-angle | 2.5 → 84.3% | 4.4 → 81.9% |
+| equal torus tube radius | 4.6 → 2.3% | 0.3 → 2.3% |
+| plane through an axis | 1.2 → 11.0% | 37.3 → 87.2% |
+
+- **Equal sizes made where the truth differs:** 2 on Onshape, 1 on fill.
+- **The earlier relations, before and after intent:**
+
+  | relation | Onshape | fill_eval |
+  |---|---|---|
+  | perpendicular | 99.8 → 99.7% | 99.2 → 98.8% |
+  | along | 95.5 → 95.8% | 98.1 → 96.0% |
+  | tangent | 48.3 → 48.1% | 86.3 → 85.5% |
+  | coaxial | 82.2 → 80.9% | — |
+
+  The fill set's along loss (84 pairs) has not been traced to parts yet; the scorer's per-part rows do not
+  record it.
+- **Recovery:** groups recovering their true face worse are 4 on Onshape (28 better) and 12 on fill (10
+  better); found4 is unchanged.
+- **Not working yet:**
+  - *Equal fillet (torus) radii.* Tangency fixes each fillet to slightly different values, which then never
+    share. Sharing them needs a joint solve.
+  - *Equal radii on the fill set.* They are mostly shared only within precision.
+  - *Equal spacing and pattern detection.* Not attempted.
 
 ---
 
