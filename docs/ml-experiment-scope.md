@@ -2711,6 +2711,40 @@ has now paid nothing in either the refiner or the seed model.
 random seeds) and nothing on the held-out four-mesher patches (fillEval's clicks). Experiment 1 is the one
 seed change whose gain carried over. Judge seed arms by `patch_eval.py`, never by the training log.
 
+### Experiment 4: a training-only cross-mesher contrastive space (2026-10-04)
+
+`runs/v7pair` is v7gnn's recipe plus `--pair-bakes` (NURBS, gmsh, game-style), pair probability 0.5, a
+64-d projection, weight 0.1 and τ 0.1. Native patches gain a partner from another mesher, and a
+multi-positive InfoNCE pulls together facets of the same face across the two meshes.
+- **Training validation:** best IoU 0.8633 against 0.8592. The contrastive loss falls to about 0.31.
+- **Held-out patches:** 0.850 / 0.751 / 0.723 / 0.711, pooled **0.764**. That is worse than v7gnn's
+  0.772, and game-style loses 0.027.
+- **Whole-region errors:** 2.9% against 2.6%.
+
+Asking directly for invariance across meshers did not narrow the gap between them, but asking every facet
+to describe its true surface (experiment 1) did: gmsh +0.044. A geometric target beats an invariance
+target here. The face-level positives ignore position, and they may also pull against the membership
+objective in the shared embedding.
+
+### Where the round leaves the models
+
+| | Held-out patch IoU (pooled) | Fills | Status |
+|---|---|---|---|
+| refiner + message passing (`r3mp`) | refiner 0.886 → 0.917 | clean with cut 87/81/82/54 → 89/83/86/55 | shipped |
+| per-facet surface space (`v7fsurf`) | 0.772 → 0.792 | unchanged | keep the recipe for future encoders |
+| seed concat / seed attention | 0.772 / 0.772 | not run | no |
+| cross-mesher contrastive | 0.764 | not run | no |
+| EMA | = raw ± 0.002 | | no |
+
+- **Where fills are decided now.** The refiner and the minimum cut decide fill regions. The seed model's
+  region quality is absorbed downstream, and its type head barely moved in any arm (tori 32–35%).
+- **Next levers.**
+  - A group-level type model: with true types, surfaces found rise 9.3 points on fill_eval and 3.6 on
+    Onshape.
+  - Refiner-side versions of the training-only surface space.
+  - For the v8 shared encoder, the per-facet surface objective as standard. It is the one auxiliary
+    target that made the encoder more robust across meshers.
+
 **EMA (experiment 5, riding along).** In experiments 1 and 2a the EMA copy matches the raw best checkpoint
 on held-out patches to within 0.002 IoU. It gives a smoother curve and no gain.
 
@@ -2834,8 +2868,9 @@ were added to `js/knit/axes.js`; none rounds a value.
 - **Planes through an axis.** A plane running along a shared axis line that passes within its precision of
   the line is made to contain it.
 - **Equal sizes, part-wide.** Cylinder radii, cone half-angles and torus tube radii that agree within the
-  fits' precision take one value. Each member is refitted with the value fixed. Surfaces fixed by tangency
-  are references: a group takes their value, and two that disagree never share.
+  fits' precision take one value. Each member takes the value and nothing else about it moves; a cone pivots
+  about the middle of its patch. Surfaces the tangency pass moved are references: a group takes their value,
+  and two that disagree never share.
 - **Mirror symmetry.** Two directions that are mirror images across a frame direction become exact mirror
   images. The frame is the heaviest shared direction and the shared directions exactly square to it.
   Mirroring across an oblique four-face chamfer direction had once mapped the frame's x onto z.
@@ -2856,34 +2891,42 @@ from loose fits rather than noisy vertices, and they hold the 12 regressions lef
 **Chain:** every chamfer at one angle and exactly tangent to its cone, 11 of 12 tangent joins exact. The last
 is the inconsistent four-face corner.
 
-**Against the true surfaces** (pairs anywhere in the part for the new relations):
+**Against the true surfaces.** The shared-axis step with the intent relations off, then on (same code;
+pairs anywhere in the part for the size and through-axis relations):
 
 | relation | Onshape (300) | fill_eval (120) |
 |---|---|---|
-| equal cylinder radius | 4.2 → 83.4% | 1.4 → 5.7% |
-| equal cone half-angle | 2.5 → 84.3% | 4.4 → 81.9% |
-| equal torus tube radius | 4.6 → 2.3% | 0.3 → 2.3% |
-| plane through an axis | 1.2 → 11.0% | 37.3 → 87.2% |
+| equal cylinder radius | 25.0 → 82.8% | 1.0 → 4.0% |
+| equal cone half-angle | 3.1 → 84.3% | 4.1 → 81.6% |
+| equal torus tube radius | 0.3 → 2.3% | 0.1 → 2.3% |
+| plane through an axis | 8.4 → 11.5% | 68.6 → 87.3% |
+| coaxial | 82.2 → 80.9% | 99.0 → 99.0% |
+| perpendicular | 99.8 → 99.7% | 99.2 → 98.8% |
+| along | 95.8 → 95.8% | 97.2 → 96.0% |
+| tangent | 48.2 → 47.9% | 85.7 → 85.3% |
+| groups fitting their true face worse | 0 → 4 | 2 → 12 |
 
-- **Equal sizes made where the truth differs:** 2 on Onshape, 1 on fill.
-- **The earlier relations, before and after intent:**
+- **Equal sizes made where the truth differs:** 2 on Onshape, 1 on fill. found4 is unchanged on both.
+- **The fill set's along loss** (about 50 pairs) has not been traced to parts yet; the scorer's per-part rows
+  do not record it.
 
-  | relation | Onshape | fill_eval |
-  |---|---|---|
-  | perpendicular | 99.8 → 99.7% | 99.2 → 98.8% |
-  | along | 95.5 → 95.8% | 98.1 → 96.0% |
-  | tangent | 48.3 → 48.1% | 86.3 → 85.5% |
-  | coaxial | 82.2 → 80.9% | — |
+**What the kernel needs from it (2026-10-04, second round).** The first version cost solids:
+- **Only the size moves.** The equal-size pass first refitted the rest of each surface about its points
+  with the size fixed. On 00007917 re-estimating two cones' apexes (a 6e-8 shift, the angle changed 2e-10)
+  made the build 16x slower (5 s -> 77 s). Now only the value changes; a cone pivots about its patch.
+- **The references of an exact tangency stay put.** The tangency pass moves one surface against
+  references (a plane onto a cylinder, a fillet onto a cone). The equal-size pass moving a reference
+  afterwards leaves a near-tangent join: 00182468_37 went 17 s -> 673 s. Each tangency now records the
+  references its constraints came from, and those keep their size. Cost: equal cylinder radii 83.4 -> 82.8%
+  (Onshape) and 5.7 -> 4.0% (fill). Protecting every neighbour instead cost a third of them.
+- **Not taken.** A second tangency pass after the equal sizes was worse on every relation.
 
-  The fill set's along loss (84 pairs) has not been traced to parts yet; the scorer's per-part rows do not
-  record it.
-- **Recovery:** groups recovering their true face worse are 4 on Onshape (28 better) and 12 on fill (10
-  better); found4 is unchanged.
-- **Not working yet:**
-  - *Equal fillet (torus) radii.* Tangency fixes each fillet to slightly different values, which then never
-    share. Sharing them needs a joint solve.
-  - *Equal radii on the fill set.* They are mostly shared only within precision.
-  - *Equal spacing and pattern detection.* Not attempted.
+**Not working yet:**
+- *Equal fillet (torus) radii, and radii held by a tangency.* Tangency fixes each fillet, and each cylinder
+  a tangent plane was fitted to, at slightly different values, which then never share. Sharing them needs a
+  joint solve that moves the tangent partners with the size.
+- *Equal radii on the fill set.* Mostly they agree only within precision.
+- *Equal spacing and pattern detection.* Not attempted.
 
 ---
 
