@@ -1,0 +1,1 @@
+{"refine": true, "n_features": 34, "refineColumns": ["in_region", "dist", "angle", "sdist", "ebottle", "epath", "elocal", "click", "cdist"], "gnn_layers": 0, "epoch": 12}

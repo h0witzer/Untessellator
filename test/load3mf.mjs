@@ -2,8 +2,9 @@
  * load3mf.mjs — minimal 3MF reader for the headless harness.
  *
  * 3MF is a ZIP containing 3D/3dmodel.model (XML). This reads the central
- * directory, inflates the model part, and returns a flat non-indexed position
- * array, applying each build item's transform.
+ * directory, inflates the model part (and any 3D/Objects/*.model parts its
+ * components point into), and returns a flat non-indexed position array,
+ * applying each build item's and component's transform.
  *
  * Node-only (uses zlib); the browser path still goes through stlLoader.js.
  */
@@ -102,19 +103,20 @@ const mul = (m, x, y, z) => [
   m[2] * x + m[5] * y + m[8] * z + m[11],
 ];
 
-/**
- * @param {string} path  .3mf file
- * @returns {{positions: Float64Array, objects: number}}
- */
-export function load3MF(path) {
-  const xml = unzipEntry(readFileSync(path), '3D/3dmodel.model').toString('utf8');
+const transformOf = (attrs) => {
+  const tm = /\btransform="([^"]+)"/i.exec(attrs);
+  return tm ? tm[1].trim().split(/\s+/).map(Number) : null;
+};
 
-  // Collect every <object> with a <mesh>.
+/** Every <object> in one model part: its inline mesh, if any, and its components, if any. */
+function parseObjects(xml) {
   const objects = new Map();
-  const objRe = /<object\b[^>]*\bid="([^"]+)"[^>]*>([\s\S]*?)<\/object>/g;
+  const objRe = /<object\b([^>]*)>([\s\S]*?)<\/object>/g;
   let m;
   while ((m = objRe.exec(xml))) {
-    const [, id, body] = m;
+    const id = /\bid="([^"]+)"/.exec(m[1])?.[1];
+    if (id === undefined) continue;
+    const body = m[2];
     const verts = [];
     const vRe = /<vertex\b[^>]*\bx="([^"]+)"[^>]*\by="([^"]+)"[^>]*\bz="([^"]+)"[^>]*\/>/g;
     let v;
@@ -125,31 +127,69 @@ export function load3MF(path) {
     let t;
     while ((t = tRe.exec(body))) tris.push([+t[1], +t[2], +t[3]]);
 
-    if (verts.length && tris.length) objects.set(id, { verts, tris });
+    // Bambu Studio and PrusaSlicer keep the mesh in 3D/Objects/*.model and reference it from a
+    // component (production extension, p:path).
+    const comps = [];
+    const cRe = /<component\b([^>]*?)\/?>/g;
+    let c;
+    while ((c = cRe.exec(body))) {
+      const oid = /\bobjectid="([^"]+)"/.exec(c[1])?.[1];
+      if (oid !== undefined) comps.push({ id: oid, path: /:path="([^"]+)"/.exec(c[1])?.[1] ?? null, xf: transformOf(c[1]) });
+    }
+    objects.set(id, { verts, tris, comps });
   }
-  if (!objects.size) throw new Error('no mesh objects in 3MF');
+  return objects;
+}
+
+/**
+ * @param {string} path  .3mf file
+ * @param {{maxBytes?: number}} [opts]  refuse any model part larger than this when inflated
+ * @returns {{positions: Float64Array, objects: number}}
+ */
+export function load3MF(path, { maxBytes = Infinity } = {}) {
+  const buf = readFileSync(path);
+  const partXml = (name) => {
+    const raw = unzipEntry(buf, name);
+    if (raw.length > maxBytes) throw new Error(`model part ${name} is ${(raw.length / 1e6).toFixed(0)} MB`);
+    return raw.toString('utf8');
+  };
+  const xml = partXml('3D/3dmodel.model');
+  const main = parseObjects(xml);
+  const parts = new Map();
+  const partObjects = (p) => {
+    const key = p.replace(/^\//, '');
+    if (!parts.has(key)) parts.set(key, parseObjects(partXml(key)));
+    return parts.get(key);
+  };
 
   // Build items reference objects, optionally with a 3x4 row-major transform.
   const items = [];
-  const iRe = /<item\b[^>]*\bobjectid="([^"]+)"([^>]*)\/?>/gi;
+  const iRe = /<item\b([^>]*?)\/?>/gi;
+  let m;
   while ((m = iRe.exec(xml))) {
-    const tm = /transform="([^"]+)"/i.exec(m[2]);
-    items.push({ id: m[1], xf: tm ? tm[1].trim().split(/\s+/).map(Number) : null });
+    const id = /\bobjectid="([^"]+)"/.exec(m[1])?.[1];
+    if (id !== undefined) items.push({ id, xf: transformOf(m[1]) });
   }
-  if (!items.length) for (const id of objects.keys()) items.push({ id, xf: null });
+  if (!items.length) for (const id of main.keys()) items.push({ id, xf: null });
 
+  // Emit an object's own triangles, then its components'. Transforms apply innermost first.
   const out = [];
-  for (const { id, xf } of items) {
+  let meshes = 0;
+  const emit = (objects, id, xfs, depth) => {
     const obj = objects.get(id);
-    if (!obj) continue;
-    for (const [a, b, c] of obj.tris) {
-      for (const vi of [a, b, c]) {
-        const p = obj.verts[vi];
-        if (!p) continue;
-        const q = xf ? mul(xf, p[0], p[1], p[2]) : p;
-        out.push(q[0], q[1], q[2]);
+    if (!obj || depth > 8) return;
+    if (obj.tris.length) meshes++;
+    for (const tri of obj.tris) {
+      const ps = tri.map((vi) => obj.verts[vi]);
+      if (ps.some((p) => !p)) continue;
+      for (let p of ps) {
+        for (const xf of xfs) if (xf) p = mul(xf, p[0], p[1], p[2]);
+        out.push(p[0], p[1], p[2]);
       }
     }
-  }
-  return { positions: Float64Array.from(out), objects: objects.size };
+    for (const comp of obj.comps) emit(comp.path ? partObjects(comp.path) : objects, comp.id, [comp.xf, ...xfs], depth + 1);
+  };
+  for (const { id, xf } of items) emit(main, id, [xf], 0);
+  if (!out.length) throw new Error('no mesh objects in 3MF');
+  return { positions: Float64Array.from(out), objects: meshes };
 }

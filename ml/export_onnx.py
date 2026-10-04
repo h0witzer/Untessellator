@@ -54,24 +54,34 @@ def main(argv=None) -> int:
     # v6 runs (train.py --features v6) take the extended inputs; the browser must build them
     # with buildFeatures(..., extended = true), which the sidecar JSON tells it.
     n_features = int(ck["args"].get("n_features", N_FEATURES))
+    gnn = int(ck["args"].get("gnn_layers", 0))
     net = SeedFillNet(in_features=n_features, n_types=N_TYPES,
-                      surface=ck["args"].get("surface_root") is not None)
+                      surface=ck["args"].get("surface_root") is not None, gnn_layers=gnn)
     net.load_state_dict(ck["model"])
     net.eval()
     export_onnx(net, str(out), in_features=n_features, zero_cols=zero)
     out.with_suffix(".json").write_text(json.dumps({
         "features": ck["args"].get("features", "base"), "n_features": n_features,
-        "zero_cols": zero, "step": ck.get("step"),
+        "zero_cols": zero, "step": ck.get("step"), "gnn_layers": gnn,
     }))
 
     import onnxruntime as ort
-    x = np.random.default_rng(0).normal(size=(1, 300, n_features)).astype(np.float32)
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=(1, 300, n_features)).astype(np.float32)
     m = np.ones((1, 300), np.float32)
-    outs_onnx = ort.InferenceSession(str(out)).run(None, {"features": x, "mask": m})
+    feeds = {"features": x, "mask": m}
+    extra = ()
+    if gnn:
+        # a random graph with missing neighbours, to exercise the masking
+        nbr = rng.integers(-1, 300, size=(1, 300, 3)).astype(np.int64)
+        ea = rng.random(size=(1, 300, 3)).astype(np.float32)
+        feeds.update(nbr=nbr, eattr=ea)
+        extra = (torch.from_numpy(nbr), torch.from_numpy(ea))
+    outs_onnx = ort.InferenceSession(str(out)).run(None, feeds)
     xz = x.copy()
     xz[:, :, zero] = 0.0
     with torch.no_grad():
-        outs_t = net(torch.from_numpy(xz), torch.from_numpy(m))
+        outs_t = net(torch.from_numpy(xz), torch.from_numpy(m), *extra)
     diff = max(float(np.abs(a - b.numpy()).max()) for a, b in zip(outs_onnx, outs_t))
     print(f"{out}: step {ck.get('step')}, zeroed {[FEATURE_NAMES[i] for i in zero] or 'none'}, "
           f"max |onnx - torch| {diff:.2e}")

@@ -44,14 +44,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from model import SeedFillNet, count_parameters  # noqa: E402
 from occ_tessellate import TYPE_NAMES  # noqa: E402
 from patches import (BakedPatches, FEATURE_NAMES, FEATURE_NAMES_V6, N_TYPES, collate,  # noqa: E402
-                     collate_surface)
+                     collate_graph, collate_surface, collate_weights)
 
 
 class PatchStream(IterableDataset):
     def __init__(self, files: list[Path], max_facets: int, seeds_per_mesh: int,
                  densities: tuple[str, ...], type_weights=None, seed: int = 0,
                  relabel_root: Path | None = None, surface_root: Path | None = None,
-                 extended: bool = False, exclude_prob: float = 0.0):
+                 extended: bool = False, exclude_prob: float = 0.0, gnn: bool = False,
+                 hard_rings: int = 0, boundary_seed_prob: float = 0.0):
+        self.gnn = gnn
+        self.hard_rings = hard_rings
+        self.boundary_seed_prob = boundary_seed_prob
         self.extended = extended
         self.exclude_prob = exclude_prob
         self.relabel_root = relabel_root
@@ -72,7 +76,9 @@ class PatchStream(IterableDataset):
                           type_weights=self.type_weights, seed=self.seed + wid * 977,
                           files=mine, relabel_root=self.relabel_root,
                           surface_root=self.surface_root, extended=self.extended,
-                          exclude_prob=self.exclude_prob)
+                          exclude_prob=self.exclude_prob, gnn=self.gnn,
+                          hard_rings=getattr(self, "hard_rings", 0),
+                          boundary_seed_prob=getattr(self, "boundary_seed_prob", 0.0))
         for s in ds:
             yield s
 
@@ -86,10 +92,13 @@ class Collate:
     than at the collate function, so it is worth not rediscovering.
     """
 
-    def __init__(self, max_facets: int, zero_cols: tuple[int, ...] = (), surface: bool = False):
+    def __init__(self, max_facets: int, zero_cols: tuple[int, ...] = (), surface: bool = False,
+                 gnn: bool = False, hard_weight: float = 1.0):
         self.max_facets = max_facets
         self.zero_cols = list(zero_cols)
         self.surface = surface
+        self.gnn = gnn
+        self.hard_weight = hard_weight
 
     def __call__(self, batch):
         x, y, m, t = collate(batch, self.max_facets)
@@ -99,6 +108,12 @@ class Collate:
         if self.surface:
             s, k = collate_surface(batch)
             out += (torch.from_numpy(s), torch.from_numpy(k))
+        # Layout: x y m t [surface target, mask] [loss weights] [nbr eattr] - the graph stays last.
+        if getattr(self, "hard_weight", 1.0) != 1.0:
+            out += (torch.from_numpy(collate_weights(batch, self.max_facets, self.hard_weight)),)
+        if self.gnn:
+            nbr, ea = collate_graph(batch, self.max_facets)
+            out += (torch.from_numpy(nbr), torch.from_numpy(ea))
         return out
 
 
@@ -115,12 +130,18 @@ def surface_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor):
     return la + lk + ls
 
 
-def make_loader(files, args, type_weights, shuffle_seed, exclude_prob=0.0):
+def make_loader(files, args, type_weights, shuffle_seed, exclude_prob=0.0, training=False):
+    # Validation keeps the plain seed distribution but still marks the band, so the log can report
+    # how the membership head does exactly where fills go wrong.
+    hard = args.hard_weight != 1.0
     stream = PatchStream(files, args.max_facets, args.seeds_per_mesh,
                          tuple(args.densities.split(",")), type_weights, shuffle_seed,
-                         args.relabel, args.surface_root, args.features == "v6", exclude_prob)
+                         args.relabel, args.surface_root, args.features == "v6", exclude_prob,
+                         args.gnn_layers > 0, args.hard_rings if hard else 0,
+                         args.boundary_seeds if training else 0.0)
     return DataLoader(stream, batch_size=args.batch,
-                      collate_fn=Collate(args.max_facets, args.zero_cols, args.surface_root is not None),
+                      collate_fn=Collate(args.max_facets, args.zero_cols, args.surface_root is not None,
+                                         args.gnn_layers > 0, args.hard_weight),
                       num_workers=args.workers, persistent_workers=args.workers > 0,
                       prefetch_factor=4 if args.workers > 0 else None)
 
@@ -144,10 +165,16 @@ def measure_stats(files, args, n: int = 800):
     return rate, types, k
 
 
+def graph_inputs(batch, model):
+    """The (nbr, eattr) pair a message-passing model takes: always the last two batch tensors."""
+    return tuple(batch[-2:]) if getattr(model, "gnn_layers", 0) else ()
+
+
 @torch.no_grad()
-def evaluate(model, loader, device, max_batches: int):
+def evaluate(model, loader, device, max_batches: int, weight_index: int | None = None):
     model.eval()
     tp = fp = fn_ = 0.0
+    btp = bfp = bfn = 0.0          # the same, inside the smooth-boundary band only
     type_hit = np.zeros(N_TYPES, np.int64)
     type_tot = np.zeros(N_TYPES, np.int64)
     axis_err, kn_sign, kn_err = [], [], []
@@ -156,10 +183,11 @@ def evaluate(model, loader, device, max_batches: int):
         if i >= max_batches:
             break
         x, y, m, t = (b.to(device) for b in batch[:4])
+        extra = tuple(b.to(device) for b in graph_inputs(batch, model))
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            outs = model(x, m)
+            outs = model(x, m, *extra)
         sl, tl = outs[0], outs[1]
-        if len(batch) == 6 and len(outs) == 3:
+        if len(outs) == 3:
             sp = outs[2].float().cpu()
             st, sk = batch[4], batch[5]
             a = F.normalize(sp[:, :3], dim=1)
@@ -177,6 +205,11 @@ def evaluate(model, loader, device, max_batches: int):
         tp += float((pred * truth).sum())
         fp += float((pred * (1 - truth) * m).sum())
         fn_ += float(((1 - pred) * truth).sum())
+        if weight_index is not None:
+            band = (batch[weight_index].to(device) > 1.0).float() * m
+            btp += float((pred * truth * band).sum())
+            bfp += float((pred * (1 - truth) * band).sum())
+            bfn += float(((1 - pred) * truth * band).sum())
         pt = tl.float().argmax(1)
         for c in range(N_TYPES):
             sel = t == c
@@ -189,7 +222,11 @@ def evaluate(model, loader, device, max_batches: int):
     rec = tp / max(tp + fn_, 1e-9)
     model.train()
     med = lambda v: float(np.median(v)) if v else None
-    return {"iou": iou, "precision": prec, "recall": rec,
+    band = None
+    if weight_index is not None:
+        band = {"iou": btp / max(btp + bfp + bfn, 1e-9), "precision": btp / max(btp + bfp, 1e-9),
+                "recall": btp / max(btp + bfn, 1e-9)}
+    return {"iou": iou, "precision": prec, "recall": rec, "band": band,
             "type_hit": type_hit, "type_tot": type_tot, "batches": seen,
             "axis_err_p50": med(axis_err), "kn_asinh_err_p50": med(kn_err),
             "kn_sign_acc": float(np.mean(kn_sign)) if kn_sign else None}
@@ -240,6 +277,15 @@ def main(argv=None) -> int:
     ap.add_argument("--exclude-prob", type=float, default=0.0,
                     help="training patches drawn with some neighbouring faces already painted "
                          "(removed from the patch); validation always uses full patches")
+    ap.add_argument("--hard-weight", type=float, default=1.0,
+                    help="loss weight for facets within --hard-rings of a smooth (<30 deg) boundary "
+                         "of the seed's face, against 1 elsewhere")
+    ap.add_argument("--hard-rings", type=int, default=2)
+    ap.add_argument("--boundary-seeds", type=float, default=0.0,
+                    help="share of training seeds redrawn from facets on a smooth face boundary")
+    ap.add_argument("--gnn-layers", type=int, default=0,
+                    help="message-passing layers over the patch's facet adjacency (model.MeshConv) "
+                         "between the per-facet encoder and the pool; 0 is the PointNet")
     ap.add_argument("--zero-features", default="",
                     help="comma list of patches.FEATURE_NAMES to hold at zero, e.g. "
                          "log_area,ring: inputs that describe the triangulation rather than "
@@ -333,7 +379,10 @@ def main(argv=None) -> int:
                          * N_TYPES, dtype=torch.float32, device=device)
 
     model = SeedFillNet(in_features=args.n_features, n_types=N_TYPES,
-                        surface=args.surface_root is not None).to(device)
+                        surface=args.surface_root is not None, gnn_layers=args.gnn_layers).to(device)
+    print(f"graph       {args.gnn_layers} message-passing layers" if args.gnn_layers else "graph       none (PointNet)")
+    print(f"hard band   loss weight {args.hard_weight} within {args.hard_rings} rings of a smooth boundary; "
+          f"boundary seeds {args.boundary_seeds:.0%}")
     print(f"surface     {'head on, sidecars ' + str(args.surface_root) if args.surface_root else 'off'}")
     print(f"curvature   {'DISABLED (control arm)' if args.no_curvature else 'enabled'}")
     print(f"inputs      {args.features} ({args.n_features} columns); painted-neighbour "
@@ -347,7 +396,7 @@ def main(argv=None) -> int:
                                                 total_steps=args.steps, pct_start=0.05)
     pos_w = torch.tensor(pw, device=device)
 
-    train_loader = make_loader(train_files, args, tw, args.seed, args.exclude_prob)
+    train_loader = make_loader(train_files, args, tw, args.seed, args.exclude_prob, training=True)
     val_loader = make_loader(val_files, args, None, args.seed + 1)
 
     best = -1.0
@@ -364,11 +413,14 @@ def main(argv=None) -> int:
         for batch in train_loader:
             batch = [b.to(device, non_blocking=True) for b in batch]
             x, y, m, t = batch[:4]
+            wm = m
+            if args.hard_weight != 1.0:
+                wm = batch[6 if args.surface_root is not None else 4]
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-                outs = model(x, m)
+                outs = model(x, m, *graph_inputs(batch, model))
                 sl, tl = outs[0], outs[1]
                 seg = F.binary_cross_entropy_with_logits(
-                    sl.float(), y, weight=m, pos_weight=pos_w, reduction="sum") / m.sum().clamp(min=1)
+                    sl.float(), y, weight=wm, pos_weight=pos_w, reduction="sum") / wm.sum().clamp(min=1)
                 cls = F.cross_entropy(tl.float(), t, weight=cls_w)
                 loss = seg + args.type_loss_weight * cls
                 surf = torch.zeros((), device=device)
@@ -394,7 +446,8 @@ def main(argv=None) -> int:
                 run_loss = run_seg = run_cls = 0.0
 
             if step % args.eval_every == 0 or step == args.steps:
-                ev = evaluate(model, val_loader, device, args.eval_batches)
+                ev = evaluate(model, val_loader, device, args.eval_batches,
+                              (6 if args.surface_root is not None else 4) if args.hard_weight != 1.0 else None)
                 per = {TYPE_NAMES[i]: (round(float(ev["type_hit"][i] / ev["type_tot"][i]), 3)
                                        if ev["type_tot"][i] else None)
                        for i in range(N_TYPES)}
@@ -402,6 +455,9 @@ def main(argv=None) -> int:
                 print(f"\n  [eval @ {step:,}] membership IoU {ev['iou']:.4f}  "
                       f"precision {ev['precision']:.4f}  recall {ev['recall']:.4f}")
                 print(f"              type macro-acc {macro:.3f}  {per}", flush=True)
+                if ev["band"]:
+                    print(f"              smooth-boundary band: IoU {ev['band']['iou']:.4f}  "
+                          f"precision {ev['band']['precision']:.4f}  recall {ev['band']['recall']:.4f}", flush=True)
                 if ev["axis_err_p50"] is not None or ev["kn_sign_acc"] is not None:
                     print(f"              surface: axis error p50 {ev['axis_err_p50']} deg  "
                           f"asinh(kn) error p50 {ev['kn_asinh_err_p50']}  kn sign {ev['kn_sign_acc']}",
@@ -412,7 +468,7 @@ def main(argv=None) -> int:
                                        "type_macro": float(macro), "per_type": per,
                                        "axis_err_p50": ev["axis_err_p50"],
                                        "kn_asinh_err_p50": ev["kn_asinh_err_p50"],
-                                       "kn_sign_acc": ev["kn_sign_acc"]}) + "\n")
+                                       "kn_sign_acc": ev["kn_sign_acc"], "band": ev["band"]}) + "\n")
                 logf.flush()
                 if ev["iou"] > best:
                     best = ev["iou"]

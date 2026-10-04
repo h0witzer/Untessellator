@@ -30,7 +30,22 @@
 import * as ui from '../../vendor/form-studio-ui/index.js';
 import { loadModelFile } from '../stlLoader.js';
 import { fitRegionAs } from '../gaussMap.js';
-import { CREASE_BARRIER, creaseFor } from '../regionGrow.js';
+import { creaseTableFor, creaseFor } from '../regionGrow.js';
+import { coherentScores, seedOrder, autoPaint, AUTO_TANGENT } from '../autoPaint.js';
+import { annotateEdges, edgeWall } from '../edgeWall.js';
+
+/** The learned face-boundary scorer (ml/edge_train.py), scored once per mesh. */
+const EDGE_MODEL = 'models/edge-boundary.onnx';
+/**
+ * REFINED FILLS (settings.refine, paintCore.refineFill): the second boundary model, trained on 2000
+ * training-split ABC parts instead of 40 (runs/edge2), and the fill-refinement model (runs/refine1)
+ * inside a minimum cut. Held out, clean single fills 78/65/69/48 -> 87/81/82/54% (OCCT / NURBS / gmsh /
+ * game-style) and auto-paint area clean 75.3/75.3/76.0/65.8 -> 81.8/82.5/85.4/70.3%.
+ */
+const EDGE_MODEL_V2 = 'models/edge-boundary-v2.onnx';
+const REFINER = 'models/fill-refiner.onnx';
+/** Plane fills keep the 2 degree crease instead: with the wall they measured worse, not better. */
+const EDGE_WALL_TYPES = ['cylinder', 'cone', 'sphere', 'torus'];
 import { buildMeshModel, bodyEdges, outline } from './meshModel.js';
 import { createRenderer } from './renderer.js';
 import { GroupStore, typeLabel } from './groups.js';
@@ -46,10 +61,23 @@ const METHODS = [
   { id: 'plain', label: 'No model' },
 ];
 const TYPES = ['auto', 'plane', 'cylinder', 'cone', 'sphere', 'torus'];
-// v6feat first: best of 13 models on the 80-part fill benchmark (studio type 52% clean over OCCT,
-// NURBS and gmsh against 49% for the next best; 69/66/68% with simpler faces painted first,
-// against s1's 60/51/58%). `features: 'v6'` makes paintTool build the extended inputs.
+// The toolbar's surface buttons: the types, then a freeform fill (no primitive: the export fits a B-spline).
+const FILL_TYPES = [...TYPES, 'freeform'];
+// A freeform fill floods the unpainted triangles to 30-degree creases. One click per true freeform face
+// of the user's parts (scratchpad fffill.mjs): whole and clean on 20/20 Star faces at every resolution
+// and 28/28 Cake Pan faces (coarse, medium); the coarse Ornament 8/14, 14/14 once its neighbours are
+// painted; the Fencepost's twisted faces join tangentially, so a click takes three (one B-spline does).
+// Not widened on "low-poly" meshes: the Star reads as one (step 50, its faces flat to 1 degree inside),
+// and at 80 degrees a click flooded 10 of its 20 faces. A curvature-jump wall cut every face short
+// (Star 29-84% covered).
+const FREEFORM_CREASE = 30;
+// v7gnn first: v6feat's recipe plus six rounds of message passing over the patch (ml/model.py
+// MeshConv; the runner feeds it the patch graph). Validation IoU 0.821 -> 0.859. With refined fills,
+// held-out auto-paint area clean 85.6/84.7/86.6/72.3% against 81.8/82.5/85.4/70.3% for v6feat
+// (test/autoSeed.mjs --refine --crf, 40 odd ABC parts). `features: 'v6'` makes paintTool build the
+// extended inputs; v6feat was the best of 13 models before it.
 const MODELS = [
+  { url: 'models/seedfill-v7gnn.onnx', label: 'v7 (message passing)', features: 'v6' },
   { url: 'models/seedfill-v6feat.onnx', label: 'v6 (crease + seed fits)', features: 'v6' },
   { url: 'models/seedfill-s1nogmsh.onnx', label: 's1 (CAD exports)' },
   { url: 'models/seedfill-s3all.onnx', label: 's3 (all meshers)' },
@@ -61,16 +89,37 @@ ui.registerIcons({
   bucket: '<path d="M8.4 1.8 16 9.4l-6.2 6.2-7.6-7.6 3-3-1.1-1.1 1.2-1.2 1.1 1.1zM4.5 8l5.3 5.3L13.7 9.4z" fill-rule="evenodd" /><path d="M16.6 12.2s1.9 2.3 1.9 3.6a1.9 1.9 0 0 1-3.8 0c0-1.3 1.9-3.6 1.9-3.6z" />',
   brush: '<path d="M17.8 2.2c.7.7-5.2 8.4-6.6 9.8L8 8.8c1.4-1.4 9.1-7.3 9.8-6.6zM6.9 10.1l3 3c-.3 2.8-2.5 5-7.9 4.7 2-1.5 1-6 4.9-7.7z" />',
   cone: '<path d="M10 1.6 17 15.2a7 2.8 0 0 1-14 0zm0 4.4-4.6 9.1a4.6 1.4 0 0 0 9.2 0z" fill-rule="evenodd" />',
+  // A rippled sheet: a freeform (B-spline) fill.
+  freeform: '<path d="M2 6.5c2.2-2.6 4.4-2.6 6.6 0s4.4 2.6 6.6 0L18 5.2v2.3c-2.2 2.6-4.4 2.6-6.6 0s-4.4-2.6-6.6 0L2 8.8z" /><path d="M2 12.2c2.2-2.6 4.4-2.6 6.6 0s4.4 2.6 6.6 0l2.8-1.3v2.3c-2.2 2.6-4.4 2.6-6.6 0s-4.4-2.6-6.6 0L2 14.5z" />',
   // A four-point spark: the model picks the surface.
   auto: '<path d="M8 1.5c.5 3.6 2.4 5.5 6 6-3.6.5-5.5 2.4-6 6-.5-3.6-2.4-5.5-6-6 3.6-.5 5.5-2.4 6-6zM15 11c.3 2 1.3 3 3.3 3.3-2 .3-3 1.3-3.3 3.3-.3-2-1.3-3-3.3-3.3 2-.3 3-1.3 3.3-3.3z" />',
+  // A wand with sparks: auto-paint.
+  wand: '<path d="M2.5 16.4 12.9 6l1.6 1.6L4.1 18z" /><path d="M14 4.9l1.3-1.3 1.6 1.6-1.3 1.3zM8.6 1.5l.6 1.5 1.5.6-1.5.6-.6 1.5-.6-1.5-1.5-.6 1.5-.6zM16.4 9.6l.5 1.2 1.2.5-1.2.5-.5 1.2-.5-1.2-1.2-.5 1.2-.5z" />',
 });
 
 const settings = {
   tool: 'fill',
-  method: 'hyp',
+  // 'model' (the model's region -> fitter), as auto-paint uses. Through the studio's own path with the
+  // type chosen automatically (test/growEval.mjs studio:*, 40 held-out parts, v7 + refined fills) it
+  // is clean on 83/76/77/51% of clicks against 76/69/76/48% for 'hyp' (the model's surface -> fitter).
+  method: 'model',
   type: 'auto',
   model: MODELS[0].url,
   brushPx: 12,
+  // The fill auto-paint uses per seed; 'model' is what test/autoSeed.mjs measured.
+  autoMethod: 'model',
+  // Auto-paint grows with the curvature-jump wall (autoPaint.AUTO_TANGENT). Off by default: it
+  // recovers more area cleanly on ABC parts but splits faces into many more groups (the watch stand
+  // goes from 66 to 277 new groups), each a merge for the user. Fill menu toggle.
+  autoTangent: false,
+  // Stop fills at the learned face boundary (js/edgeWall.js). Measured on held-out parts with the
+  // true type declared: clean fills 62 -> 69% OCCT, 48 -> 58% gmsh, with spill 32 -> 17% and
+  // 49 -> 34%. Fill menu toggle.
+  edgeWall: true,
+  // Refined fills: boundary model v2, then the refiner inside a minimum cut (paintCore.refineFill).
+  // Confirmed through the studio's own path on 40 held-out ABC parts (v7, type chosen automatically):
+  // clean single fills 75/63/65/46 -> 83/76/77/51% OCCT / NURBS / gmsh / game-style. Fill menu toggle.
+  refine: true,
   perspective: ui.LIGHTING.perspectiveByDefault,
   edges: true,
   smooth: false,
@@ -123,17 +172,20 @@ const toolbar = ui.createToolbar(shell.toolbar, [
   { kind: 'tool', id: 'redo', icon: 'redo', title: 'Redo (Ctrl+Y)', onClick: () => redo() },
   { kind: 'separator' },
   // The surface a fill paints with: one button each, since it changes stroke to stroke.
-  ...TYPES.map((type, i) => ({
+  ...FILL_TYPES.map((type, i) => ({
     kind: 'toggle',
     id: `type-${type}`,
-    icon: type === 'auto' ? 'auto' : TYPE_ICONS[type],
+    icon: type === 'auto' ? 'auto' : type === 'freeform' ? 'freeform' : TYPE_ICONS[type],
     title: type === 'auto'
       ? `Model picks the surface from the seed (${i + 1})`
-      : `Fill as ${typeLabel(type).toLowerCase()} (${i + 1})`,
+      : type === 'freeform'
+        ? `Freeform fill: grows to creases; exported as a B-spline (${i + 1})`
+        : `Fill as ${typeLabel(type).toLowerCase()} (${i + 1})`,
     pressed: settings.type === type,
     onClick: () => setType(type),
   })),
   { kind: 'separator' },
+  { kind: 'tool', id: 'autopaint', icon: 'wand', title: 'Auto-paint every unpainted face (P); Esc stops', onClick: () => runAutoPaint() },
   { kind: 'split', id: 'fill-options', icon: 'surface', title: 'Fill method and model', onClick: () => openFillMenu(), menu: () => fillMenu() },
   { kind: 'spacer' },
   { kind: 'labelled', id: 'export', icon: 'build', label: 'Export STEP', accent: true, onClick: () => exportStep() },
@@ -152,6 +204,9 @@ let mesh = null;
 let active = null;
 let hoverKey = null;
 let stroke = null;
+/** The auto-paint in progress: { stop } — Esc sets stop. */
+let autoRun = null;
+let lastEdgeBuild = 0;
 let paintPromise = null;
 let prepared = null;
 let needsRender = true;
@@ -164,6 +219,7 @@ window.studio = {
   get active() { return active; },
   get stroke() { return stroke; },
   get prepared() { return prepared; },
+  get autoRun() { return autoRun; },
   settings,
   camera,
 };
@@ -175,7 +231,7 @@ const dpr = () => window.devicePixelRatio || 1;
 // ── loading ───────────────────────────────────────────────────────────────────
 
 async function openFile(file) {
-  if (stroke) { say('Finish or cancel (Esc) the stroke before opening another mesh', true); return; }
+  if (stroke || autoRun) { say('Finish or cancel (Esc) the stroke or auto-paint before opening another mesh', true); return; }
   say(`Opening ${file.name}…`);
   try {
     const loaded = await loadModelFile(file);
@@ -184,7 +240,8 @@ async function openFile(file) {
     const model = buildMeshModel(geometry.attributes.position.array);
     const colours = new Float32Array(model.count * 9);
     for (let i = 0; i < colours.length; i += 3) colours.set(UNPAINTED, i);
-    mesh = { model, geometry, name: file.name.replace(/\.[^.]+$/, ''), store: new GroupStore(model.count), colours };
+    mesh = { model, geometry, name: file.name.replace(/\.[^.]+$/, ''), store: new GroupStore(model.count), colours,
+             offset: loaded.offset ?? [0, 0, 0] };   // the loader centred the mesh; the export moves it back
     active = null;
     hoverKey = null;
     paintPromise = null;
@@ -200,7 +257,12 @@ async function openFile(file) {
     refreshPanel();
     say(`${file.name}: ${model.count.toLocaleString()} triangles`);
     // Adjacency and curvature take a moment on a big mesh: start now so the first stroke doesn't wait.
-    setTimeout(() => preparePaint().catch(() => {}), 50);
+    // Seed scores for auto-paint too, so the button starts at once.
+    const opened = mesh;
+    setTimeout(() => preparePaint()
+      .then(() => edgeScoresFor(opened))
+      .then(() => coherenceFor(opened))
+      .catch(() => {}), 50);
   } catch (error) {
     console.error(error);
     say(`Could not open ${file.name}: ${error.message}`, true);
@@ -294,6 +356,7 @@ function devicePoint(event) {
 function beginStroke(event) {
   if (!mesh) return;
   if (stroke) { say('Still filling the last stroke (Esc cancels it)', true); return; }
+  if (autoRun) { say('Auto-painting (Esc stops it)', true); return; }
   const point = devicePoint(event);
   const mode = strokeMode();
   mesh.store.begin();
@@ -307,12 +370,15 @@ function beginStroke(event) {
   applyBrush(point);
 }
 
+/** A group's stored type for a surface button: null (untyped: freeform at export) for the model and freeform. */
+const groupTypeFor = (type) => (type === 'auto' || type === 'freeform' ? null : type);
+
 /** The stroke's group, settled by the first triangle it lands on: that triangle's group, or a new one. */
 function strokeGroup(t) {
   if (stroke.gid === null) {
     const { store } = mesh;
     const owner = store.owner[t];
-    stroke.gid = owner >= 0 ? owner : store.create(settings.type === 'auto' ? null : settings.type).id;
+    stroke.gid = owner >= 0 ? owner : store.create(groupTypeFor(settings.type)).id;
     stroke.anchor = t;
     setActive(stroke.gid);
   }
@@ -365,16 +431,24 @@ async function pump() {
       const group = mesh.store.groups.get(s.gid);
       say(`Filling${s.queue.length ? ` (${s.queue.length} more queued)` : ''}…`);
       // A chosen surface button wins, and retypes a group the stroke extends. On the model
-      // button a group keeps the type its first fill settled.
-      const type = settings.type !== 'auto' ? settings.type : group.type ?? 'auto';
+      // button a group keeps the type its first fill settled: an untyped group that already has
+      // triangles (a freeform fill, facet brush or auto-paint's freeform join) grows freeform.
+      const type = settings.type !== 'auto' ? settings.type
+        : group.type ?? (mesh.store.count(s.gid) ? 'freeform' : 'auto');
       if (!strokeZone(s, type, paintMesh.adjacency).has(seed)) { s.blocked++; continue; }
-      const out = await tool.paintAt(seed, paintMesh, {
-        method: settings.method, type, modelUrl: settings.model, taken: takenMask(s.gid),
-        extended: MODELS.find((m) => m.url === settings.model)?.features === 'v6',
-      });
+      let out;
+      if (type === 'freeform') out = freeformFill(seed, paintMesh);
+      else {
+        const refineUrl = await refineUrlFor(mesh);
+        out = await tool.paintAt(seed, paintMesh, {
+          method: settings.method, type, modelUrl: settings.model, taken: takenMask(s.gid),
+          extended: MODELS.find((m) => m.url === settings.model)?.features === 'v6',
+          grow: growOptions(), refineUrl,
+        });
+      }
       if (s.cancelled) break;
-      if (settings.type !== 'auto') group.type = settings.type;
-      else if (!group.type && out.fitter) group.type = out.fitter;
+      if (settings.type !== 'auto') group.type = groupTypeFor(settings.type);
+      else if (!group.type && out.fitter && type !== 'freeform') group.type = out.fitter;
       let claimed = 0;
       for (const t of out.region) if (mesh.store.owner[t] === -1 && mesh.store.assign(t, s.gid)) claimed++;
       if (mesh.store.owner[seed] === -1 && mesh.store.assign(seed, s.gid)) claimed++;
@@ -401,7 +475,7 @@ async function pump() {
  * triangles or its own group's. Recomputed only when the surface type, and so the angle, changes.
  */
 function strokeZone(s, type, adjacency) {
-  const deg = type && type !== 'auto' ? creaseFor(CREASE_BARRIER, type) : 30;
+  const deg = creaseOf(type, adjacency);
   if (s.zone && s.zone.deg === deg) return s.zone.set;
   const { owner } = mesh.store;
   const set = new Set(s.anchor >= 0 ? [s.anchor] : []);
@@ -418,6 +492,201 @@ function strokeZone(s, type, adjacency) {
   }
   s.zone = { deg, set };
   return set;
+}
+
+/** The crease a fill of `type` stops at (degrees). */
+function creaseOf(type, adjacency) {
+  if (!type || type === 'auto') return 30;
+  if (type === 'freeform') return FREEFORM_CREASE;
+  return creaseFor(creaseTableFor(adjacency), type);
+}
+
+/**
+ * A freeform fill: the unpainted triangles reachable from `seed` without crossing a crease. No
+ * primitive is fitted; the group exports as a B-spline (js/freeformFit.js).
+ */
+function freeformFill(seed, paintMesh) {
+  const t0 = performance.now();
+  const { adjacency } = paintMesh;
+  const { owner } = mesh.store;
+  const deg = creaseOf('freeform', adjacency);
+  const region = new Set([seed]);
+  const stack = [seed];
+  while (stack.length) {
+    const t = stack.pop();
+    for (const e of adjacency.get(t) || []) {
+      const nb = e.neighbor;
+      if (region.has(nb) || owner[nb] !== -1 || e.angle >= deg) continue;
+      region.add(nb);
+      stack.push(nb);
+    }
+  }
+  return { region, fitter: null, ms: performance.now() - t0, notes: [] };
+}
+
+// ── auto-paint ────────────────────────────────────────────────────────────────
+
+/**
+ * Score every edge of a loaded mesh with the boundary model, once, and build the wall growth uses.
+ * A failure (no model file, no runtime) leaves `target.edgeWall` unset and fills behave as before.
+ */
+function edgeScoresFor(target) {
+  // Scores live on the adjacency itself, so a switch of boundary model re-scores the mesh. Jobs run
+  // one after another: the scores in place are always those of the last model asked for.
+  const url = settings.refine ? EDGE_MODEL_V2 : EDGE_MODEL;
+  if (!target.edgeScores || target.edgeUrl !== url) {
+    target.edgeUrl = url;
+    const previous = target.edgeScores ?? Promise.resolve();
+    target.edgeScores = previous.catch(() => {}).then(() => preparePaint()).then(async ({ tool, mesh: paintMesh }) => {
+      const { runner, meta } = await tool.edgeScorerFor(url);
+      const { edges, ms } = await annotateEdges(paintMesh.facets, paintMesh.adjacency, runner, meta.columns);
+      const logit = meta.thresholds['fpr0.02'].logit;
+      target.edgeWall = edgeWall(1 / (1 + Math.exp(-logit)), EDGE_WALL_TYPES);
+      console.log(`edge boundaries (${url}): ${edges} edges in ${ms.toFixed(0)} ms`);
+      return target.edgeWall;
+    });
+    target.edgeScores.catch((error) => console.warn('no learned face boundaries:', error.message));
+  }
+  return target.edgeScores;
+}
+
+/**
+ * The refiner for this fill, when refined fills are on and the mesh's edges carry the second boundary
+ * model's scores (the refiner reads them). Waits for scoring that is still running.
+ */
+async function refineUrlFor(target) {
+  if (!settings.refine) return null;
+  try {
+    await edgeScoresFor(target);
+  } catch {
+    return null;
+  }
+  return target.edgeUrl === EDGE_MODEL_V2 ? REFINER : null;
+}
+
+/** Growth options shared by strokes and auto-paint: the learned wall when it is on and ready. */
+function growOptions() {
+  return settings.edgeWall && mesh?.edgeWall ? { wall: mesh.edgeWall } : {};
+}
+
+/** Per-facet seed coherence for a loaded mesh (js/autoPaint.js), computed once and cached. */
+function coherenceFor(target) {
+  if (!target.coherence) {
+    target.coherence = preparePaint().then(({ mesh: paintMesh }) => coherentScores(paintMesh.facets, paintMesh.adjacency));
+  }
+  return target.coherence;
+}
+
+/**
+ * Fill every unpainted face, best seed first, as new groups. Existing groups are never touched, so
+ * this works as a first pass or after the user has painted some faces. One undo step; Esc stops
+ * and keeps what was painted.
+ */
+async function runAutoPaint() {
+  if (!mesh) return;
+  if (stroke || autoRun) { say('Finish or cancel (Esc) the stroke or auto-paint first', true); return; }
+  const current = mesh;
+  const { store } = current;
+  autoRun = { stop: false };
+  toolbar.setPressed('autopaint', true);
+  setActive(null);
+  setHover(null);
+  let editOpen = false;
+  try {
+    say('Auto-paint: preparing…');
+    const { tool, mesh: paintMesh } = await preparePaint();
+    say('Auto-paint: scoring seeds…');
+    const order = seedOrder(await coherenceFor(current), paintMesh.facets);
+    if (autoRun.stop || mesh !== current) return;
+    const extended = MODELS.find((m) => m.url === settings.model)?.features === 'v6';
+    const refineUrl = await refineUrlFor(current);
+    const created = [];
+    const uiClock = { panel: 0, yield: performance.now() };
+    store.begin();
+    editOpen = true;
+    const result = await autoPaint({
+      facets: paintMesh.facets,
+      order,
+      owner: store.owner,
+      fill: (seed, taken) => tool.paintAt(seed, paintMesh, {
+        method: settings.autoMethod, type: 'auto', modelUrl: settings.model, taken, extended, reportFit: false,
+        grow: { ...growOptions(), ...(settings.autoTangent ? { tangent: AUTO_TANGENT } : {}) }, refineUrl,
+      }),
+      onSegment: async (claim, out) => {
+        const group = store.create(out.fitter ?? null);
+        for (const t of claim) store.assign(t, group.id);
+        created.push(group.id);
+        flushChanged();
+        // On a clock, not per group: the panel holds a row per group and a yield costs a timer
+        // tick, and a low-poly mesh makes thousands of groups.
+        const now = performance.now();
+        if (now - uiClock.panel > 750) { refreshPanel(); uiClock.panel = now; }
+        if (now - uiClock.yield > 40) {
+          await new Promise((resolve) => setTimeout(resolve, 0));   // let a frame show the new groups
+          uiClock.yield = performance.now();
+        }
+        return group.id;
+      },
+      // Every claim is kept: a flat rectangle is often exactly two triangles, and dropping groups
+      // under three triangles threw away real faces (area clean 78 -> 69% on OCCT meshes).
+      minKeep: 1,
+      // Unpainted islands of up to 8 triangles left inside a face join the neighbouring new group.
+      adjacency: paintMesh.adjacency,
+      absorbUpTo: 8,
+      onAbsorb: async (island, id) => {
+        for (const t of island) store.assign(t, id);
+        flushChanged();
+      },
+      onDiscard: async (claim, id) => {
+        for (const t of claim) store.assign(t, -1);
+        created.splice(created.indexOf(id), 1);
+        flushChanged();
+      },
+      shouldStop: () => autoRun.stop || mesh !== current,
+      onProgress: ({ segments, free }) => say(`Auto-paint: ${segments} groups · ${free.toLocaleString()} triangles left (Esc stops)`),
+    });
+    // Freeform faces back into one group each (js/freeformMerge.js): auto-paint knows only primitives and
+    // carves a B-spline face into many. Only this run's groups, and only on a part made mostly of such
+    // faces; the joined groups stay untyped, so the export fits them a B-spline. Part of the undo step.
+    say('Auto-paint: joining freeform pieces…');
+    const joined = Int32Array.from(store.owner);
+    const { freeform } = tool.freeformMerge(joined, paintMesh.facets, paintMesh.adjacency, { only: new Set(created) });
+    for (let t = 0; t < joined.length; t++) if (joined[t] !== store.owner[t]) store.assign(t, joined[t]);
+    flushChanged();
+    // One pass over the mesh for every new group's triangles, not one pass per group.
+    const byGroup = new Map(created.map((id) => [id, new Set()]));
+    for (let t = 0; t < store.owner.length; t++) byGroup.get(store.owner[t])?.add(t);
+    for (const [id, tris] of byGroup) if (!tris.size) byGroup.delete(id);
+    // Each finished group's export type (paintCore.typeFinalGroup): untyped groups get one, and a group
+    // a simpler or truer primitive fits exactly takes it; freeform groups stay untyped.
+    say('Auto-paint: typing groups…');
+    for (const [id, tris] of byGroup) {
+      const group = store.groups.get(id);
+      if (freeform.has(id)) { group.type = null; refit(id, tris); continue; }
+      const typed = tool.typeFinalGroup(tris, paintMesh.facets, group.type);
+      if (typed.changed) group.type = typed.type;
+      refit(id, tris);
+      const now = performance.now();
+      if (now - uiClock.yield > 40) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        uiClock.yield = performance.now();
+      }
+    }
+    store.commit(`Auto-paint ${result.segments} groups`);
+    editOpen = false;
+    const left = result.free > 0 ? ` · ${result.free.toLocaleString()} triangles left unpainted` : '';
+    const ff = freeform.size ? ` (${freeform.size} freeform, joined from ${result.segments})` : '';
+    say(`Auto-paint ${result.stopped ? 'stopped' : 'done'}: ${byGroup.size} new groups${ff}${left}`);
+  } catch (error) {
+    console.error(error);
+    if (editOpen) { store.commit('Auto-paint (interrupted)'); editOpen = false; }
+    say(`Auto-paint failed: ${error.message}`, true);
+  } finally {
+    autoRun = null;
+    toolbar.setPressed('autopaint', false);
+    edgesDirty = true;
+    refreshPanel();
+  }
 }
 
 /** Triangles painted into any group but `gid`: the model's patch and the fill walk around them. */
@@ -480,12 +749,12 @@ function finishStroke() {
 }
 
 /** Refit a group's whole region with its type, for the panel. Skipped until the fill tool has loaded. */
-function refit(id) {
+function refit(id, tris = null) {
   const { store } = mesh;
   const group = store.groups.get(id);
   if (!group || !prepared) return;
   if (!group.type || !store.count(id)) { group.fit = null; return; }
-  const result = fitRegionAs(group.type, store.triangles(id), prepared.mesh.facets);
+  const result = fitRegionAs(group.type, tris ?? store.triangles(id), prepared.mesh.facets);
   group.fit = result.params
     ? { params: result.params, relResidual: result.relResidual }
     : { reason: result.reason ?? 'the fit failed' };
@@ -525,7 +794,7 @@ function setActive(id) {
 /** A change to groups outside a stroke, as one undo step. */
 function editGroups(label, change) {
   if (!mesh) return;
-  if (stroke) { say('Finish or cancel (Esc) the stroke first', true); return; }
+  if (stroke || autoRun) { say('Finish or cancel (Esc) the stroke or auto-paint first', true); return; }
   const { store } = mesh;
   store.begin();
   const touched = change(store) ?? [];
@@ -580,7 +849,7 @@ function groupMenu(id, event) {
 }
 
 function undo() {
-  if (!mesh || stroke) return;
+  if (!mesh || stroke || autoRun) return;
   const label = mesh.store.undo();
   if (!label) return;
   afterHistory();
@@ -588,7 +857,7 @@ function undo() {
 }
 
 function redo() {
-  if (!mesh || stroke) return;
+  if (!mesh || stroke || autoRun) return;
   const label = mesh.store.redo();
   if (!label) return;
   afterHistory();
@@ -605,38 +874,135 @@ function afterHistory() {
 
 // ── export ────────────────────────────────────────────────────────────────────
 
-/** Fit every group with its painted type and build the STEP solid, as the main app's export does. */
+/**
+ * Build the STEP solid from the painted groups with the topo knitter (js/knit, the port of
+ * ml/solid_rebuild.py): the B-rep's topology from the mesh, so neighbouring faces share their edges by
+ * construction, each group's fitted surface, the kernel-judged repair loop, and flat facets only where
+ * the analytic build cannot close. It replaces the sewing builder, which built every face on its own and
+ * closed none of 31 fully analytic test parts. Runs in a worker: builds take seconds to minutes.
+ */
 async function exportStep() {
   if (!mesh) return;
-  if (stroke) { say('Finish or cancel (Esc) the stroke first', true); return; }
+  if (stroke || autoRun) { say('Finish or cancel (Esc) the stroke or auto-paint first', true); return; }
   const { store, model, geometry, name } = mesh;
   const groups = store.list();
   if (!groups.length) { say('Paint at least one face group first', true); return; }
   toolbar.setDisabled('export', 'Exporting…');
   try {
-    const [{ classifyGroupAsGauss }, builder] = await Promise.all([import('../surfaceFitter.js'), import('../brepBuilder.js')]);
+    let facets = prepared?.mesh?.facets;
+    if (!facets) {
+      const [{ buildFacets }, { attachCurvature }] = await Promise.all([import('../meshCore.js'), import('../curvature.js')]);
+      const geo = geometry.index ? geometry.toNonIndexed() : geometry;
+      const P = Float64Array.from(geo.attributes.position.array);
+      facets = buildFacets(P);
+      attachCurvature(P, facets);
+    }
     say(`Fitting ${groups.length} groups…`);
-    const payload = groups.map((group) => {
-      const part = { triangleIndices: [...store.triangles(group.id)] };
-      part.surface = classifyGroupAsGauss(group.type ?? 'nurbs', part, geometry);
-      return part;
-    });
-    const content = await builder.buildAndExportSTEP(payload, geometry, { schema: 'AP214' },
-      (text, pct) => say(`${text} ${Math.round(pct)}%`));
-    builder.downloadSTEP(content, `${name}.stp`);
-    const unpainted = model.count - store.painted;
-    const failed = payload.filter((p) => p.surface.degenerate).length;
-    say([
-      `Exported ${name}.stp from ${groups.length} groups`,
-      failed ? `${failed} could not take their type and went out as freeform patches` : '',
-      unpainted ? `${unpainted.toLocaleString()} unpainted triangles were left out` : '',
-    ].filter(Boolean).join(' · '), failed > 0 || unpainted > 0);
+    const surfaces = [];
+    for (const group of groups) {
+      if (!group.type) continue;                  // no analytic surface: the knitter makes it facets
+      const fit = group.fit?.params ? group.fit : fitRegionAs(group.type, store.triangles(group.id), facets);
+      if (fit.params) surfaces.push([group.id, [group.type, fit.params]]);
+    }
+    // The STEP goes where the file's mesh was: the loader centred it for the view, so the centre goes
+    // back on the positions, and on every fitted surface (all are anchored by points, never directions).
+    const [ox, oy, oz] = mesh.offset;
+    const positions = Float64Array.from(facets.positions, (v, i) => v + (i % 3 === 0 ? ox : i % 3 === 1 ? oy : oz));
+    const payload = { positions, labels: Int32Array.from(store.owner), surfaces: surfaces.map(([id, [type, p]]) => [id, [type, shifted(p, mesh.offset)]]) };
+    let result;
+    try {
+      result = await knitInWorker({ ...payload, options: { deadline: EXPORT_DEADLINE_S } }, (text) => say(text), EXPORT_HARD_STOP_S);
+    } catch (error) {
+      if (error.name !== 'TimeoutError') throw error;
+      // A single OCCT repair on badly fitting surfaces can run for most of an hour and cannot be
+      // interrupted, so the worker is stopped and a fresh one exports the mesh itself.
+      say(`The surfaces took over ${Math.round(EXPORT_HARD_STOP_S / 60)} minutes to join; exporting the mesh as a faceted solid…`, true);
+      result = await knitInWorker({ ...payload, options: { mode: 'faceted' } }, (text) => say(text));
+      result.report.timedOut = true;
+    }
+    const { step, report } = result;
+    if (!step) throw new Error('no shape came out of the build');
+    downloadStep(step, `${name}.stp`);
+    say(exportSummary(`${name}.stp`, report, model.count - store.painted), report.tier !== 'analytic');
   } catch (error) {
     console.error(error);
     say(`Export failed: ${error.message}`, true);
   } finally {
     refreshPanel();
   }
+}
+
+/** Fitted surface params moved by `d`: every point-valued param (origin, axisPoint, apex, center). */
+function shifted(p, d) {
+  const out = { ...p };
+  for (const k of ['origin', 'axisPoint', 'apex', 'center']) if (p[k]) out[k] = [p[k][0] + d[0], p[k][1] + d[1], p[k][2] + d[2]];
+  return out;
+}
+
+// The knitter stops starting repair builds and facet tiers after EXPORT_DEADLINE_S; a build already
+// running is stopped with its worker at EXPORT_HARD_STOP_S. Measured without them: 26 min (Fencepost,
+// 54k triangles) and 49 min (Cake Pan, 23k) before a faceted result, both badly typed freeform parts.
+const EXPORT_DEADLINE_S = 150;
+const EXPORT_HARD_STOP_S = 240;
+
+/** js/knit/worker.js, once per export (the kernel's memory goes with it); rejects with TimeoutError after `limitS`. */
+function knitInWorker(payload, onStatus, limitS = Infinity) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL('../knit/worker.js', import.meta.url), { type: 'module' });
+    const timer = Number.isFinite(limitS) ? setTimeout(() => {
+      worker.terminate();
+      const error = new Error(`the solid build took longer than ${limitS} s`);
+      error.name = 'TimeoutError';
+      reject(error);
+    }, limitS * 1000) : null;
+    worker.onmessage = ({ data }) => {
+      if (data.type === 'status') onStatus(data.text);
+      else if (data.type === 'progress') {
+        onStatus(data.freeform ? `Fitting freeform surfaces… ${data.freeform} of ${data.of}` : `Building the solid… attempt ${data.builds}`);
+      }
+      else {
+        clearTimeout(timer);
+        worker.terminate();
+        if (data.type === 'done') resolve(data);
+        else reject(new Error(data.message));
+      }
+    };
+    worker.onerror = (event) => { clearTimeout(timer); worker.terminate(); reject(new Error(event.message || 'the export worker failed')); };
+    worker.postMessage(payload);
+  });
+}
+
+/** What the export holds, said plainly: every face analytic, or how much went out as facets, or why not a solid. */
+function exportSummary(file, report, unpainted) {
+  const pct = (x) => `${(100 * x).toFixed(x < 0.01 ? 1 : 0)}%`;
+  const parts = [];
+  if (report.tier === 'analytic') parts.push(`Exported ${file}: a closed solid, every face on its fitted surface`);
+  else if (report.tier === 'hybrid' || report.tier === 'planar') {
+    parts.push(`Exported ${file}: a closed solid; ${report.facetTris.toLocaleString()} triangles (${pct(report.facetArea)} of the area) ` +
+      `went out as flat facets where ${report.tier === 'planar' ? 'the curved' : 'their'} surfaces would not join`);
+  } else if (report.tier === 'faceted') {
+    parts.push(report.timedOut
+      ? `Exported ${file} as the mesh, a faceted solid: joining the fitted surfaces took too long`
+      : `Exported ${file}: the surfaces would not join into a solid, so this is the mesh as a faceted solid`);
+  } else {
+    parts.push(`Exported ${file}, but it is NOT a closed solid` +
+      (report.free_edges ? `: ${report.free_edges.toLocaleString()} open edges` : '') +
+      (report.bestTier === 'faceted' ? ' - the mesh itself is open, so no surfaces can close it' : ''));
+  }
+  if (unpainted > 0) parts.push(`${unpainted.toLocaleString()} unpainted triangles went out as facets`);
+  parts.push(`${report.secs} s`);
+  return parts.join(' · ');
+}
+
+function downloadStep(text, filename) {
+  const url = URL.createObjectURL(new Blob([text], { type: 'application/octet-stream' }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
 }
 
 // ── panel, toolbar, status ────────────────────────────────────────────────────
@@ -693,13 +1059,15 @@ function refreshPanel() {
   } else {
     shell.setStatus('');
   }
-  shell.hint.textContent = `Shift: facets · Alt: erase · [ ]: brush ${settings.brushPx}px`;
+  shell.hint.textContent = `P: auto-paint · Shift: facets · Alt: erase · [ ]: brush ${settings.brushPx}px`;
 }
 
 function setType(type) {
   settings.type = type;
-  for (const t of TYPES) toolbar.setPressed(`type-${t}`, t === type);
-  say(type === 'auto' ? 'Fill: the model picks the surface' : `Fill as ${typeLabel(type).toLowerCase()}`);
+  for (const t of FILL_TYPES) toolbar.setPressed(`type-${t}`, t === type);
+  say(type === 'auto' ? 'Fill: the model picks the surface'
+    : type === 'freeform' ? 'Freeform fill: grows to creases; the export fits a B-spline'
+      : `Fill as ${typeLabel(type).toLowerCase()}`);
 }
 
 function fillMenu() {
@@ -710,6 +1078,35 @@ function fillMenu() {
   return [
     { id: 'method', label: 'Fill method', children: METHODS.map((m) => ({ id: m.id, label: m.label, checked: settings.method === m.id, onSelect: pick('method', m.id) })) },
     { id: 'model', label: 'Model', children: MODELS.map((m) => ({ id: m.url, label: m.label, checked: settings.model === m.url, onSelect: pick('model', m.url) })) },
+    { separator: true },
+    {
+      id: 'edgeWall', label: 'Stop fills at learned face borders', checked: settings.edgeWall,
+      onSelect: () => {
+        settings.edgeWall = !settings.edgeWall;
+        say(settings.edgeWall
+          ? 'Fills stop at the learned face borders'
+          : 'Fills use the crease barrier only');
+      },
+    },
+    {
+      id: 'refine', label: 'Refined fills (second pass + minimum cut)', checked: settings.refine,
+      onSelect: () => {
+        settings.refine = !settings.refine;
+        if (mesh) edgeScoresFor(mesh);
+        say(settings.refine
+          ? 'Fills get a second pass: boundary model v2, the refiner and a minimum cut'
+          : 'Fills use the first pass only, with boundary model v1');
+      },
+    },
+    {
+      id: 'autoTangent', label: 'Auto-paint stops at curvature changes', checked: settings.autoTangent,
+      onSelect: () => {
+        settings.autoTangent = !settings.autoTangent;
+        say(settings.autoTangent
+          ? 'Auto-paint stops at curvature changes: cleaner faces, many more groups to merge'
+          : 'Auto-paint grows across curvature changes');
+      },
+    },
   ];
 }
 
@@ -848,7 +1245,7 @@ window.addEventListener('keydown', (event) => {
   if (mod && key === 'z') { event.preventDefault(); if (event.shiftKey) redo(); else undo(); }
   else if (mod && key === 'y') { event.preventDefault(); redo(); }
   else if (mod && key === 'o') { event.preventDefault(); fileInput.click(); }
-  else if (event.key === 'Escape') cancelStroke();
+  else if (event.key === 'Escape') { if (autoRun) autoRun.stop = true; else cancelStroke(); }
   else if (event.key === ' ') { event.preventDefault(); setActive(null); }
   else if ((event.key === 'Delete' || event.key === 'Backspace') && active !== null) deleteGroup(active);
   else if (event.key === '[' || event.key === ']') {
@@ -856,7 +1253,8 @@ window.addEventListener('keydown', (event) => {
     refreshPanel();
     drawCursor();
   } else if (key === 'f' && !mod) zoomFit();
-  else if (!mod && event.key >= '1' && event.key <= String(TYPES.length)) setType(TYPES[Number(event.key) - 1]);
+  else if (key === 'p' && !mod) runAutoPaint();
+  else if (!mod && event.key >= '1' && event.key <= String(FILL_TYPES.length)) setType(FILL_TYPES[Number(event.key) - 1]);
   else if (event.key === 'Alt') event.preventDefault();   // keep Alt from reaching a browser menu
 });
 window.addEventListener('keyup', (event) => {
@@ -881,7 +1279,9 @@ function frame(now) {
     needsRender = true;
     drawCursor();
   }
-  if (edgesDirty && mesh) {
+  // While auto-paint runs, edges are rebuilt at most twice a second rather than after every fill.
+  if (edgesDirty && mesh && (!autoRun || now - lastEdgeBuild > 500)) {
+    lastEdgeBuild = now;
     const { model, store } = mesh;
     renderer.setBands('edges', bodyEdges(model, store.owner));
     renderer.setBands('active', active !== null && store.count(active)

@@ -28,7 +28,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import { buildFacets, buildAdjacency } from '../js/meshCore.js';
-import { buildFeatures, kRing, N_FEATURES, N_FEATURES_V6 } from '../js/seedNet.js';
+import { buildFeatures, kRing, N_FEATURES, N_FEATURES_V6, patchNeighbours } from '../js/seedNet.js';
 import { EXT_FEATURE_NAMES } from '../js/seedFeatures.js';
 import { attachCurvature } from '../js/curvature.js';
 
@@ -157,8 +157,9 @@ exc = np.array(cfg["excluded"], dtype=bool) if cfg["excluded"] is not None else 
 out = []
 for seed in cfg["seeds"]:
     p = extract_patch(facets, indptr, indices, fid, fty, int(seed), cfg["max_facets"], rng=None,
-                      spin=False, curv=curv, extended=True, eangles=eang, excluded=exc)
-    out.append({"ids": p["ids"].tolist(), "features": p["features"].ravel().tolist()}
+                      spin=False, curv=curv, extended=True, eangles=eang, excluded=exc, gnn=True)
+    out.append({"ids": p["ids"].tolist(), "features": p["features"].ravel().tolist(),
+                "nbr": p["nbr"].ravel().tolist(), "eattr": p["eattr"].ravel().tolist()}
                if p is not None else None)
 json.dump(out, open(sys.argv[2], "w"))
 `;
@@ -183,7 +184,7 @@ function compareV6(label, positions, seeds, maxFacets, quant, excludeEvery) {
 
   const W = N_FEATURES_V6;
   const worst = new Float64Array(W);
-  let idMismatch = 0, sizeMismatch = 0, checked = 0;
+  let idMismatch = 0, sizeMismatch = 0, checked = 0, graphMismatch = 0;
   for (let s = 0; s < seeds.length; s++) {
     const ref = py[s];
     if (!ref) continue;
@@ -195,12 +196,24 @@ function compareV6(label, positions, seeds, maxFacets, quant, excludeEvery) {
       const d = Math.abs(ref.features[i] - got.features[i]);
       if (d > worst[i % W]) worst[i % W] = d;
     }
+    // The patch graph (message-passing models): the same neighbour set with the same dihedrals
+    // per facet; slot order is free because the model max-pools over the slots.
+    const g = patchNeighbours(got.ids, adjacency);
+    for (let i = 0; i < got.n; i++) {
+      const mine = [], theirs = [];
+      for (let k = 0; k < 3; k++) {
+        if (g.nbr[i * 3 + k] >= 0n) mine.push(`${g.nbr[i * 3 + k]}:${g.eattr[i * 3 + k].toFixed(4)}`);
+        if (ref.nbr[i * 3 + k] >= 0) theirs.push(`${ref.nbr[i * 3 + k]}:${ref.eattr[i * 3 + k].toFixed(4)}`);
+      }
+      if (mine.sort().join() !== theirs.sort().join()) graphMismatch++;
+    }
   }
   const baseWorst = Math.max(...worst.slice(0, N_FEATURES));
   const extWorst = Math.max(...worst.slice(N_FEATURES));
   const extCol = worst.indexOf(extWorst);
-  const ok = !sizeMismatch && !idMismatch && baseWorst < 2e-5 && extWorst < 1e-4;
+  const ok = !sizeMismatch && !idMismatch && baseWorst < 2e-5 && extWorst < 1e-4 && !graphMismatch;
   console.log(`  ${label.padEnd(34)} seeds ${String(checked).padStart(3)}   size/id mismatches ${sizeMismatch}/${idMismatch}` +
+    `   graph mismatches ${graphMismatch}` +
     `   base ${baseWorst.toExponential(2)}   extended ${extWorst.toExponential(2)} (${EXT_FEATURE_NAMES[extCol - N_FEATURES] ?? '-'})   ${ok ? 'ok' : 'MISMATCH'}`);
   return ok;
 }

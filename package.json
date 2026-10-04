@@ -2,5 +2,8 @@
   "dependencies": {
     "onnxruntime-node": "^1.29.0"
   },
-  "type": "module"
+  "type": "module",
+  "devDependencies": {
+    "opencascade.js": "2.0.0-beta.b5ff984"
+  }
 }

@@ -49,14 +49,19 @@ def main(argv=None) -> int:
     ap.add_argument("--density", default="medium")
     ap.add_argument("--max-tris", type=int, default=150_000)
     ap.add_argument("--seed", type=int, default=11)
+    ap.add_argument("--split", choices=("val", "train"), default="val",
+                    help="val (the default) for evaluation sets; train for TRAINING data of models "
+                         "other than the seed model, e.g. the edge model (test/edgeScreen.mjs), "
+                         "which then has every validation part held out")
     args = ap.parse_args(argv)
 
     variants = dict(pair.split("=", 1) for pair in args.variants.split(","))
     variants = {k: Path(v) for k, v in variants.items()}
     args.out.mkdir(parents=True, exist_ok=True)
 
-    val, _ = val_split(args.bake)
-    cands = [f for f in val
+    val, train = val_split(args.bake)
+    pool = val if args.split == "val" else train
+    cands = [f for f in pool
              if all((root / f.relative_to(args.bake)).exists() for root in variants.values())
              and (args.relabel / f.parent.name / f.name).exists()]
     rng = np.random.default_rng(args.seed)
@@ -84,7 +89,7 @@ def main(argv=None) -> int:
     (args.out / "manifest.json").write_text(json.dumps(
         {"variants": list(variants), "density": args.density, "parts": manifest}, indent=1))
     per = sum(len(e["variants"]) for e in manifest) / max(len(manifest), 1)
-    print(f"{len(cands):,} validation parts present in all of {', '.join(variants)}; "
+    print(f"{len(cands):,} {args.split} parts present in all of {', '.join(variants)}; "
           f"exported {len(manifest)} ({per:.2f} variants each) -> {args.out}")
     return 0
 

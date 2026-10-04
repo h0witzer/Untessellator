@@ -234,7 +234,7 @@ const normalOf = (facets, t) =>
  * @param {number} cosTolA min |cos| between facet normal and surface normal
  * @param {Uint8Array} taken  facets already committed to another region
  */
-function growOn(seed, facets, adjacency, type, params, tolD, cosTolA, taken, creaseDeg = Infinity) {
+function growOn(seed, facets, adjacency, type, params, tolD, cosTolA, taken, creaseDeg = Infinity, wall = null) {
   const ev = surfaceEval(type, params);
   if (!ev) return new Set();
 
@@ -253,7 +253,8 @@ function growOn(seed, facets, adjacency, type, params, tolD, cosTolA, taken, cre
     for (const e of adjacency.get(t) || []) {
       const nb = e.neighbor;
       if (taken[nb] || region.has(nb)) continue;
-      if (e.angle >= creaseDeg) continue;   // a crease is a wall, whatever the fit says
+      // A crease (or, with `wall`, a curvature jump) is a wall, whatever the fit says.
+      if (e.angle >= creaseDeg || (wall && wall(t, e))) continue;
       if (!fits(nb)) continue;
       region.add(nb);
       queue.push(nb);
@@ -263,13 +264,13 @@ function growOn(seed, facets, adjacency, type, params, tolD, cosTolA, taken, cre
 }
 
 /** Small connected neighbourhood around a seed, used to propose a primitive. */
-function neighbourhood(seed, adjacency, taken, want, creaseDeg = Infinity) {
+function neighbourhood(seed, adjacency, taken, want, creaseDeg = Infinity, wall = null) {
   const out = new Set([seed]);
   const queue = [seed];
   while (queue.length && out.size < want) {
     const t = queue.shift();
     for (const e of adjacency.get(t) || []) {
-      if (taken[e.neighbor] || out.has(e.neighbor) || e.angle >= creaseDeg) continue;
+      if (taken[e.neighbor] || out.has(e.neighbor) || e.angle >= creaseDeg || (wall && wall(t, e))) continue;
       out.add(e.neighbor);
       queue.push(e.neighbor);
       if (out.size >= want) break;
@@ -304,6 +305,88 @@ function neighbourhood(seed, adjacency, taken, want, creaseDeg = Infinity) {
 export const CREASE_BARRIER = Object.freeze({ plane: 2, cylinder: 30, cone: 30, sphere: 30, torus: 45 });
 
 /**
+ * TANGENT BARRIER (experimental; null = off): a wall where CURVATURE jumps, for the face boundaries
+ * a dihedral cannot see. A fillet meeting a cylinder tangentially has no crease, but its facets
+ * curve at 1/r while the cylinder's curve at 1/R.
+ *
+ * `{ abs, rel, types }`: an edge is a wall for a fill of one of `types` when the facets' total
+ * principal curvature |k1| + |k2| (js/curvature.js) differs by at least `rel` of the larger, and
+ * that difference times the centroid spacing is at least `abs`.
+ *
+ * Measured by test/tangentStats.mjs on 80 ABC parts: at rel 0.8 it flags 30-42% of the smooth
+ * (< 30 degree) edges between faces of different types, while putting false walls on only 1-7% of
+ * edges inside cylinders, cones, spheres and tori (their recall ceilings stay 93-99% on CAD
+ * meshes). On PLANES it is unusable: 12-29% false walls, because per-facet curvature is smeared
+ * from the neighbouring faces near a plane's edges; the 2-degree plane crease already seals most
+ * tangent junctions there.
+ */
+export const TANGENT_BARRIER = null;
+
+/** The curvature-jump wall predicate (t, edge) => boolean for a fill of `type`, or null. */
+export function tangentWall(facets, type, cfg) {
+  if (!cfg || !facets.curvature) return null;
+  if (cfg.types && !cfg.types.includes(type)) return null;
+  const { k1, k2, valid } = facets.curvature;
+  const C = facets.centroids;
+  return (a, e) => {
+    const b = e.neighbor;
+    if (!valid[a] || !valid[b]) return false;
+    const ka = Math.abs(k1[a]) + Math.abs(k2[a]);
+    const kb = Math.abs(k1[b]) + Math.abs(k2[b]);
+    const jump = Math.abs(ka - kb);
+    const big = Math.max(ka, kb);
+    if (!(big > 0) || jump < cfg.rel * big) return false;
+    const d = Math.hypot(C[a * 3] - C[b * 3], C[a * 3 + 1] - C[b * 3 + 1], C[a * 3 + 2] - C[b * 3 + 2]);
+    return jump * d >= cfg.abs;
+  };
+}
+
+/**
+ * LOW-POLY MESHES. Game-style meshes put 20-40 degree dihedrals inside one cylinder, and their
+ * coarse facets sit further from the surface they approximate, so the CAD-tuned barrier and growth
+ * tolerances stop fills short (59% incomplete). A mesh's STEP is the median dihedral of its 1-60
+ * degree edges: 7.3 degrees on OCCT and NURBS meshes, 12.3 on gmsh, 22.2 on game-style meshes
+ * (80 ABC parts). From a step of LOWPOLY_STEP the curved types' barrier rises to 2 x step (capped
+ * at 80) and growth accepts 1.5 x step of normal deviation and 0.75 facet sizes of distance.
+ *
+ * test/fillEval.mjs --declared-only on the game-style copies: clean 32 -> 39%, incomplete
+ * 59 -> 44%, recall p50 69 -> 96%, spill 23 -> 31%; cylinders 34 -> 39, cones 14 -> 29, spheres
+ * 2 -> 11, tori 2 -> 10. Meshes below the step are unchanged by construction. The barrier alone
+ * (without the tolerances) gave 33%, and cost cones.
+ */
+export const LOWPOLY_STEP = 18;
+
+const stepCache = new WeakMap();
+
+/** A mesh's step angle in degrees, computed once per adjacency map. */
+export function meshStepAngle(adjacency) {
+  if (stepCache.has(adjacency)) return stepCache.get(adjacency);
+  const angles = [];
+  for (const [a, edges] of adjacency) {
+    for (const e of edges) if (e.neighbor > a && e.angle >= 1 && e.angle < 60) angles.push(e.angle);
+  }
+  angles.sort((p, q) => p - q);
+  const step = angles.length ? angles[angles.length >> 1] : 0;
+  stepCache.set(adjacency, step);
+  return step;
+}
+
+/** The crease table for a mesh: CREASE_BARRIER, with curved types widened on low-poly meshes. */
+export function creaseTableFor(adjacency) {
+  const step = meshStepAngle(adjacency);
+  if (step < LOWPOLY_STEP) return CREASE_BARRIER;
+  const curved = Math.min(80, Math.max(30, 2 * step));
+  return { plane: CREASE_BARRIER.plane, cylinder: curved, cone: curved, sphere: curved,
+           torus: Math.min(80, Math.max(45, 2 * step)) };
+}
+
+/** Growth tolerances for a low-poly mesh, or {} for regionGrow's defaults. */
+export function lowPolyDefaults(adjacency) {
+  const step = meshStepAngle(adjacency);
+  return step < LOWPOLY_STEP ? {} : { angleTol: Math.max(15, 1.5 * step), tolScale: 0.75 };
+}
+
+/**
  * The dihedral angle, in degrees, at which growth for `type` treats an edge as a wall.
  * `crease` is a number for every type, a { type: degrees } table, or null for no wall.
  */
@@ -317,9 +400,9 @@ export function creaseFor(crease, type) {
  * at or above `creaseDeg`. The seed itself is always included. With no barrier (Infinity)
  * nothing is cut.
  */
-export function creaseComponent(seed, allowed, adjacency, creaseDeg) {
+export function creaseComponent(seed, allowed, adjacency, creaseDeg, wall = null) {
   const out = new Set([seed]);
-  if (!Number.isFinite(creaseDeg)) {
+  if (!Number.isFinite(creaseDeg) && !wall) {
     for (const t of allowed) out.add(t);
     return out;
   }
@@ -327,7 +410,7 @@ export function creaseComponent(seed, allowed, adjacency, creaseDeg) {
   while (stack.length) {
     const t = stack.pop();
     for (const e of adjacency.get(t) || []) {
-      if (e.angle >= creaseDeg || out.has(e.neighbor) || !allowed.has(e.neighbor)) continue;
+      if (e.angle >= creaseDeg || out.has(e.neighbor) || !allowed.has(e.neighbor) || (wall && wall(t, e))) continue;
       out.add(e.neighbor);
       stack.push(e.neighbor);
     }
@@ -335,8 +418,18 @@ export function creaseComponent(seed, allowed, adjacency, creaseDeg) {
   return out;
 }
 
-/** Median edge length, used to scale the distance tolerance to the mesh. */
+const facetSizeCache = new WeakMap();
+
+/**
+ * Median edge length, used to scale the distance tolerance to the mesh. Cached per facets object:
+ * it sorted every facet on every paintFrom call, 11% of auto-paint's time on a 56k-triangle mesh.
+ */
 function medianFacetSize(facets) {
+  if (!facetSizeCache.has(facets)) facetSizeCache.set(facets, computeMedianFacetSize(facets));
+  return facetSizeCache.get(facets);
+}
+
+function computeMedianFacetSize(facets) {
   const s = [];
   for (let t = 0; t < facets.count; t++) s.push(Math.sqrt(Math.max(facets.areas[t], 0)));
   s.sort((a, b) => a - b);
@@ -504,19 +597,31 @@ export function growPrimitives(facets, adjacency, opts = {}) {
  * is a wall added to the surface test, never a replacement for it.
  */
 export function paintFrom(seedTri, type, facets, adjacency, opts = {}) {
-  const tolD = (opts.tolScale ?? 0.5) * medianFacetSize(facets);
-  const cosTolA = Math.cos((opts.angleTol ?? 15) * Math.PI / 180);
+  // Low-poly meshes (median step angle >= LOWPOLY_STEP) get a wider barrier and tolerances by default.
+  const lowPoly = lowPolyDefaults(adjacency);
+  const tolD = (opts.tolScale ?? lowPoly.tolScale ?? 0.5) * medianFacetSize(facets);
+  const cosTolA = Math.cos((opts.angleTol ?? lowPoly.angleTol ?? 15) * Math.PI / 180);
   const iterations = opts.iterations ?? 4;
-  const creaseDeg = creaseFor(opts.crease === undefined ? CREASE_BARRIER : opts.crease, type);
+  const creaseDeg = creaseFor(opts.crease === undefined ? creaseTableFor(adjacency) : opts.crease, type);
+  // A wall predicate (t, edge) => boolean stops growth at an edge whatever the fit says. Callers may
+  // pass their own (js/edgeWall.js: the learned face-boundary scorer); otherwise it is the
+  // curvature-jump wall, off unless opts.tangent asks for it.
+  const given = opts.wall && (!opts.wall.types || opts.wall.types.includes(type)) ? opts.wall : null;
+  const wall = given ?? tangentWall(facets, type, opts.tangent === undefined ? TANGENT_BARRIER : opts.tangent);
   // opts.taken: facets already painted into another group, which growth never enters.
   const none = opts.taken ?? new Uint8Array(facets.count);
 
   // A supplied region (a model's proposal) is cut back to the part the click can reach without
   // crossing a crease, or a proposal spanning a bend would carry the fill over it.
-  let region = opts.seedRegion && opts.seedRegion.size
-    ? creaseComponent(seedTri, opts.seedRegion, adjacency, creaseDeg)
-    : neighbourhood(seedTri, adjacency, none, opts.seedSize ?? 12, creaseDeg);
-  if (opts.taken) for (const t of region) if (t !== seedTri && opts.taken[t]) region.delete(t);
+  // Taken facets come out BEFORE the component is found: a component found through them and then
+  // cut would leave pieces joined only across another group, and growth would paint both.
+  let region;
+  if (opts.seedRegion && opts.seedRegion.size) {
+    const allowed = opts.taken ? new Set([...opts.seedRegion].filter((t) => !opts.taken[t])) : opts.seedRegion;
+    region = creaseComponent(seedTri, allowed, adjacency, creaseDeg, wall);
+  } else {
+    region = neighbourhood(seedTri, adjacency, none, opts.seedSize ?? 12, creaseDeg, wall);
+  }
 
   let fit = fitRegionAs(type, region, facets);
   if (fit.degenerate || !fit.params) {
@@ -529,7 +634,7 @@ export function paintFrom(seedTri, type, facets, adjacency, opts = {}) {
   // Each refit sees more of the surface and claims more of it in turn.
   for (let i = 0; i < iterations; i++) {
     const grown = growOn(region, facets, adjacency, type, fit.params,
-                         tolD, cosTolA, none, creaseDeg);
+                         tolD, cosTolA, none, creaseDeg, wall);
     if (grown.size === 0) break;
 
     const refit = fitRegionAs(type, grown, facets);

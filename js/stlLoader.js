@@ -17,9 +17,9 @@ export function loadSTLFile(file) {
     reader.onload = (e) => {
       try {
         const geometry = stlLoader.parse(e.target.result);
-        setupGeometry(geometry);
+        const offset = setupGeometry(geometry);
         const bounds = computeBounds(geometry);
-        resolve({ geometry, bounds });
+        resolve({ geometry, bounds, offset });
       } catch (err) {
         reject(err);
       }
@@ -30,7 +30,8 @@ export function loadSTLFile(file) {
 }
 
 /**
- * Ensure vertex normals exist, then centre the geometry on its bounding-box centroid.
+ * Ensure vertex normals exist, then centre the geometry on its bounding-box centroid. Returns the
+ * centre it was moved by, [x, y, z]: an export adds it back, so the STEP sits where the file's mesh did.
  */
 function setupGeometry(geometry) {
   geometry.computeBoundingBox();
@@ -40,6 +41,7 @@ function setupGeometry(geometry) {
   geometry.translate(-centre.x, -centre.y, -centre.z);
   geometry.computeBoundingBox();
   if (!geometry.attributes.normal) geometry.computeVertexNormals();
+  return [centre.x, centre.y, centre.z];
 }
 
 /**
@@ -79,9 +81,9 @@ export function loadOBJFile(file) {
       try {
         const group = objLoader.parse(e.target.result);
         const geometry = mergeGroupGeometries(group);
-        setupGeometry(geometry);
+        const offset = setupGeometry(geometry);
         const bounds = computeBounds(geometry);
-        resolve({ geometry, bounds });
+        resolve({ geometry, bounds, offset });
       } catch (err) {
         reject(err);
       }
@@ -104,9 +106,9 @@ export function load3MFFile(file) {
     reader.onload = (e) => {
       try {
         const geometry = parse3MF(new Uint8Array(e.target.result));
-        setupGeometry(geometry);
+        const offset = setupGeometry(geometry);
         const bounds = computeBounds(geometry);
-        resolve({ geometry, bounds });
+        resolve({ geometry, bounds, offset });
       } catch (err) {
         reject(err);
       }

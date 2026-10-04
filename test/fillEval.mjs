@@ -45,11 +45,16 @@ import { createRequire } from 'node:module';
 
 import { buildFacets, buildAdjacency } from '../js/meshCore.js';
 import { paintFrom, creaseComponent } from '../js/regionGrow.js';
+import { annotateEdges, edgeWall } from '../js/edgeWall.js';
 import { classifyRegion } from '../js/gaussMap.js';
 import { proposeRegion, TYPE_NAMES, fitterFor, N_FEATURES } from '../js/seedNet.js';
 import { attachCurvature } from '../js/curvature.js';
 
 const ort = createRequire(import.meta.url)('onnxruntime-node');
+/** The patch graph a message-passing seed model takes (seedNet.patchNeighbours), if it takes one. */
+const graphFeeds = (session, graph, n) => (session.inputNames.includes('nbr') && graph
+  ? { nbr: new ort.Tensor('int64', graph.nbr, [1, n, 3]), eattr: new ort.Tensor('float32', graph.eattr, [1, n, 3]) }
+  : {});
 
 const args = process.argv.slice(2);
 function flag(name, dflt) {
@@ -64,6 +69,8 @@ const CURVATURE = flag('--curvature', 'off');
 // Crease barriers for the declared (no model) fills: edges at or above the angle are walls.
 // Several comma-separated presets run side by side on the same clicks.
 const CREASE_PRESETS = {
+  // default: paintFrom's own choice (regionGrow.creaseTableFor, low-poly tolerances included)
+  default: undefined,
   none: null,
   all30: 30,
   typedA: { plane: 5, cylinder: 30, cone: 30, sphere: 30, torus: 45 },
@@ -72,9 +79,81 @@ const CREASE_PRESETS = {
   typedD: { plane: 5, cylinder: 20, cone: 20, sphere: 20, torus: 45 },
   typedE: { plane: 5, cylinder: 15, cone: 15, sphere: 20, torus: 30 },
   typedF: { plane: 2, cylinder: 30, cone: 30, sphere: 30, torus: 45 },
+  // ADAPTIVE: curved types' angle raised to a multiple of the mesh's own step (the median dihedral
+  // of its 1-60 degree edges), never below typedF, so low-poly meshes are not walled inside one face.
+  adapt15: (s) => adaptive(s, 1.5),
+  adapt2: (s) => adaptive(s, 2),
+  adapt3: (s) => adaptive(s, 3),
 };
+function adaptive(step, k) {
+  const curved = Math.min(80, Math.max(30, k * step));
+  return { plane: 2, cylinder: curved, cone: curved, sphere: curved, torus: Math.min(80, Math.max(45, k * step)) };
+}
 const CREASES = flag('--crease', 'none').split(',');
 for (const c of CREASES) if (!(c in CREASE_PRESETS)) { console.error(`unknown crease preset ${c}`); process.exit(2); }
+// Curvature-jump walls (regionGrow.tangentWall), combined with every crease preset.
+const CURVED = ['cylinder', 'cone', 'sphere', 'torus'];
+const TANGENT_PRESETS = {
+  none: null,
+  c80: { abs: 0.1, rel: 0.8, types: CURVED },
+  c65: { abs: 0.1, rel: 0.65, types: CURVED },
+  c50: { abs: 0.1, rel: 0.5, types: CURVED },
+  c50b: { abs: 0.2, rel: 0.5, types: CURVED },
+  all80: { abs: 0.1, rel: 0.8 },
+};
+const TANGENTS = flag('--tangent', 'none').split(',');
+for (const g of TANGENTS) if (!(g in TANGENT_PRESETS)) { console.error(`unknown tangent preset ${g}`); process.exit(2); }
+// LOW-POLY ACCEPTANCE: paintFrom's growth tolerances (15 degrees of normal deviation, half a median
+// facet size of distance) widened with the mesh's own step angle, only on meshes whose step is at
+// least LOWPOLY_STEP degrees, so CAD-exported and gmsh meshes (median steps 7 and 12) are unchanged.
+const LOWPOLY_STEP = 18;
+const ACCEPT_PRESETS = {
+  none: () => ({}),
+  a1: (s) => (s >= LOWPOLY_STEP ? { angleTol: Math.max(15, s) } : {}),
+  a2: (s) => (s >= LOWPOLY_STEP ? { angleTol: Math.max(15, 1.5 * s), tolScale: 0.75 } : {}),
+  a3: (s) => (s >= LOWPOLY_STEP ? { angleTol: Math.max(15, 1.5 * s), tolScale: 1.0 } : {}),
+};
+const ACCEPTS = flag('--accept', 'none').split(',');
+for (const a of ACCEPTS) if (!(a in ACCEPT_PRESETS)) { console.error(`unknown accept preset ${a}`); process.exit(2); }
+// LEARNED FACE BOUNDARY (js/edgeWall.js). `--edge-wall <run dir>` loads ml/edge_train.py's export;
+// `--edge` picks thresholds from its sidecar, named by the share of WITHIN-FACE edges they wall
+// (fpr1/fpr2/fpr5). Each mesh is scored once, before its fills.
+const PARITY = flag('--parity', 'all');
+if (!['all', 'odd', 'even'].includes(PARITY)) { console.error('--parity all|odd|even'); process.exit(2); }
+const EDGE_WALL_DIR = flag('--edge-wall', null);
+const EDGES = flag('--edge', 'none').split(',');
+let edgeMeta = null;
+let edgeRunner = null;
+if (EDGE_WALL_DIR) {
+  edgeMeta = JSON.parse(readFileSync(join(EDGE_WALL_DIR, 'edge.json'), 'utf8'));
+  const session = await ort.InferenceSession.create(join(EDGE_WALL_DIR, 'edge.onnx'),
+    { intraOpNumThreads: 2, interOpNumThreads: 1 });
+  edgeRunner = async (features, n) => {
+    const out = await session.run({ features: new ort.Tensor('float32', features, [n, features.length / n]) });
+    return out.logit.data;
+  };
+} else if (EDGES.some((e) => e !== 'none')) {
+  console.error('--edge needs --edge-wall <run dir>');
+  process.exit(2);
+}
+const edgeThreshold = (name) => {
+  const key = { fpr1: 'fpr0.01', fpr2: 'fpr0.02', fpr5: 'fpr0.05' }[name];
+  const entry = key && edgeMeta?.thresholds?.[key];
+  if (!entry) { console.error(`unknown edge preset ${name}`); process.exit(2); }
+  return 1 / (1 + Math.exp(-entry.logit));
+};
+// A `np` suffix (fpr2np) leaves PLANE fills to the 2 degree crease, which they do better with.
+const EDGE_PRESETS = Object.fromEntries(EDGES.map((e) => {
+  if (e === 'none') return [e, null];
+  const noPlane = e.endsWith('np');
+  const base = noPlane ? e.slice(0, -2) : e;
+  return [e, edgeWall(edgeThreshold(base), noPlane ? ['cylinder', 'cone', 'sphere', 'torus'] : null)];
+}));
+
+const COMBOS = CREASES.flatMap((c) => TANGENTS.flatMap((g) => ACCEPTS.flatMap((a) => EDGES.map((w) => [c, g, a, w]))));
+const comboLabel = ([c, g, a, w]) => [c, g === 'none' ? null : g, a === 'none' ? null : a,
+  w === 'none' ? null : `edge=${w}`].filter(Boolean).join('+');
+const meshSteps = {};
 const DECLARED_ONLY = args.includes('--declared-only');
 if (DECLARED_ONLY) args.splice(args.indexOf('--declared-only'), 1);
 // ORDERED TYPE: the geometry picks the type instead of the model's type head. classifyRegion fits
@@ -130,7 +209,11 @@ function creasePatch(seed, adjacency, want, allowed = null) {
 }
 const TYPE_BY_FITTER = { plane: 'Plane', cylinder: 'Cylinder', cone: 'Cone', sphere: 'Sphere', torus: 'Torus', nurbs: 'BSpline' };
 const orderedTypeOf = (region, facets) => TYPE_BY_FITTER[classifyRegion(region, facets).type] ?? 'BSpline';
-const declaredMethod = c => (c === 'none' ? 'declared' : `declared crease=${c}`);
+const declaredMethod = (c, g = 'none', a = 'none', w = 'none') =>
+  (c === 'none' && g === 'none' && a === 'none' && w === 'none'
+    ? 'declared'
+    : `declared crease=${c}${g === 'none' ? '' : ` tangent=${g}`}${a === 'none' ? '' : ` accept=${a}`}`
+      + (w === 'none' ? '' : ` edge=${w}`));
 
 const [DIR, MODEL_LIST] = args;
 if (!DIR || (!MODEL_LIST && !DECLARED_ONLY)) {
@@ -150,10 +233,11 @@ for (const path of DECLARED_ONLY ? [] : MODEL_LIST.split(',')) {
   models.push({
     name: basename(dirname(path)),
     extended: meta.features === 'v6',
-    run: async (features, n) => {
+    run: async (features, n, graph) => {
       const out = await session.run({
         features: new ort.Tensor('float32', features, [1, n, features.length / n]),
         mask: new ort.Tensor('float32', new Float32Array(n).fill(1), [1, n]),
+        ...graphFeeds(session, graph, n),
       });
       return { sameLogit: out.same_logit.data, typeLogit: Array.from(out.type_logit.data) };
     },
@@ -188,7 +272,10 @@ const manifest = JSON.parse(readFileSync(join(DIR, 'manifest.json'), 'utf8'));
 const reference = manifest.variants[0];
 const t0 = performance.now();
 
-for (const entry of manifest.parts) {
+for (const [partIndex, entry] of manifest.parts.entries()) {
+  // ml/edge_train.py trains on even-indexed parts, so `--parity odd` scores the learned boundary
+  // wall only on parts it has never seen.
+  if (PARITY !== 'all' && (partIndex % 2 === 0) !== (PARITY === 'even')) continue;
   const ref = entry.variants[reference];
   if (!ref) continue;
   // seed FACES are picked once, on the reference mesh, so every mesher clicks the same faces
@@ -214,6 +301,13 @@ for (const entry of manifest.parts) {
     const facets = buildFacets(P);
     const adjacency = buildAdjacency(P, facets);
     attachCurvature(P, facets);
+    const stepAngles = [];
+    for (const [a, es] of adjacency) for (const e of es) if (e.neighbor > a && e.angle >= 1 && e.angle < 60) stepAngles.push(e.angle);
+    stepAngles.sort((p, q) => p - q);
+    const meshStep = stepAngles.length ? stepAngles[stepAngles.length >> 1] : 0;
+    (meshSteps[mesher] ??= []).push(meshStep);
+    // The learned boundary score, once per mesh; the wall predicates read it off the adjacency.
+    if (edgeRunner) await annotateEdges(facets, adjacency, edgeRunner, edgeMeta.columns);
     const proposeOpts = CURVATURE === 'on' ? {} : { curvature: { valid: new Uint8Array(facets.count) } };
     const byFace = new Map();
     for (let t = 0; t < facets.count; t++) {
@@ -262,9 +356,14 @@ for (const entry of manifest.parts) {
         continue;
       }
       if (tf) {
-        for (const c of CREASES) {
-          score(declaredMethod(c), '-', mesher, seed, T, truthType,
-                paintFrom(seed, tf, facets, adjacency, { crease: CREASE_PRESETS[c] }).region, truth);
+        for (const [c, g, a, w] of COMBOS) {
+          const preset = CREASE_PRESETS[c];
+          const crease = typeof preset === 'function' ? preset(meshStep) : preset;
+          const wall = EDGE_PRESETS[w];
+          score(declaredMethod(c, g, a, w), '-', mesher, seed, T, truthType,
+                paintFrom(seed, tf, facets, adjacency, {
+                  crease, tangent: TANGENT_PRESETS[g], ...ACCEPT_PRESETS[a](meshStep), ...(wall ? { wall } : {}),
+                }).region, truth);
         }
       }
       if (ORDERED) {
@@ -330,7 +429,7 @@ function line(label, rs) {
     `  recall p50 ${pc(med(rs.map(r => r.recall)))}`);
 }
 
-console.log(`\n${manifest.parts.length} parts, ${rows.length} scored fills, ` +
+console.log(`\n${manifest.parts.length} parts (${PARITY}), ${rows.length} scored fills, ` +
   `${((performance.now() - t0) / 1000).toFixed(0)} s, curvature ${CURVATURE}`);
 console.log('clean: surface purity and recall >= 95% (strict: own face only). spill: surface purity < 90%. ' +
   'incomplete: recall < 90%.\n');
@@ -339,7 +438,7 @@ for (const mesher of manifest.variants) {
   const at = rows.filter(r => r.mesher === mesher);
   if (!at.length) continue;
   console.log(mesher);
-  for (const c of CREASES) line(`declared (no model) ${c}`, at.filter(r => r.method === declaredMethod(c)));
+  for (const combo of COMBOS) line(`declared ${comboLabel(combo)}`, at.filter(r => r.method === declaredMethod(...combo)));
   if (ORDERED) for (const size of ORDERED_SIZES) line(`ordered ${size} (no model)`, at.filter(r => r.method === `ordered ${size}`));
   for (const model of models) {
     for (const method of ['auto', ...(ORDERED ? ['ordered type', 'ordered+model'] : []), 'declared+model', 'model only']) {
@@ -349,13 +448,13 @@ for (const mesher of manifest.variants) {
   console.log('');
 }
 
-if (CREASES.length > 1) {
-  console.log('declared, by true type: clean / spill / incomplete per crease preset');
-  console.log(`  ${'mesher / type'.padEnd(22)}${CREASES.map(c => c.padStart(22)).join('')}`);
+if (COMBOS.length > 1) {
+  console.log('declared, by true type: clean / spill / incomplete per preset');
+  console.log(`  ${'mesher / type'.padEnd(22)}${COMBOS.map(c => comboLabel(c).padStart(22)).join('')}`);
   for (const mesher of manifest.variants) {
     for (const t of TYPE_NAMES) {
-      const cells = CREASES.map(c => {
-        const rs = rows.filter(r => r.mesher === mesher && r.method === declaredMethod(c) && r.truthType === t);
+      const cells = COMBOS.map(c => {
+        const rs = rows.filter(r => r.mesher === mesher && r.method === declaredMethod(...c) && r.truthType === t);
         return rs.length
           ? `${pc(frac(rs, clean))}/${pc(frac(rs, r => r.surfacePurity < 0.9))}/${pc(frac(rs, r => r.recall < 0.9))}`.padStart(22)
           : '-'.padStart(22);
@@ -421,6 +520,13 @@ for (const mesher of manifest.variants) {
     });
     if (cells.some(c => c.trim() !== '-')) console.log(`  ${`${mesher} ${t}`.padEnd(22)}${cells.join('')}`);
   }
+}
+
+console.log('mesh step angle (median dihedral of 1-60 degree edges), p10 / p50 / p90 over parts:');
+for (const [mesher, steps] of Object.entries(meshSteps)) {
+  const s = [...steps].sort((p, q) => p - q);
+  const at = (q) => s[Math.min(s.length - 1, Math.floor(q * s.length))].toFixed(1);
+  console.log(`  ${mesher.padEnd(7)} ${at(0.1)} / ${at(0.5)} / ${at(0.9)} deg`);
 }
 
 if (JSON_OUT) {

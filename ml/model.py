@@ -42,6 +42,34 @@ import torch.nn as nn
 NEG = -1e4   # finite, so it survives bf16/fp16 autocast; -inf produces NaNs
 
 
+class MeshConv(nn.Module):
+    """One round of message passing over the patch's facet adjacency.
+
+    A facet in a manifold mesh has at most three neighbours, so the patch's graph is a fixed
+    (B, N, 3) index tensor: a gather, an MLP on (own, neighbour - own, dihedral), a masked max
+    over the three, and a residual. No k-NN anywhere, so it exports as a plain Gather and runs in
+    the browser like the rest. Each layer lets a facet see one ring further, and unlike the
+    patch-wide max-pool it can carry PATH information: whether the way back to the seed crosses
+    something that looks like a boundary.
+    """
+
+    def __init__(self, width: int):
+        super().__init__()
+        self.msg = mlp([2 * width + 1, width, width])
+        self.norm = nn.LayerNorm(width)
+
+    def forward(self, h: torch.Tensor, nbr: torch.Tensor, emask: torch.Tensor, eattr: torch.Tensor):
+        b, n, w = h.shape
+        idx = nbr.reshape(b, n * 3, 1).expand(b, n * 3, w)
+        hj = torch.gather(h, 1, idx).reshape(b, n, 3, w)
+        hi = h.unsqueeze(2).expand(b, n, 3, w)
+        m = self.msg(torch.cat([hi, hj - hi, eattr.unsqueeze(-1)], dim=-1))
+        m = m.masked_fill(emask.unsqueeze(-1) == 0, NEG)
+        agg = m.max(dim=2).values
+        agg = agg.masked_fill(emask.sum(-1, keepdim=True) == 0, 0.0)
+        return self.norm(h + torch.relu(agg))
+
+
 def mlp(sizes: list[int]) -> nn.Sequential:
     layers: list[nn.Module] = []
     for i in range(len(sizes) - 1):
@@ -54,10 +82,14 @@ def mlp(sizes: list[int]) -> nn.Sequential:
 
 class SeedFillNet(nn.Module):
     def __init__(self, in_features: int = 10, n_types: int = 9, width: int = 256,
-                 surface: bool = False, n_surface: int = 5):
+                 surface: bool = False, n_surface: int = 5, gnn_layers: int = 0):
         super().__init__()
         w = width
         self.enc1 = mlp([in_features, w // 4, w // 2])     # local features
+        # Optional message passing over the facet adjacency (MeshConv), between the per-facet
+        # encoder and the pool. 0 keeps the original PointNet and loads old checkpoints unchanged.
+        self.gnn_layers = gnn_layers
+        self.convs = nn.ModuleList([MeshConv(w // 2) for _ in range(gnn_layers)])
         self.enc2 = mlp([w // 2, w, w])                    # features that get pooled
         self.seg = mlp([w // 2 + w, w, w // 2, 1])         # per-facet membership
         self.cls = mlp([w, w // 2, n_types])               # per-patch surface type
@@ -68,10 +100,18 @@ class SeedFillNet(nn.Module):
         if surface:
             self.surf = mlp([w // 2 + w, w, w // 2, n_surface])
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor):
-        """x: (B, N, F)   mask: (B, N) with 1 for real facets, 0 for padding."""
+    def forward(self, x: torch.Tensor, mask: torch.Tensor, nbr: torch.Tensor | None = None,
+                eattr: torch.Tensor | None = None):
+        """x: (B, N, F)   mask: (B, N) with 1 for real facets, 0 for padding.
+        nbr: (B, N, 3) int64 patch-local neighbour indices, -1 where there is none; eattr: (B, N, 3)
+        the dihedral of each of those edges / 90. Only models with gnn_layers read them."""
         m = mask.unsqueeze(-1)
         local = self.enc1(x) * m                      # (B, N, w/2)
+        if self.gnn_layers:
+            emask = ((nbr >= 0) & (mask.unsqueeze(-1) > 0)).to(local.dtype)
+            safe = torch.where(nbr >= 0, nbr, torch.zeros_like(nbr))
+            for conv in self.convs:
+                local = conv(local, safe, emask, eattr) * m
         pooled_in = self.enc2(local)                  # (B, N, w)
         pooled_in = pooled_in.masked_fill(m == 0, NEG)
         glob = pooled_in.max(dim=1).values            # (B, w)
@@ -101,8 +141,8 @@ class ZeroInputs(nn.Module):
         keep[list(zero_cols)] = 0.0
         self.register_buffer("keep", keep)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor):
-        return self.inner(x * self.keep, mask)
+    def forward(self, x: torch.Tensor, mask: torch.Tensor, *rest):
+        return self.inner(x * self.keep, mask, *rest)
 
 
 def export_onnx(model: nn.Module, path: str, n_facets: int = 512,
@@ -119,6 +159,7 @@ def export_onnx(model: nn.Module, path: str, n_facets: int = 512,
     """
     model.eval()
     has_surface = getattr(model, "surface", False)
+    gnn = getattr(model, "gnn_layers", 0)
     if zero_cols:
         model = ZeroInputs(model, in_features, zero_cols).eval()
     x = torch.randn(1, n_facets, in_features)
@@ -130,9 +171,19 @@ def export_onnx(model: nn.Module, path: str, n_facets: int = 512,
             "type_logit": {0: "batch"}}
     if has_surface:
         axes["surface"] = {0: "batch"}
+    inputs, input_names = (x, m), ["features", "mask"]
+    if gnn:
+        # a chain, so every gather index is valid; the real graph comes from the caller
+        nbr = torch.full((1, n_facets, 3), -1, dtype=torch.int64)
+        nbr[0, 1:, 0] = torch.arange(n_facets - 1)
+        nbr[0, :-1, 1] = torch.arange(1, n_facets)
+        inputs += (nbr, torch.rand(1, n_facets, 3))
+        input_names += ["nbr", "eattr"]
+        axes["nbr"] = {0: "batch", 1: "facets"}
+        axes["eattr"] = {0: "batch", 1: "facets"}
     torch.onnx.export(
-        model, (x, m), path,
-        input_names=["features", "mask"],
+        model, inputs, path,
+        input_names=input_names,
         output_names=names,
         dynamic_axes=axes,
         opset_version=17,

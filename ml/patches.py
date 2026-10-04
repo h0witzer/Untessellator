@@ -110,7 +110,8 @@ def extract_patch(facets: dict, indptr, indices, face_id: np.ndarray,
                   spin: bool = True, curv: dict | None = None,
                   surface: tuple | None = None, extended: bool = False,
                   eangles: np.ndarray | None = None,
-                  excluded: np.ndarray | None = None) -> dict | None:
+                  excluded: np.ndarray | None = None, gnn: bool = False,
+                  hard_rings: int = 0) -> dict | None:
     """Build one training sample around `seed`. Returns None if the patch is too small.
 
     `surface` is a (kind, params) pair from surface_sidecar.py, indexed by face id. When given,
@@ -173,6 +174,12 @@ def extract_patch(facets: dict, indptr, indices, face_id: np.ndarray,
         "seed": int(seed),
         "scale": scale,
     }
+    if gnn or hard_rings:
+        nbr, eattr = patch_graph(ids, indptr, indices, eangles)
+        if gnn:
+            out["nbr"], out["eattr"] = nbr, eattr
+        if hard_rings:
+            out["band"] = boundary_band(out["same"], nbr, eattr, hard_rings)
     if surface is not None:
         kinds, params = surface
         sf = int(face_id[seed])
@@ -187,6 +194,46 @@ def extract_patch(facets: dict, indptr, indices, face_id: np.ndarray,
             msk[:] = (ha, hk, hs)
         out.update(surface=tgt, surface_mask=msk, R=R, q=np.asarray(seed_pos, np.float64))
     return out
+
+
+def patch_graph(ids: np.ndarray, indptr, indices, eangles):
+    """Patch-local neighbours of every patch facet, (n, 3) int64 with -1 where the neighbour is
+    missing or outside the patch, and each edge's dihedral / 90 (n, 3). Mirrored by
+    seedNet.patchNeighbours; the model max-pools over the three, so slot order does not matter."""
+    n = ids.size
+    nbr = np.full((n, 3), -1, np.int64)
+    eattr = np.zeros((n, 3), np.float32)
+    order = np.argsort(ids, kind="stable")
+    sids = ids[order]
+    starts = indptr[ids]
+    counts = indptr[ids + 1] - starts
+    for k in range(3):
+        rows = np.nonzero(counts > k)[0]
+        if rows.size == 0:
+            continue
+        nb = indices[starts[rows] + k]
+        pos = np.minimum(np.searchsorted(sids, nb), n - 1)
+        found = sids[pos] == nb
+        nbr[rows[found], k] = order[pos[found]]
+        if eangles is not None:
+            eattr[rows[found], k] = eangles[starts[rows[found]] + k] / 90.0
+    return nbr, eattr
+
+
+SMOOTH_BOUNDARY = 30.0 / 90.0
+
+
+def boundary_band(same: np.ndarray, nbr: np.ndarray, eattr: np.ndarray, rings: int) -> np.ndarray:
+    """Patch facets within `rings` of a SMOOTH boundary of the seed's face: an edge between a facet
+    on the seed's face and one off it whose dihedral is under 30 degrees. That is where the crease
+    barrier is blind and fills spill, and where the membership head must be sharpest."""
+    valid = nbr >= 0
+    j = np.where(valid, nbr, 0)
+    edge = valid & (same[:, None] != same[j]) & (eattr < SMOOTH_BOUNDARY)
+    band = edge.any(axis=1)
+    for _ in range(rings - 1):
+        band = band | (valid & band[j]).any(axis=1)
+    return band.astype(np.float32)
 
 
 def collate(samples: list[dict], max_facets: int):
@@ -204,6 +251,30 @@ def collate(samples: list[dict], max_facets: int):
         m[i, :k] = 1.0
         t[i] = s["type"]
     return x, y, m, t
+
+
+def collate_weights(samples: list[dict], max_facets: int, hard_weight: float):
+    """Per-facet loss weights: `hard_weight` inside the boundary band, 1 elsewhere, 0 on padding."""
+    b = len(samples)
+    w = np.zeros((b, max_facets), np.float32)
+    for i, s in enumerate(samples):
+        k = min(s["n"], max_facets)
+        band = s.get("band")
+        w[i, :k] = 1.0 if band is None else 1.0 + (hard_weight - 1.0) * band[:k]
+    return w
+
+
+def collate_graph(samples: list[dict], max_facets: int):
+    """Neighbour indices and dihedrals, padded with -1 / 0 like the features."""
+    b = len(samples)
+    nbr = np.full((b, max_facets, 3), -1, np.int64)
+    eattr = np.zeros((b, max_facets, 3), np.float32)
+    for i, s in enumerate(samples):
+        k = min(s["n"], max_facets)
+        g = s["nbr"][:k]
+        nbr[i, :k] = np.where(g < k, g, -1)
+        eattr[i, :k] = s["eattr"][:k]
+    return nbr, eattr
 
 
 def collate_surface(samples: list[dict]):
@@ -230,7 +301,8 @@ class BakedPatches:
                  type_weights: np.ndarray | None = None, seed: int = 0,
                  files: list[Path] | None = None, relabel_root: Path | None = None,
                  surface_root: Path | None = None, extended: bool = False,
-                 exclude_prob: float = 0.0):
+                 exclude_prob: float = 0.0, gnn: bool = False, hard_rings: int = 0,
+                 boundary_seed_prob: float = 0.0):
         self.root = Path(root)
         self.densities = tuple(densities)
         self.max_facets = max_facets
@@ -256,6 +328,12 @@ class BakedPatches:
         # fills on gmsh 46 -> 58% but degraded the type head on the holed patches it never saw.
         self.extended = extended
         self.exclude_prob = exclude_prob
+        self.gnn = gnn
+        # DISCRIMINATIVE TRAINING: a band of `hard_rings` around the seed face's smooth boundaries
+        # is marked for loss weighting (train.py --hard-weight), and a share of seeds is drawn from
+        # facets next to a smooth face boundary, where fills actually go wrong.
+        self.hard_rings = hard_rings
+        self.boundary_seed_prob = boundary_seed_prob
 
     def _excluded_faces(self, s: int, indptr, indices, face_id, face_type):
         ids0, _ = k_ring(s, indptr, indices, self.max_facets)
@@ -309,13 +387,17 @@ class BakedPatches:
             if positions.shape[0] < 32:
                 continue
             eangles = None
-            if self.extended or self.exclude_prob > 0:
+            hard_rings = getattr(self, "hard_rings", 0)
+            bprob = getattr(self, "boundary_seed_prob", 0.0)
+            if self.extended or self.exclude_prob > 0 or self.gnn or hard_rings or bprob:
                 facets, indptr, indices, curv, eangles = derive(positions, with_angles=True)
             else:
                 facets, indptr, indices, curv = derive(positions)
             ntri = facets["count"]
 
             seeds = self._choose_seeds(face_type, ntri)
+            if bprob > 0:
+                seeds = self._boundary_seeds(seeds, face_id, face_type, indptr, indices, eangles, bprob)
             for s in seeds:
                 excluded = None
                 if self.exclude_prob > 0 and self.rng.random() < self.exclude_prob:
@@ -323,10 +405,32 @@ class BakedPatches:
                 out = extract_patch(facets, indptr, indices, face_id, face_type,
                                     int(s), self.max_facets, self.rng, curv=curv,
                                     surface=surface, extended=self.extended,
-                                    eangles=eangles, excluded=excluded)
+                                    eangles=eangles, excluded=excluded, gnn=self.gnn,
+                                    hard_rings=hard_rings)
                 if out is not None:
                     out["density"] = dens
                     yield out
+
+    def _boundary_seeds(self, seeds, face_id, face_type, indptr, indices, eangles, prob):
+        """Replace each seed, with probability `prob`, by a facet on a smooth face boundary (an
+        edge to another face under 30 degrees), type-weighted like the rest when weights are set."""
+        src = np.repeat(np.arange(indptr.size - 1), np.diff(indptr))
+        smooth = (face_id[src] != face_id[indices]) & (eangles < 30.0)
+        cand = np.unique(src[smooth])
+        if cand.size == 0:
+            return seeds
+        seeds = np.array(seeds, copy=True)
+        swap = self.rng.random(seeds.size) < prob
+        k = int(swap.sum())
+        if k == 0:
+            return seeds
+        p = None
+        if self.type_weights is not None:
+            w = self.type_weights[face_type[cand]]
+            if np.isfinite(w.sum()) and w.sum() > 0:
+                p = w / w.sum()
+        seeds[swap] = self.rng.choice(cand, size=k, replace=True, p=p)
+        return seeds
 
     def _choose_seeds(self, face_type: np.ndarray, ntri: int) -> np.ndarray:
         k = min(self.seeds_per_mesh, ntri)

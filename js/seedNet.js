@@ -170,6 +170,32 @@ export function buildFeatures(seed, facets, adjacency, maxFacets = 512, curv = n
 }
 
 /**
+ * Patch-local neighbours for a message-passing model (ml/model.py MeshConv): for patch facet i, the
+ * patch indices of its (at most three) neighbours, -1 where one is missing or outside the patch, and
+ * each edge's dihedral / 90. Mirrors ml/patches.py patch_graph. The model max-pools over the three
+ * slots, so their order does not matter. Models without message passing ignore it.
+ */
+export function patchNeighbours(ids, adjacency) {
+  const n = ids.length;
+  const index = new Map();
+  for (let i = 0; i < n; i++) index.set(ids[i], i);
+  const nbr = new BigInt64Array(n * 3).fill(-1n);
+  const eattr = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    let k = 0;
+    for (const e of adjacency.get(ids[i]) || []) {
+      if (k >= 3) break;
+      const j = index.get(e.neighbor);
+      if (j === undefined) continue;
+      nbr[i * 3 + k] = BigInt(j);
+      eattr[i * 3 + k] = e.angle / 90;
+      k++;
+    }
+  }
+  return { nbr, eattr };
+}
+
+/**
  * The surface a surface-head model predicted under `seed`, placed in the world in
  * regionGrow.surfaceEval's format. `surface` is the model's 5-vector (ml/surface_targets.py):
  * the axis in the patch frame, asinh(kn) and asinh(ks), where kn = scale / d and d is the
@@ -243,7 +269,7 @@ export async function proposeRegion(seed, facets, adjacency, run, opts = {}) {
   const maxFacets = opts.maxFacets ?? 512;
   const threshold = opts.threshold ?? 0.5;
   const { features, ids, n, scale } = buildFeatures(seed, facets, adjacency, maxFacets, opts.curvature, opts.excluded, opts.extended);
-  const { sameLogit, typeLogit, surface } = await run(features, n);
+  const { sameLogit, typeLogit, surface } = await run(features, n, patchNeighbours(ids, adjacency));
 
   const region = new Set();
   for (let i = 0; i < n; i++) {

@@ -1,0 +1,61 @@
+{
+ "columns": [
+  "dihedral",
+  "local_max_lo",
+  "local_max_hi",
+  "local_mean_lo",
+  "local_mean_hi",
+  "curv_jump",
+  "curv_rel",
+  "curv_lo",
+  "curv_hi",
+  "ev1_lo",
+  "ev1_hi",
+  "ev2_lo",
+  "ev2_hi",
+  "plane_d_lo",
+  "plane_d_hi",
+  "plane_a_lo",
+  "plane_a_hi",
+  "cylinder_d_lo",
+  "cylinder_d_hi",
+  "cylinder_a_lo",
+  "cylinder_a_hi",
+  "cone_d_lo",
+  "cone_d_hi",
+  "cone_a_lo",
+  "cone_a_hi",
+  "sphere_d_lo",
+  "sphere_d_hi",
+  "sphere_a_lo",
+  "sphere_a_hi",
+  "own_lo",
+  "own_hi",
+  "same_kind"
+ ],
+ "groups": [
+  "dihedral",
+  "curv",
+  "spread",
+  "fit"
+ ],
+ "thresholds": {
+  "fpr0.01": {
+   "logit": 1.7130986452102661,
+   "recall": 0.8387415427745218,
+   "smooth_recall": 0.7033792375164328
+  },
+  "fpr0.02": {
+   "logit": 0.9326788187026978,
+   "recall": 0.8760802622429721,
+   "smooth_recall": 0.7702635719057779
+  },
+  "fpr0.05": {
+   "logit": -0.08370726555585861,
+   "recall": 0.9144454377890356,
+   "smooth_recall": 0.8397340574556583
+  }
+ },
+ "auc": 0.9796565474034639,
+ "n_features": 32
+}
