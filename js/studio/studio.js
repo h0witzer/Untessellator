@@ -38,9 +38,12 @@ import { annotateEdges, edgeWall } from '../edgeWall.js';
 const EDGE_MODEL = 'models/edge-boundary.onnx';
 /**
  * REFINED FILLS (settings.refine, paintCore.refineFill): the second boundary model, trained on 2000
- * training-split ABC parts instead of 40 (runs/edge2), and the fill-refinement model (runs/refine1)
- * inside a minimum cut. Held out, clean single fills 78/65/69/48 -> 87/81/82/54% (OCCT / NURBS / gmsh /
- * game-style) and auto-paint area clean 75.3/75.3/76.0/65.8 -> 81.8/82.5/85.4/70.3%.
+ * training-split ABC parts instead of 40 (runs/edge2), and the fill-refinement model inside a minimum
+ * cut. Held out, clean single fills 78/65/69/48 -> 87/81/82/54% (OCCT / NURBS / gmsh / game-style) and
+ * auto-paint area clean 75.3/75.3/76.0/65.8 -> 81.8/82.5/85.4/70.3%.
+ * Since 2026-10-04 the refiner is runs/r3mp: six MeshConv layers, so it takes the patch graph. Clean
+ * single fills with the cut 87/81/82/54 -> 89/83/86/55%; on the 300 Onshape exports surfaces found once
+ * 84.8 -> 85.4% (docs/ml-experiment-scope.md, experiment 3).
  */
 const EDGE_MODEL_V2 = 'models/edge-boundary-v2.onnx';
 const REFINER = 'models/fill-refiner.onnx';

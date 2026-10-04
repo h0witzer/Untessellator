@@ -254,6 +254,8 @@ export async function paintWithVeto(seed, type, mesh, seedRegion, runner, taken 
  * fills (true type): wall alone 78/65/69/48%, refiner 85/72/76/52%, refiner + cut 87/81/82/54%
  * (test/growEval.mjs crf:a=2;l=4;r=1). Auto-paint area clean 75.3/75.3/76.0/65.8 -> 81.8/82.5/85.4/70.3
  * (test/autoSeed.mjs --refine --crf). Refining twice gains nothing; one pass is the fixed point.
+ * The shipped refiner (runs/r3mp, 2026-10-04) adds six MeshConv layers, so `runner` must pass the patch
+ * graph: refiner + cut 87/81/82/54 -> 89/83/86/55% on the same clicks.
  *
  * `cut` is the refiner's logit threshold (1, chosen on the even parts); inside the cut a facet's term
  * is alpha * clamp((logit - cut) / scale, -1, 1) and an edge costs lambda * length * (1 - p).
