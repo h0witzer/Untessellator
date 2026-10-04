@@ -2682,6 +2682,22 @@ the last seven evaluations (steps 45k–60k), by +0.004 to +0.009. The EMA copy 
 expected to show on patches but not on fills. The levers that reach fills are now the refiner (experiment
 3 shows it) and typing.
 
+### Experiment 2a: the seed's embedding in the membership head (2026-10-04)
+
+`runs/v7seedcat` is v7gnn's recipe plus `--seed-concat`: the membership head also reads h_seed and
+h_i − h_seed.
+- **Training validation:** best IoU 0.8637 against 0.8592, +0.004 on average over the last seven
+  evaluations.
+- **Held-out patches:** 0.840 / 0.760 / 0.740 / 0.730, pooled **0.772**, the same as v7gnn. OCCT loses
+  0.014 and gmsh gains 0.016.
+- **Whole-region errors:** 2.7% of facets 6+ rings from a border, against v7gnn's 2.6%.
+
+The hypothesis behind it, that the membership head misses the seed's own embedding, is not supported,
+and no fill gate was run. The whole-region errors stay where they are.
+
+**EMA (experiment 5, riding along).** In experiments 1 and 2a the EMA copy matches the raw best checkpoint
+on held-out patches to within 0.002 IoU. It gives a smoother curve and no gain.
+
 **Decision so far (experiment 3).**
 - Message passing goes into the refiner, with plain max aggregation. Gating, attention and the boundary
   probability added nothing for their cost.
