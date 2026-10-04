@@ -59,13 +59,20 @@ import { refineFeatures, simulatedClick } from '../js/refineFeatures.js';
 import { classifyRegion } from '../js/gaussMap.js';
 import { creaseRing } from '../js/seedFeatures.js';
 import { attachCurvature } from '../js/curvature.js';
-import { proposeRegion, TYPE_NAMES, fitterFor } from '../js/seedNet.js';
+import { proposeRegion, TYPE_NAMES, fitterFor, graphInputs } from '../js/seedNet.js';
 
 const ort = createRequire(import.meta.url)('onnxruntime-node');
-/** The patch graph a message-passing seed model takes (seedNet.patchNeighbours), if it takes one. */
-const graphFeeds = (session, graph, n) => (session.inputNames.includes('nbr') && graph
-  ? { nbr: new ort.Tensor('int64', graph.nbr, [1, n, 3]), eattr: new ort.Tensor('float32', graph.eattr, [1, n, 3]) }
-  : {});
+/** The patch graph a message-passing model takes (seedNet.patchNeighbours, seedNet.graphInputs), if it
+ * takes one; `edgeDim` 2 adds the learned boundary probability for refiners trained with --edge-dim 2. */
+const graphFeeds = (session, graph, n, edgeDim = 1) => {
+  if (!(session.inputNames.includes('nbr') && graph)) return {};
+  const g = graphInputs(graph, n, edgeDim);
+  return { nbr: new ort.Tensor('int64', ...g.nbr), eattr: new ort.Tensor('float32', ...g.eattr) };
+};
+/** A model's edge_dim from its sidecar JSON (1 when it has none). */
+const edgeDimOf = (onnxPath) => {
+  try { return JSON.parse(readFileSync(onnxPath.replace(/\.onnx$/, '.json'), 'utf8')).edge_dim ?? 1; } catch { return 1; }
+};
 
 const args = process.argv.slice(2);
 function flag(name, dflt) {
@@ -137,11 +144,12 @@ if (METHODS.some((m) => m.endsWith('@m')) && !model) { console.error('@m methods
 let refiner = null;
 if (REFINE) {
   const session = await ort.InferenceSession.create(REFINE);
+  const refineEdgeDim = edgeDimOf(REFINE);
   refiner = {
     run: async (features, n, graph) => (await session.run({
       features: new ort.Tensor('float32', features, [1, n, features.length / n]),
       mask: new ort.Tensor('float32', new Float32Array(n).fill(1), [1, n]),
-      ...graphFeeds(session, graph, n),
+      ...graphFeeds(session, graph, n, refineEdgeDim),
     })).same_logit.data,
   };
 }

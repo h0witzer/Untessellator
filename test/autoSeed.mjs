@@ -32,11 +32,20 @@ import { mergeRegions } from '../js/mergeRegions.js';
 import { attachEdgeGraph } from '../js/edgeGraph.js';
 import { pearlRefine } from '../js/pearl.js';
 
+import { graphInputs } from '../js/seedNet.js';
+
 const ort = createRequire(import.meta.url)('onnxruntime-node');
-/** The patch graph a message-passing seed model takes (seedNet.patchNeighbours), if it takes one. */
-const graphFeeds = (session, graph, n) => (session.inputNames.includes('nbr') && graph
-  ? { nbr: new ort.Tensor('int64', graph.nbr, [1, n, 3]), eattr: new ort.Tensor('float32', graph.eattr, [1, n, 3]) }
-  : {});
+/** The patch graph a message-passing model takes (seedNet.patchNeighbours, seedNet.graphInputs), if it
+ * takes one; `edgeDim` 2 adds the learned boundary probability for refiners trained with --edge-dim 2. */
+const graphFeeds = (session, graph, n, edgeDim = 1) => {
+  if (!(session.inputNames.includes('nbr') && graph)) return {};
+  const g = graphInputs(graph, n, edgeDim);
+  return { nbr: new ort.Tensor('int64', ...g.nbr), eattr: new ort.Tensor('float32', ...g.eattr) };
+};
+/** A model's edge_dim from its sidecar JSON (1 when it has none). */
+const edgeDimOf = (onnxPath) => {
+  try { return JSON.parse(readFileSync(onnxPath.replace(/\.onnx$/, '.json'), 'utf8')).edge_dim ?? 1; } catch { return 1; }
+};
 
 const args = process.argv.slice(2);
 function flag(name, dflt) {
@@ -127,10 +136,11 @@ const runner = async (features, n, graph) => {
 let refiner = null;
 if (REFINE) {
   const rs = await ort.InferenceSession.create(REFINE, { intraOpNumThreads: 2, interOpNumThreads: 1 });
+  const refineEdgeDim = edgeDimOf(REFINE);
   refiner = async (features, n, graph) => ({ sameLogit: (await rs.run({
     features: new ort.Tensor('float32', features, [1, n, features.length / n]),
     mask: new ort.Tensor('float32', new Float32Array(n).fill(1), [1, n]),
-    ...graphFeeds(rs, graph, n),
+    ...graphFeeds(rs, graph, n, refineEdgeDim),
   })).same_logit.data });
 }
 

@@ -8,6 +8,7 @@
 
 import * as ort from 'onnxruntime-web';
 import { preparePaintPositions, paintWith } from './paintCore.js';
+import { graphInputs } from './seedNet.js';
 
 export { FREEFORM_CREASE, ORDER_RANK, typeFinalGroup } from './paintCore.js';
 export { freeformMerge } from './freeformMerge.js';
@@ -25,7 +26,17 @@ export function loadModel(url) {
   return sessions.get(url);
 }
 
-function makeRunner(session) {
+const sidecars = new Map();
+/** A model's sidecar JSON (ml/export_onnx.py, ml/refine_train.py), or {} when it has none. */
+function sidecarFor(url) {
+  if (!sidecars.has(url)) {
+    sidecars.set(url, fetch(url.replace(/\.onnx$/, '.json'))
+      .then((r) => (r.ok ? r.json() : {})).catch(() => ({})));
+  }
+  return sidecars.get(url);
+}
+
+function makeRunner(session, edgeDim = 1) {
   // A message-passing model (ml/model.py MeshConv, e.g. v7gnn) also takes the patch graph that
   // seedNet.patchNeighbours builds; other models ignore it.
   const wantsGraph = session.inputNames.includes('nbr');
@@ -36,8 +47,9 @@ function makeRunner(session) {
     };
     if (wantsGraph) {
       if (!graph) throw new Error('this model needs the patch graph (seedNet.patchNeighbours)');
-      feeds.nbr = new ort.Tensor('int64', graph.nbr, [1, n, 3]);
-      feeds.eattr = new ort.Tensor('float32', graph.eattr, [1, n, 3]);
+      const g = graphInputs(graph, n, edgeDim);
+      feeds.nbr = new ort.Tensor('int64', ...g.nbr);
+      feeds.eattr = new ort.Tensor('float32', ...g.eattr);
     }
     const out = await session.run(feeds);
     return {
@@ -50,7 +62,8 @@ function makeRunner(session) {
 
 /** The model runner for a URL, for callers that fill many times (auto-paint). */
 export async function runnerFor(url) {
-  return makeRunner(await loadModel(url));
+  const [session, meta] = await Promise.all([loadModel(url), sidecarFor(url)]);
+  return makeRunner(session, meta.edge_dim ?? 1);
 }
 
 /**

@@ -200,6 +200,29 @@ export function patchNeighbours(ids, adjacency) {
 }
 
 /**
+ * The patch graph as ONNX inputs, as [data, dims] pairs so either onnxruntime build can wrap them:
+ * nbr (int64, [1, n, 3]) and eattr, either [1, n, 3] (the dihedral / 90, as every model before
+ * 2026-10-03 takes) or, with `edgeDim` 2, [1, n, 3, 2]: the dihedral and the learned boundary
+ * probability (graph.eprob), for refiners trained with ml/refine_train.py --edge-dim 2. A model's
+ * sidecar JSON names its edge_dim; models without one take 1.
+ */
+export function graphInputs(graph, n, edgeDim = 1) {
+  let eattr = graph.eattr;
+  let dims = [1, n, 3];
+  if (edgeDim === 2) {
+    eattr = new Float32Array(n * 6);
+    for (let i = 0; i < n * 3; i++) {
+      eattr[2 * i] = graph.eattr[i];
+      eattr[2 * i + 1] = graph.eprob ? graph.eprob[i] : 0;
+    }
+    dims = [1, n, 3, 2];
+  } else if (edgeDim !== 1) {
+    throw new Error(`unsupported edge_dim ${edgeDim}`);
+  }
+  return { nbr: [graph.nbr, [1, n, 3]], eattr: [eattr, dims] };
+}
+
+/**
  * The surface a surface-head model predicted under `seed`, placed in the world in
  * regionGrow.surfaceEval's format. `surface` is the model's 5-vector (ml/surface_targets.py):
  * the axis in the patch frame, asinh(kn) and asinh(ks), where kn = scale / d and d is the
