@@ -2685,9 +2685,19 @@ expected to show on patches but not on fills. The levers that reach fills are no
 **Decision so far (experiment 3).**
 - Message passing goes into the refiner, with plain max aggregation. Gating, attention and the boundary
   probability added nothing for their cost.
-- Whether `r3mp` replaces `models/fill-refiner.onnx` waits on the Onshape 300 gate (`lab/s19`): auto-paint,
-  then `surfaceScore` with `fetm/ring1`. The single-click gain is clear; whole-part auto-paint is mixed on
-  gmsh.
+- **Onshape 300 gate** (`lab/s19`: auto-paint, then `surfaceScore` with `fetm/ring1`, face-weighted
+  over all 300 parts):
+
+  | | refine1 | r3mp |
+  |---|---|---|
+  | found | 85.99% | 86.60% |
+  | found once | 84.76% | 85.38% |
+  | swallowed | 8.08% | 7.58% |
+  | segments per face | 2.198 | 2.205 |
+
+  Paired by part, found once improves on 27 parts and drops on 11. Auto-paint faces clean is
+  87.6/88.6/87.0 → 87.7/88.6/87.2 by shard.
+- **Shipped** as `models/fill-refiner.onnx` (commit d2b35f0). Solids were not rebuilt for this gate.
 
 ## CAD-clean exports: tangency, exact edges, no slivers (2026-10-03/04)
 
