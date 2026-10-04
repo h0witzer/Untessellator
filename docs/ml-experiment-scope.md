@@ -2652,7 +2652,37 @@ must beat the 12.6k-parameter boundary MLP on fills, or v8 stops there.
   loses 1.7 points of area to splitting (8.0 → 11.1% of area).
 - Time per part rises 10–15%.
 
-**Decision so far.**
+### Experiment 1: a training-only per-facet surface space (2026-10-04)
+
+`runs/v7fsurf` is v7gnn's recipe, seed and data stream with only `--facet-surface` added: every facet
+regresses its own face's axis, asinh kn, asinh ks and type through a shallow head that is never exported.
+
+**Training validation** (OCCT meshes): best IoU 0.8659 against v7gnn's 0.8592. It is ahead at each of
+the last seven evaluations (steps 45k–60k), by +0.004 to +0.009. The EMA copy reaches 0.8654.
+
+**Held-out patches** (`patch_eval.py`):
+
+| | IoU OCCT / NURBS / gmsh / game | Pooled | Error 6+ rings from a border | Type (torus) |
+|---|---|---|---|---|
+| v7gnn | 0.854 / 0.764 / 0.724 / 0.738 | 0.772 | 2.6% | 70.1% (32%) |
+| v7fsurf | 0.855 / 0.777 / 0.768 / 0.733 | 0.792 | 2.3% | 70.4% (35%) |
+
+- gmsh gains most (+0.044): supervising every facet's surface pushes the encoder toward geometry and
+  away from triangulation.
+- The dihedral now carries 5.5% of layer 1's message energy, against 0.7% in v7gnn.
+
+**Fills do not move.**
+- Studio path (`growEval studio:model+r`, auto type, refined fills): 83/74/77/51 against v7gnn's
+  83/76/77/51; paired +8/−11 summed over meshers.
+- Auto-paint area clean: 85.0/85.2/87.3/73.1 against 85.6/84.7/86.6/72.3.
+- The refiner and the minimum cut now decide the region, so a better seed region is absorbed downstream.
+  This is the same pattern as v7gnn, whose +5–7 region points gave +1 to +4 on fills.
+
+**Implication.** Seed-model improvements aimed at the region (experiments 2a, 2b and 4 as queued) can be
+expected to show on patches but not on fills. The levers that reach fills are now the refiner (experiment
+3 shows it) and typing.
+
+**Decision so far (experiment 3).**
 - Message passing goes into the refiner, with plain max aggregation. Gating, attention and the boundary
   probability added nothing for their cost.
 - Whether `r3mp` replaces `models/fill-refiner.onnx` waits on the Onshape 300 gate (`lab/s19`): auto-paint,
