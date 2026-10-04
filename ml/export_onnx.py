@@ -29,7 +29,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from model import SeedFillNet, export_onnx  # noqa: E402
+from model import build_from_args, export_onnx  # noqa: E402
 from patches import FEATURE_NAMES, N_FEATURES, N_TYPES  # noqa: E402
 
 
@@ -55,8 +55,7 @@ def main(argv=None) -> int:
     # with buildFeatures(..., extended = true), which the sidecar JSON tells it.
     n_features = int(ck["args"].get("n_features", N_FEATURES))
     gnn = int(ck["args"].get("gnn_layers", 0))
-    net = SeedFillNet(in_features=n_features, n_types=N_TYPES,
-                      surface=ck["args"].get("surface_root") is not None, gnn_layers=gnn)
+    net = build_from_args(ck["args"], N_TYPES)
     net.load_state_dict(ck["model"])
     net.eval()
     export_onnx(net, str(out), in_features=n_features, zero_cols=zero)
@@ -74,7 +73,8 @@ def main(argv=None) -> int:
     if gnn:
         # a random graph with missing neighbours, to exercise the masking
         nbr = rng.integers(-1, 300, size=(1, 300, 3)).astype(np.int64)
-        ea = rng.random(size=(1, 300, 3)).astype(np.float32)
+        ed = int(ck["args"].get("edge_dim", 1) or 1)
+        ea = rng.random(size=(1, 300, 3) if ed == 1 else (1, 300, 3, ed)).astype(np.float32)
         feeds.update(nbr=nbr, eattr=ea)
         extra = (torch.from_numpy(nbr), torch.from_numpy(ea))
     outs_onnx = ort.InferenceSession(str(out)).run(None, feeds)

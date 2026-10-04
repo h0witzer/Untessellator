@@ -105,5 +105,43 @@ def main(argv=None) -> int:
     return 0 if ok else 1
 
 
+def check_facet_targets(trials: int = 400, seed: int = 0) -> int:
+    """facet_targets() must equal targets() facet by facet, for every kind, on random geometry."""
+    rng = np.random.default_rng(seed)
+    worst, bad = 0.0, 0
+    for _ in range(trials):
+        kinds = rng.choice([st.PLANE, st.CYL, st.CONE, st.SPHERE, st.TORUS], size=4)
+        params = rng.normal(size=(4, 10))
+        params[:, 6] = rng.uniform(0.2, 3.0, size=4)
+        params[:, 7] = rng.uniform(0.05, 0.5, size=4)
+        params[kinds == st.CONE, 6] = rng.uniform(0.1, 1.4, size=int((kinds == st.CONE).sum()))
+        n = 40
+        fid = rng.integers(0, 5, size=n)            # face 4 has no sidecar row: masked out
+        cen = rng.normal(size=(n, 3)) * 2
+        nrm = rng.normal(size=(n, 3))
+        nrm /= np.linalg.norm(nrm, axis=1, keepdims=True)
+        th = rng.uniform(0, 2 * np.pi)
+        R = np.array([[np.cos(th), -np.sin(th), 0], [np.sin(th), np.cos(th), 0], [0, 0, 1.0]])
+        scale = float(rng.uniform(0.5, 5))
+        tgt, msk = st.facet_targets(kinds, params, fid, cen, nrm, R, scale)
+        for i in range(n):
+            if fid[i] >= len(kinds):
+                ref_t, ref_m = np.zeros(5), np.zeros(3)
+            else:
+                ax, ha, kn, hk, ks, hs = st.targets(int(kinds[fid[i]]), params[fid[i]], cen[i], nrm[i], R, scale)
+                ref_t, ref_m = np.r_[ax, kn, ks], np.array([ha, hk, hs])
+            if not np.array_equal(ref_m, msk[i]):
+                bad += 1
+                continue
+            d = float(np.abs((ref_t - tgt[i]) * np.r_[ref_m[0], ref_m[0], ref_m[0], ref_m[1], ref_m[2]]).max())
+            worst = max(worst, d)
+    ok = bad == 0 and worst < 1e-4
+    print(f"facet_targets vs targets: {trials} patches, mask mismatches {bad}, worst value error {worst:.2e}"
+          f" -> {'PASS' if ok else 'FAIL'}")
+    return 0 if ok else 1
+
+
 if __name__ == "__main__":
+    if "--facets" in sys.argv:
+        raise SystemExit(check_facet_targets())
     raise SystemExit(main())

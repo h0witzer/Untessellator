@@ -181,6 +181,9 @@ export function patchNeighbours(ids, adjacency) {
   for (let i = 0; i < n; i++) index.set(ids[i], i);
   const nbr = new BigInt64Array(n * 3).fill(-1n);
   const eattr = new Float32Array(n * 3);
+  // The learned boundary probability of the same edges (js/edgeWall.js annotateEdges), 0 when the
+  // mesh has not been scored: a second edge attribute for refiners trained with --edge-dim 2.
+  const eprob = new Float32Array(n * 3);
   for (let i = 0; i < n; i++) {
     let k = 0;
     for (const e of adjacency.get(ids[i]) || []) {
@@ -189,10 +192,11 @@ export function patchNeighbours(ids, adjacency) {
       if (j === undefined) continue;
       nbr[i * 3 + k] = BigInt(j);
       eattr[i * 3 + k] = e.angle / 90;
+      eprob[i * 3 + k] = e.boundary ?? 0;
       k++;
     }
   }
-  return { nbr, eattr };
+  return { nbr, eattr, eprob };
 }
 
 /**

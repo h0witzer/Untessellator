@@ -113,6 +113,79 @@ def targets(kind: int, p: np.ndarray, q: np.ndarray, n: np.ndarray, R: np.ndarra
     return _NONE
 
 
+def facet_targets(kinds: np.ndarray, params: np.ndarray, face_ids: np.ndarray, cen: np.ndarray,
+                  nrm: np.ndarray, R: np.ndarray, scale: float):
+    """targets() for EVERY facet of a patch: each facet against its OWN face's surface, evaluated
+    at that facet's centroid and normal, in the patch frame. Vectorised per face; agrees with
+    targets() facet by facet (test_surface_targets.py --facets). Feeds the training-only per-facet
+    surface head (model.SeedFillNet facet_surface).
+
+    Returns (targets (n, 5) float32, masks (n, 3) float32: has axis, has kn, has ks).
+    """
+    n = len(face_ids)
+    tgt = np.zeros((n, N_SURFACE), np.float32)
+    msk = np.zeros((n, 3), np.float32)
+    nrm = np.asarray(nrm, np.float64)
+    nrm = nrm / (np.linalg.norm(nrm, axis=1, keepdims=True) + 1e-30)
+    cen = np.asarray(cen, np.float64)
+    sgn = lambda x: np.where(x >= 0, 1.0, -1.0)
+    for f in np.unique(face_ids):
+        if f >= len(kinds):
+            continue
+        sel = np.nonzero(face_ids == f)[0]
+        kind, p = int(kinds[f]), params[f]
+        Q, Nn = cen[sel], nrm[sel]
+        if kind == PLANE:
+            msk[sel, 1] = 1.0
+            continue
+        if kind == SPHERE:
+            if p[6] <= 0:
+                continue
+            u = Q - p[0:3]
+            ok = np.linalg.norm(u, axis=1) > 1e-300
+            kn = sgn((Nn * u).sum(1)) * scale / p[6]
+            tgt[sel[ok], 3] = np.arcsinh(kn[ok])
+            msk[sel[ok], 1] = 1.0
+            continue
+        if kind not in (CYL, CONE, TORUS):
+            continue
+        a = _unit(p[3:6])
+        if a is None:
+            continue
+        tgt[sel, 0:3] = R @ a
+        msk[sel, 0] = 1.0
+        w = Q - p[0:3]
+        perp = w - np.outer(w @ a, a)
+        pn = np.linalg.norm(perp, axis=1)
+        safe = np.maximum(pn, 1e-300)[:, None]
+        if kind == CYL:
+            ok = (pn > 1e-300) & (p[6] > 0)
+            kn = sgn((Nn * (perp / safe)).sum(1)) * scale / p[6] if p[6] > 0 else np.zeros(len(sel))
+            tgt[sel[ok], 3] = np.arcsinh(kn[ok])
+            msk[sel[ok], 1] = 1.0
+        elif kind == CONE:
+            ok = pn > 1e-300
+            kn = sgn((Nn * (perp / safe)).sum(1)) * scale * math.cos(p[6]) / np.maximum(pn, 1e-300)
+            tgt[sel[ok], 3] = np.arcsinh(np.clip(kn[ok], -KN_CLIP, KN_CLIP))
+            msk[sel[ok], 1] = 1.0
+        else:  # TORUS
+            if p[6] <= 0 or p[7] <= 0:
+                continue
+            ok = pn > 1e-300
+            u = perp / safe
+            t = p[0:3] + p[6] * u
+            sn = sgn((Nn * (Q - t)).sum(1))
+            kn = sn * scale / p[7]
+            nperp = Nn - np.outer(Nn @ a, a)
+            side = sgn(sn * (nperp * u).sum(1))
+            ks = side * scale / p[6]
+            tgt[sel[ok], 3] = np.arcsinh(np.clip(kn[ok], -KN_CLIP, KN_CLIP))
+            tgt[sel[ok], 4] = np.arcsinh(ks[ok])
+            msk[sel[ok], 1] = 1.0
+            msk[sel[ok], 2] = 1.0
+    return tgt, msk
+
+
 def reconstruct(kind, axis, asinh_kn: float, asinh_ks: float = 0.0):
     """The surface implied by (axis, kn, ks) in the patch frame: seed at the origin, facet normal
     +Z, unit length = scale. Returns (kind, params) or None when the numbers do not define one."""

@@ -41,10 +41,10 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from model import SeedFillNet, count_parameters  # noqa: E402
+from model import build_from_args, count_parameters  # noqa: E402
 from occ_tessellate import TYPE_NAMES  # noqa: E402
 from patches import (BakedPatches, FEATURE_NAMES, FEATURE_NAMES_V6, N_TYPES, collate,  # noqa: E402
-                     collate_graph, collate_surface, collate_weights)
+                     collate_facet_surface, collate_graph, collate_surface, collate_weights)
 
 
 class PatchStream(IterableDataset):
@@ -52,7 +52,8 @@ class PatchStream(IterableDataset):
                  densities: tuple[str, ...], type_weights=None, seed: int = 0,
                  relabel_root: Path | None = None, surface_root: Path | None = None,
                  extended: bool = False, exclude_prob: float = 0.0, gnn: bool = False,
-                 hard_rings: int = 0, boundary_seed_prob: float = 0.0):
+                 hard_rings: int = 0, boundary_seed_prob: float = 0.0, facet_surface: bool = False):
+        self.facet_surface = facet_surface
         self.gnn = gnn
         self.hard_rings = hard_rings
         self.boundary_seed_prob = boundary_seed_prob
@@ -78,7 +79,8 @@ class PatchStream(IterableDataset):
                           surface_root=self.surface_root, extended=self.extended,
                           exclude_prob=self.exclude_prob, gnn=self.gnn,
                           hard_rings=getattr(self, "hard_rings", 0),
-                          boundary_seed_prob=getattr(self, "boundary_seed_prob", 0.0))
+                          boundary_seed_prob=getattr(self, "boundary_seed_prob", 0.0),
+                          facet_surface=getattr(self, "facet_surface", False))
         for s in ds:
             yield s
 
@@ -93,7 +95,8 @@ class Collate:
     """
 
     def __init__(self, max_facets: int, zero_cols: tuple[int, ...] = (), surface: bool = False,
-                 gnn: bool = False, hard_weight: float = 1.0):
+                 gnn: bool = False, hard_weight: float = 1.0, facet_surface: bool = False):
+        self.facet_surface = facet_surface
         self.max_facets = max_facets
         self.zero_cols = list(zero_cols)
         self.surface = surface
@@ -108,13 +111,44 @@ class Collate:
         if self.surface:
             s, k = collate_surface(batch)
             out += (torch.from_numpy(s), torch.from_numpy(k))
-        # Layout: x y m t [surface target, mask] [loss weights] [nbr eattr] - the graph stays last.
+        # Layout: x y m t [surface target, mask] [facet target, mask, type] [loss weights] [nbr eattr]
+        # - the graph stays last; batch_index() names the positions.
+        if getattr(self, "facet_surface", False):
+            out += tuple(torch.from_numpy(a) for a in collate_facet_surface(batch, self.max_facets))
         if getattr(self, "hard_weight", 1.0) != 1.0:
             out += (torch.from_numpy(collate_weights(batch, self.max_facets, self.hard_weight)),)
         if self.gnn:
             nbr, ea = collate_graph(batch, self.max_facets)
             out += (torch.from_numpy(nbr), torch.from_numpy(ea))
         return out
+
+
+def batch_index(args) -> dict:
+    """Positions of the optional tensors in a collated TRAINING batch (Collate's layout)."""
+    i, at = 4, {}
+    if args.surface_root is not None:
+        at["surface"], at["surface_mask"] = i, i + 1
+        i += 2
+    if getattr(args, "facet_surface", False):
+        at["fsurf"], at["fsurf_mask"], at["ftype"] = i, i + 1, i + 2
+        i += 3
+    if args.hard_weight != 1.0:
+        at["weight"] = i
+    return at
+
+
+def facet_surface_loss(pred, tgt, msk, ftype, m, cls_w):
+    """The training-only per-facet surface space: each facet's own face's axis (sign-free),
+    asinh kn, asinh ks, and type."""
+    pred = pred.float()
+    ax = F.normalize(pred[..., :3], dim=-1)
+    ma, mk, ms = msk[..., 0] * m, msk[..., 1] * m, msk[..., 2] * m
+    la = ((1 - (ax * tgt[..., :3]).sum(-1) ** 2) * ma).sum() / ma.sum().clamp(min=1)
+    lk = (F.smooth_l1_loss(pred[..., 3], tgt[..., 3], reduction="none") * mk).sum() / mk.sum().clamp(min=1)
+    ls = (F.smooth_l1_loss(pred[..., 4], tgt[..., 4], reduction="none") * ms).sum() / ms.sum().clamp(min=1)
+    nt = pred.shape[-1] - 5
+    lt = F.cross_entropy(pred[..., 5:].reshape(-1, nt), ftype.reshape(-1), weight=cls_w, ignore_index=-100)
+    return la + lk + ls + 0.5 * lt
 
 
 def surface_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor):
@@ -138,10 +172,12 @@ def make_loader(files, args, type_weights, shuffle_seed, exclude_prob=0.0, train
                          tuple(args.densities.split(",")), type_weights, shuffle_seed,
                          args.relabel, args.surface_root, args.features == "v6", exclude_prob,
                          args.gnn_layers > 0, args.hard_rings if hard else 0,
-                         args.boundary_seeds if training else 0.0)
+                         args.boundary_seeds if training else 0.0,
+                         facet_surface=args.facet_surface and training)
     return DataLoader(stream, batch_size=args.batch,
                       collate_fn=Collate(args.max_facets, args.zero_cols, args.surface_root is not None,
-                                         args.gnn_layers > 0, args.hard_weight),
+                                         args.gnn_layers > 0, args.hard_weight,
+                                         facet_surface=args.facet_surface and training),
                       num_workers=args.workers, persistent_workers=args.workers > 0,
                       prefetch_factor=4 if args.workers > 0 else None)
 
@@ -173,6 +209,7 @@ def graph_inputs(batch, model):
 @torch.no_grad()
 def evaluate(model, loader, device, max_batches: int, weight_index: int | None = None):
     model.eval()
+    model.emit_aux = False
     tp = fp = fn_ = 0.0
     btp = bfp = bfn = 0.0          # the same, inside the smooth-boundary band only
     type_hit = np.zeros(N_TYPES, np.int64)
@@ -286,6 +323,20 @@ def main(argv=None) -> int:
     ap.add_argument("--gnn-layers", type=int, default=0,
                     help="message-passing layers over the patch's facet adjacency (model.MeshConv) "
                          "between the per-facet encoder and the pool; 0 is the PointNet")
+    ap.add_argument("--edge-dim", type=int, default=1, help=argparse.SUPPRESS)
+    ap.add_argument("--agg", choices=("max", "gate", "attn"), default="max",
+                    help="how MeshConv combines a facet's three messages (model.MeshConv)")
+    ap.add_argument("--seed-concat", action="store_true",
+                    help="give the membership head the seed's embedding and h_i - h_seed")
+    ap.add_argument("--seed-attn", type=int, default=0,
+                    help="heads of seed-query cross-attention feeding the membership head; 0 = off")
+    ap.add_argument("--facet-surface", action="store_true",
+                    help="training-only head: every facet regresses its own face's surface and type "
+                         "(needs --surface-root); never exported")
+    ap.add_argument("--facet-loss-weight", type=float, default=0.5)
+    ap.add_argument("--ema", type=float, default=0.0,
+                    help="also keep an exponential moving average of the weights with this decay, "
+                         "evaluated and saved separately (best_ema.pt); the trained weights are untouched")
     ap.add_argument("--zero-features", default="",
                     help="comma list of patches.FEATURE_NAMES to hold at zero, e.g. "
                          "log_area,ring: inputs that describe the triangulation rather than "
@@ -378,8 +429,22 @@ def main(argv=None) -> int:
     cls_w = torch.tensor((1.0 / np.maximum(types, 1)) / (1.0 / np.maximum(types, 1)).sum()
                          * N_TYPES, dtype=torch.float32, device=device)
 
-    model = SeedFillNet(in_features=args.n_features, n_types=N_TYPES,
-                        surface=args.surface_root is not None, gnn_layers=args.gnn_layers).to(device)
+    if args.facet_surface and args.surface_root is None:
+        print("--facet-surface needs --surface-root", file=sys.stderr)
+        return 2
+    model = build_from_args(vars(args), N_TYPES).to(device)
+    model.emit_aux = args.facet_surface
+    print(f"variants    agg {args.agg}, seed concat {args.seed_concat}, seed attention heads "
+          f"{args.seed_attn}, per-facet surface head {args.facet_surface} "
+          f"(weight {args.facet_loss_weight}), EMA {args.ema or 'off'}")
+    ema = ema_params = model_params = None
+    if args.ema > 0:
+        import copy
+        ema = copy.deepcopy(model).eval()
+        for p in ema.parameters():
+            p.requires_grad_(False)
+        ema_params, model_params = list(ema.parameters()), list(model.parameters())
+    at = batch_index(args)
     print(f"graph       {args.gnn_layers} message-passing layers" if args.gnn_layers else "graph       none (PointNet)")
     print(f"hard band   loss weight {args.hard_weight} within {args.hard_rings} rings of a smooth boundary; "
           f"boundary seeds {args.boundary_seeds:.0%}")
@@ -399,7 +464,7 @@ def main(argv=None) -> int:
     train_loader = make_loader(train_files, args, tw, args.seed, args.exclude_prob, training=True)
     val_loader = make_loader(val_files, args, None, args.seed + 1)
 
-    best = -1.0
+    best = best_ema = -1.0
     step = 0
     t0 = time.time()
     run_loss = run_seg = run_cls = 0.0
@@ -415,7 +480,7 @@ def main(argv=None) -> int:
             x, y, m, t = batch[:4]
             wm = m
             if args.hard_weight != 1.0:
-                wm = batch[6 if args.surface_root is not None else 4]
+                wm = batch[at["weight"]]
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
                 outs = model(x, m, *graph_inputs(batch, model))
                 sl, tl = outs[0], outs[1]
@@ -424,15 +489,23 @@ def main(argv=None) -> int:
                 cls = F.cross_entropy(tl.float(), t, weight=cls_w)
                 loss = seg + args.type_loss_weight * cls
                 surf = torch.zeros((), device=device)
-                if len(outs) == 3:
-                    surf = surface_loss(outs[2], batch[4], batch[5])
+                if args.surface_root is not None:
+                    surf = surface_loss(outs[2], batch[at["surface"]], batch[at["surface_mask"]])
                     loss = loss + args.surface_loss_weight * surf
+                if args.facet_surface:
+                    fl = facet_surface_loss(outs[-1], batch[at["fsurf"]], batch[at["fsurf_mask"]],
+                                            batch[at["ftype"]], m, cls_w)
+                    loss = loss + args.facet_loss_weight * fl
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             sched.step()
+            if ema is not None:
+                with torch.no_grad():
+                    torch._foreach_mul_(ema_params, args.ema)
+                    torch._foreach_add_(ema_params, model_params, alpha=1 - args.ema)
 
             run_loss += float(loss); run_seg += float(seg); run_cls += float(cls)
             run_surf = (run_surf if step % 100 else 0.0) + float(surf)
@@ -446,14 +519,17 @@ def main(argv=None) -> int:
                 run_loss = run_seg = run_cls = 0.0
 
             if step % args.eval_every == 0 or step == args.steps:
-                ev = evaluate(model, val_loader, device, args.eval_batches,
-                              (6 if args.surface_root is not None else 4) if args.hard_weight != 1.0 else None)
+                vw = (6 if args.surface_root is not None else 4) if args.hard_weight != 1.0 else None
+                ev = evaluate(model, val_loader, device, args.eval_batches, vw)
+                model.emit_aux = args.facet_surface
+                ev_ema = evaluate(ema, val_loader, device, args.eval_batches, vw) if ema is not None else None
                 per = {TYPE_NAMES[i]: (round(float(ev["type_hit"][i] / ev["type_tot"][i]), 3)
                                        if ev["type_tot"][i] else None)
                        for i in range(N_TYPES)}
                 macro = np.mean([v for v in per.values() if v is not None])
                 print(f"\n  [eval @ {step:,}] membership IoU {ev['iou']:.4f}  "
-                      f"precision {ev['precision']:.4f}  recall {ev['recall']:.4f}")
+                      f"precision {ev['precision']:.4f}  recall {ev['recall']:.4f}"
+                      + (f"   EMA IoU {ev_ema['iou']:.4f}" if ev_ema else ""))
                 print(f"              type macro-acc {macro:.3f}  {per}", flush=True)
                 if ev["band"]:
                     print(f"              smooth-boundary band: IoU {ev['band']['iou']:.4f}  "
@@ -468,7 +544,8 @@ def main(argv=None) -> int:
                                        "type_macro": float(macro), "per_type": per,
                                        "axis_err_p50": ev["axis_err_p50"],
                                        "kn_asinh_err_p50": ev["kn_asinh_err_p50"],
-                                       "kn_sign_acc": ev["kn_sign_acc"], "band": ev["band"]}) + "\n")
+                                       "kn_sign_acc": ev["kn_sign_acc"], "band": ev["band"],
+                                       "ema_iou": ev_ema["iou"] if ev_ema else None}) + "\n")
                 logf.flush()
                 if ev["iou"] > best:
                     best = ev["iou"]
@@ -476,6 +553,11 @@ def main(argv=None) -> int:
                                 "iou": best, "args": vars(args),
                                 "pos_weight": pw, "type_names": list(TYPE_NAMES)},
                                args.out / "best.pt")
+                if ev_ema and ev_ema["iou"] > best_ema:
+                    best_ema = ev_ema["iou"]
+                    torch.save({"model": ema.state_dict(), "step": step, "iou": best_ema, "args": vars(args),
+                                "pos_weight": pw, "type_names": list(TYPE_NAMES), "ema": args.ema},
+                               args.out / "best_ema.pt")
 
             if step >= args.steps:
                 done = True

@@ -38,7 +38,9 @@ from model import SeedFillNet, count_parameters, export_onnx  # noqa: E402
 MAX_FACETS = 512
 
 
-def load(prefixes: list[str]):
+def load(prefixes: list[str], eprob: bool = False):
+    """Concatenated dumps. With `eprob`, EA carries a second edge attribute per neighbour, the learned
+    boundary probability (<prefix>.eprob, written by refineDump.mjs since 2026-10-03)."""
     X, M, NB, EA, patches = [], [], [], [], []
     base = 0
     for p in prefixes:
@@ -48,6 +50,8 @@ def load(prefixes: list[str]):
         m = np.fromfile(p + ".meta", np.int32).reshape(-1, 7)
         nb = np.fromfile(p + ".nbr", np.int32).reshape(-1, 3)
         ea = np.fromfile(p + ".eattr", np.float32).reshape(-1, 3)
+        if eprob:
+            ea = np.stack([ea, np.fromfile(p + ".eprob", np.float32).reshape(-1, 3)], axis=-1)
         X.append(x); M.append(m); NB.append(nb); EA.append(ea)
         off = base
         for rec in hdr["patches"]:
@@ -73,7 +77,7 @@ class Batches:
             reg = np.zeros((b, MAX_FACETS), np.float32)
             m = np.zeros((b, MAX_FACETS), np.float32)
             nb = np.full((b, MAX_FACETS, 3), -1, np.int64)
-            ea = np.zeros((b, MAX_FACETS, 3), np.float32)
+            ea = np.zeros((b, MAX_FACETS) + self.EA.shape[1:], np.float32)
             click = np.zeros(b, bool)
             for i, pi in enumerate(chunk):
                 rec = self.patches[pi]
@@ -128,6 +132,10 @@ def main() -> int:
     ap.add_argument("--val", required=True)
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--gnn-layers", type=int, default=0)
+    ap.add_argument("--agg", choices=("max", "gate", "attn"), default="max",
+                    help="how each MeshConv layer combines a facet's three messages (model.MeshConv)")
+    ap.add_argument("--edge-dim", type=int, choices=(1, 2), default=1,
+                    help="2 adds the learned boundary probability (.eprob) to the dihedral as an edge attribute")
     ap.add_argument("--epochs", type=int, default=12)
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -138,8 +146,8 @@ def main() -> int:
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
 
-    *tr, trp, ncol, cols = load(args.train.split(","))
-    *va, vap, _, _ = load(args.val.split(","))
+    *tr, trp, ncol, cols = load(args.train.split(","), args.edge_dim == 2)
+    *va, vap, _, _ = load(args.val.split(","), args.edge_dim == 2)
     train_data = (*tr, trp)
     val_data = (*va, vap)
     pos = float(tr[1][:, 4].mean())
@@ -148,8 +156,10 @@ def main() -> int:
     print(f"train {len(trp):,} patches ({n_click:,} with a click), {len(tr[0]):,} rows; val {len(vap):,} patches; "
           f"{ncol} inputs; positive rate {pos:.3f}; device {device}")
 
-    net = SeedFillNet(in_features=ncol, n_types=2, surface=False, gnn_layers=args.gnn_layers).to(device)
-    print(f"parameters {count_parameters(net):,}; message passing {args.gnn_layers} layers")
+    net = SeedFillNet(in_features=ncol, n_types=2, surface=False, gnn_layers=args.gnn_layers,
+                      edge_dim=args.edge_dim, agg=args.agg).to(device)
+    print(f"parameters {count_parameters(net):,}; message passing {args.gnn_layers} layers, "
+          f"aggregation {args.agg}, edge attributes {args.edge_dim}")
     steps = args.epochs * ((len(trp) + args.batch - 1) // args.batch)
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=steps, pct_start=0.05)
@@ -186,11 +196,13 @@ def main() -> int:
             torch.save({"model": net.state_dict(), "epoch": epoch, "args": vars(args), "ncol": ncol,
                         "columns": cols}, args.out / "refine.pt")
     ck = torch.load(args.out / "refine.pt", map_location="cpu", weights_only=False)
-    net = SeedFillNet(in_features=ncol, n_types=2, surface=False, gnn_layers=args.gnn_layers)
+    net = SeedFillNet(in_features=ncol, n_types=2, surface=False, gnn_layers=args.gnn_layers,
+                      edge_dim=args.edge_dim, agg=args.agg)
     net.load_state_dict(ck["model"])
     export_onnx(net, str(args.out / "refine.onnx"), in_features=ncol)
     (args.out / "refine.json").write_text(json.dumps({"refine": True, "n_features": ncol, "refineColumns": cols,
-                                                      "gnn_layers": args.gnn_layers, "epoch": ck["epoch"]}))
+                                                      "gnn_layers": args.gnn_layers, "agg": args.agg,
+                                                      "edge_dim": args.edge_dim, "epoch": ck["epoch"]}))
     print(f"best plain IoU {best:.4f} (epoch {ck['epoch']}) -> {args.out / 'refine.onnx'}")
     return 0
 

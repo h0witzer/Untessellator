@@ -2506,6 +2506,112 @@ the relation exactly; "exact" means within 1e-9 rad and 1e-9 of the diagonal):
 
 ---
 
+## Inside the models: an architecture audit (2026-10-03)
+
+**Why.** Every model so far was judged by what comes out of it: fills, groups, solids. This audit opens
+them up: their layers, their trained weights, and where on held-out patches they go wrong. The aim was
+to choose the next architecture changes from evidence rather than taste.
+
+**Tools.**
+- `ml/patch_eval.py` is the new quick gate. It scores any seed-model or refiner checkpoint on the
+  refiner's held-out dump: 2,067 patches from fill_eval parts no model trained on (OCCT 472, NURBS→OCCT
+  512, gmsh 606, game-style 477). It runs in about 10 s on the 3090. It reports:
+  - IoU, precision and recall per mesher;
+  - clean patches (≥ 95% precision and recall inside the patch);
+  - error rate by ring distance to the nearest face border;
+  - type confusion;
+  - per-MeshConv-layer message composition.
+- `ml/test_model_variants.py` builds, trains and exports every `SeedFillNet` option. For each it checks
+  for padding leaks and compares onnxruntime with PyTorch.
+
+**The models, by count.**
+
+| Model | Family | Linear | LayerNorm | Graph layers | Deepest path | Params |
+|---|---|---|---|---|---|---|
+| v7gnn | PointNet + 6 MeshConv | 24 | 19 | 6 | 19 | 709,263 |
+| refine1 | PointNet | 9 | 5 | 0 | 7 | 275,779 |
+| edge-boundary v2 | MLP | 3 | 0 | 0 | 3 | 12,577 |
+| verifier | MLP × 5 seeds | 3 | 0 | 0 | 3 | 5,825 each |
+
+- MeshConv is EdgeConv on the fixed dual graph: the message is MLP([hᵢ, hⱼ − hᵢ, θᵢⱼ]), then a max over
+  ≤ 3 neighbours, then LayerNorm(hᵢ + ReLU(max)).
+- Skip connections are all in v7gnn: 6 residuals, the long local-to-membership-head concat, and the seed
+  row to the surface head. The refiner has only the long concat.
+- Nothing is stored beside the weights except the edge model's 32 means and standard deviations and the
+  ONNX zero-input mask. There are no running statistics, optimizer state or EMA copy.
+
+**Findings.**
+1. **The dihedral edge attribute is unused.** It is 0.25–0.70% of each MeshConv layer's message energy.
+   Zeroing it at inference changes nothing: pooled patch IoU 0.772 → 0.776, type 70.1% → 70.1%.
+2. **Every layer is busy.**
+   - Update ratio ‖ReLU(a)‖ / ‖h‖ is 0.62 in layer 1 and 0.37–0.45 after.
+   - Own state is 87% of the layer 1 message and 60–75% later; neighbour difference is the rest.
+   - Message passing moved the membership head toward patch context: 63% local in v6feat, 50% in v7gnn.
+   - The surface head draws 84% from the pooled descriptor and 16% from the seed's own row.
+3. **First-layer sensitivity** (‖weight column‖ × input standard deviation; a proxy, not an ablation).
+   - **Seed model:** the closed-form fit distances on the seed ring lead: cylinder 3.09, sphere 2.95,
+     cone 2.70. Next come dz 1.71, log_area 1.13 and the crease bottleneck 0.91. Normal-spread
+     eigenvalues and ring index are barely used.
+   - **Refiner:** signed distance to the first fill's surface 6.13, distance 4.90 and `epath` 4.65 lead.
+     `in_region` is only 0.44: it re-decides from geometry instead of copying the fill.
+   - **Boundary MLP:** the better side's own residual 5.51 and the dihedral 4.48 lead; `same_kind` 0.45
+     is last.
+   - The two zeroed curvature columns still hold their random initial weights: they never received a
+     gradient. The ONNX zeroing makes them harmless.
+4. **The refiner is the second half of the filler, and much the better half.** IoU inside the patch
+   (OCCT / NURBS / gmsh / game):
+
+   | | IoU | Precision | Recall |
+   |---|---|---|---|
+   | seed model's raw region | 0.85 / 0.76 / 0.72 / 0.74 | 0.73–0.87 | 0.94–0.98 |
+   | fit test, connected to the click | 0.77 / 0.72 / 0.68 / 0.58 | | |
+   | first fill (model → fitter → growth) | 0.84 / 0.77 / 0.79 / 0.62 | 0.82–0.88 | 0.71–0.95 |
+   | refiner | **0.93 / 0.85 / 0.90 / 0.81** | 0.87–0.95 | 0.91–0.98 |
+
+   - Clean patches: 63/53/47/38% → 75/61/59/57%.
+   - Per patch the refiner is better 31–54% of the time and worse 5–9%.
+   - The gain is information, not capacity. The refiner is the smaller network, but it is handed a
+     fitted surface. The fit test alone scores far below it, so its judgement adds 11–23 points.
+5. **The two models fail differently.**
+
+   | | Error rate touching a border | Error rate 6+ rings away | Errors within 2 rings |
+   |---|---|---|---|
+   | v7gnn | 7.8% | 2.6% | 43% |
+   | refiner | 6.3% | 0.5% | 67% |
+
+   The seed model's errors are mostly whole regions: it claims a neighbouring face. Once a surface is
+   known, what remains is at the borders.
+6. **The type head's confusion is not pool dilution.**
+   - Tori are called B-spline 47% of the time; 31% of cylinders are called cone, extrusion or B-spline.
+   - Accuracy does not depend on how much of the patch is the seed's face: 0.72 when under 15%, 0.69
+     when over 75%.
+   - Feeding the trained head a max over only the predicted face helped cones, spheres and tori but
+     cost planes 90 → 72% and cylinders 69 → 55%. It uses neighbours as context.
+   - A torus fillet and a B-spline fillet look alike locally. Telling them apart needs a constant tube
+     radius and a circular centre line, which is a representation question.
+
+**Plan (agreed 2026-10-03), in order, each gated on `patch_eval.py` first and fills second.**
+1. **Training-only per-facet surface space** (`train.py --facet-surface`).
+   - Every facet regresses its own face's axis, asinh kn, asinh ks (`surface_targets.facet_targets`,
+     checked against `targets()` by `test_surface_targets.py --facets`) and its type.
+   - The head is shallow and on the facet's own embedding, and it is never exported.
+   - Run `runs/v7fsurf`: v7gnn's recipe, seed and data stream with only this added.
+2. **Seed comparison** (`--seed-concat`, then `--seed-attn H`). It targets the whole-region errors: the
+   membership head has never seen the seed's own embedding.
+3. **Refiner message passing and border-aware aggregation.**
+   - Flags: `refine_train.py --gnn-layers 6 --agg max|gate|attn --edge-dim 1|2`.
+   - `--edge-dim 2` adds the learned boundary probability per edge, which `refineDump.mjs` now writes
+     as `.eprob`.
+   - It targets the refiner's border errors.
+4. **Cross-mesher contrastive head.** Needs a loader that pairs the same part across bakes.
+5. **EMA weights** (`--ema`). They are evaluated and saved separately, so they never confound a run.
+
+A unified v8 was sketched alongside: one mesh-level encoder, and edge, type and click heads, with the
+click head run twice to merge the seed model and the refiner. Its first stage (encoder plus edge head)
+must beat the 12.6k-parameter boundary MLP on fills, or v8 stops there.
+
+---
+
 ## Sources
 
 - ABC dataset: https://deep-geometry.github.io/abc-dataset/ — paper https://arxiv.org/abs/1812.06216, supplementary https://cims.nyu.edu/gcl/papers/2019-ABC-Dataset-Supplemental.pdf (surface taxonomy and feature-file schema)

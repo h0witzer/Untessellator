@@ -12,7 +12,8 @@
  *
  * Files: <prefix>.feat (float32, N_REFINE per facet), <prefix>.meta (int32 per facet: patch, mesher,
  * part, seed type, same face, same type, in patch region), <prefix>.nbr (int32, 3 per facet: patch
- * graph), <prefix>.eattr (float32, 3 per facet: those edges' dihedral / 90), <prefix>.json. Training data must come from parts no model in the loop trained on: the edge
+ * graph), <prefix>.eattr (float32, 3 per facet: those edges' dihedral / 90), <prefix>.eprob (float32,
+ * 3 per facet: those edges' learned boundary probability), <prefix>.json. Training data must come from parts no model in the loop trained on: the edge
  * model's scores are in the inputs, so pass one that did not see these parts.
  */
 
@@ -65,6 +66,7 @@ const featFd = openSync(`${OUT}.feat`, 'w');
 const metaFd = openSync(`${OUT}.meta`, 'w');
 const nbrFd = openSync(`${OUT}.nbr`, 'w');
 const eattrFd = openSync(`${OUT}.eattr`, 'w');
+const eprobFd = openSync(`${OUT}.eprob`, 'w');
 const patches = [];
 let rows = 0;
 // One generator per part (seeded by its index), so shards need not load each other's meshes. These
@@ -81,6 +83,7 @@ function write(r, meta) {
   for (let i = 0; i < n * 3; i++) nb[i] = Number(r.graph.nbr[i]);
   writeSync(nbrFd, new Uint8Array(nb.buffer));
   writeSync(eattrFd, new Uint8Array(r.graph.eattr.buffer, r.graph.eattr.byteOffset, n * 3 * 4));
+  writeSync(eprobFd, new Uint8Array(r.graph.eprob.buffer, r.graph.eprob.byteOffset, n * 3 * 4));
   rows += n;
 }
 
@@ -162,6 +165,7 @@ closeSync(featFd);
 closeSync(metaFd);
 closeSync(nbrFd);
 closeSync(eattrFd);
+closeSync(eprobFd);
 writeFileSync(`${OUT}.json`, JSON.stringify({ ncol: N_REFINE, refineColumns: REFINE_COLUMNS, meshers: manifest.variants,
   typeNames: TYPE_NAMES, rows, patches }, null, 0));
 console.log(`wrote ${rows} rows from ${patches.length} patches to ${OUT}.*`);

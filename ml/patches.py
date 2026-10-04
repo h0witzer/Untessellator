@@ -51,7 +51,7 @@ from meshcore import (  # noqa: E402
 )
 from seedfeatures import EXT_FEATURE_NAMES, adjacency_csr_angles, ext_features  # noqa: E402
 from occ_tessellate import TYPE_NAMES  # noqa: E402
-from surface_targets import N_SURFACE, targets as surface_targets  # noqa: E402
+from surface_targets import N_SURFACE, facet_targets, targets as surface_targets  # noqa: E402
 
 N_TYPES = len(TYPE_NAMES)
 N_FEATURES = 12
@@ -111,7 +111,7 @@ def extract_patch(facets: dict, indptr, indices, face_id: np.ndarray,
                   surface: tuple | None = None, extended: bool = False,
                   eangles: np.ndarray | None = None,
                   excluded: np.ndarray | None = None, gnn: bool = False,
-                  hard_rings: int = 0) -> dict | None:
+                  hard_rings: int = 0, facet_surface: bool = False) -> dict | None:
     """Build one training sample around `seed`. Returns None if the patch is too small.
 
     `surface` is a (kind, params) pair from surface_sidecar.py, indexed by face id. When given,
@@ -193,6 +193,13 @@ def extract_patch(facets: dict, indptr, indices, face_id: np.ndarray,
             tgt[0:3], tgt[3], tgt[4] = ax, kn, ks
             msk[:] = (ha, hk, hs)
         out.update(surface=tgt, surface_mask=msk, R=R, q=np.asarray(seed_pos, np.float64))
+    if facet_surface:
+        # every facet's OWN face's surface and type: the training-only per-facet head
+        if surface is not None:
+            ft, fm = facet_targets(surface[0], surface[1], face_id[ids], cen, nrm, R, scale)
+        else:
+            ft, fm = np.zeros((ids.size, N_SURFACE), np.float32), np.zeros((ids.size, 3), np.float32)
+        out.update(fsurf=ft, fsurf_mask=fm, ftype=face_type[ids].astype(np.int64))
     return out
 
 
@@ -277,6 +284,22 @@ def collate_graph(samples: list[dict], max_facets: int):
     return nbr, eattr
 
 
+def collate_facet_surface(samples: list[dict], max_facets: int):
+    """Per-facet surface targets, masks and face types; padding and missing sidecars are masked
+    (type -100 is cross_entropy's ignore index)."""
+    b = len(samples)
+    tgt = np.zeros((b, max_facets, N_SURFACE), np.float32)
+    msk = np.zeros((b, max_facets, 3), np.float32)
+    typ = np.full((b, max_facets), -100, np.int64)
+    for i, s in enumerate(samples):
+        k = min(s["n"], max_facets)
+        if "fsurf" in s:
+            tgt[i, :k] = s["fsurf"][:k]
+            msk[i, :k] = s["fsurf_mask"][:k]
+            typ[i, :k] = s["ftype"][:k]
+    return tgt, msk, typ
+
+
 def collate_surface(samples: list[dict]):
     """Surface targets and their masks; samples without a sidecar contribute zeros, masked out."""
     b = len(samples)
@@ -302,7 +325,7 @@ class BakedPatches:
                  files: list[Path] | None = None, relabel_root: Path | None = None,
                  surface_root: Path | None = None, extended: bool = False,
                  exclude_prob: float = 0.0, gnn: bool = False, hard_rings: int = 0,
-                 boundary_seed_prob: float = 0.0):
+                 boundary_seed_prob: float = 0.0, facet_surface: bool = False):
         self.root = Path(root)
         self.densities = tuple(densities)
         self.max_facets = max_facets
@@ -334,6 +357,7 @@ class BakedPatches:
         # facets next to a smooth face boundary, where fills actually go wrong.
         self.hard_rings = hard_rings
         self.boundary_seed_prob = boundary_seed_prob
+        self.facet_surface = facet_surface
 
     def _excluded_faces(self, s: int, indptr, indices, face_id, face_type):
         ids0, _ = k_ring(s, indptr, indices, self.max_facets)
@@ -406,7 +430,8 @@ class BakedPatches:
                                     int(s), self.max_facets, self.rng, curv=curv,
                                     surface=surface, extended=self.extended,
                                     eangles=eangles, excluded=excluded, gnn=self.gnn,
-                                    hard_rings=hard_rings)
+                                    hard_rings=hard_rings,
+                                    facet_surface=getattr(self, "facet_surface", False))
                 if out is not None:
                     out["density"] = dens
                     yield out
