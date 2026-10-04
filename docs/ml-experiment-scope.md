@@ -2610,6 +2610,151 @@ A unified v8 was sketched alongside: one mesh-level encoder, and edge, type and 
 click head run twice to merge the seed model and the refiner. Its first stage (encoder plus edge head)
 must beat the 12.6k-parameter boundary MLP on fills, or v8 stops there.
 
+### Experiment 3: message passing in the refiner (2026-10-04)
+
+**Setup.**
+- The refiner dumps were regenerated as `lab/refine3_*` with the same command, parts and edge models.
+  They matched the originals row for row and only add `.eprob`, the boundary probability per edge.
+- Arms used `refine_train.py`, 12 epochs, seed 0.
+- The control, `r3base`, reproduced `refine1` exactly.
+
+**Held-out patches** (`patch_eval.py`; IoU OCCT / NURBS / gmsh / game):
+
+| Arm | IoU | Pooled | Clean patches | Error touching a border |
+|---|---|---|---|---|
+| refine1 / r3base | 0.928 / 0.851 / 0.900 / 0.805 | 0.886 | 75/61/59/57% | 6.2% |
+| + 6 MeshConv, max (`r3mp`) | 0.947 / 0.896 / 0.934 / 0.833 | 0.917 | 81/72/81/67% | 3.8% |
+| + gated aggregation | 0.946 / 0.880 / 0.938 / 0.829 | 0.913 | 81/73/82/64% | 4.1% |
+| + attention | 0.948 / 0.889 / 0.932 / 0.822 | 0.914 | 82/74/81/64% | 4.0% |
+| + boundary prob, max | 0.949 / 0.888 / 0.928 / 0.831 | 0.914 | 82/73/81/64% | 4.1% |
+| + boundary prob, gated (`r3gate_p`) | 0.944 / 0.896 / 0.940 / 0.839 | 0.919 | 81/73/82/65% | 3.9% |
+| + boundary prob, attention | 0.941 / 0.894 / 0.938 / 0.830 | 0.916 | 81/73/82/63% | 3.8% |
+
+- Message passing is the whole gain: pooled IoU +0.031, and clean patches +6 to +22 points.
+- Gating, attention and the boundary probability each move pooled IoU by under 0.005. The boundary
+  probability takes 3.5–5.5% of layer 1's message energy, against about 1% for the dihedral, so it is
+  read, but it adds nothing.
+
+**Fills** (`growEval`, 40 odd fill_eval parts, edge2 wall, declared type; clean %):
+
+| | Refiner alone | Refiner + minimum cut |
+|---|---|---|
+| refine1 | 83 / 72 / 75 / 52 | 87 / 81 / 82 / 54 |
+| r3mp | **87 / 79 / 81 / 56** | **89 / 83 / 86 / 55** |
+| r3gate_p | 86 / 79 / 83 / 54 | 88 / 83 / 86 / 56 |
+
+- Paired, with the cut, r3mp fixes and breaks: +5/−0 OCCT, +11/−5 NURBS, +10/−1 gmsh, +4/−3 game.
+- Spill with the cut falls from 6/10/7/13% to 4/7/6/10%.
+
+**Auto-paint** (`autoSeed`, same parts, v7gnn + edge2 + refiner + cut):
+- Faces clean: 80.0/73.8/78.4/62.1 → 80.2/76.2/78.8/63.5.
+- Area clean: 85.6/84.7/86.6/72.3 → 85.8/86.0/84.9/73.0. Spilled area falls on every mesher, but gmsh
+  loses 1.7 points of area to splitting (8.0 → 11.1% of area).
+- Time per part rises 10–15%.
+
+**Decision so far.**
+- Message passing goes into the refiner, with plain max aggregation. Gating, attention and the boundary
+  probability added nothing for their cost.
+- Whether `r3mp` replaces `models/fill-refiner.onnx` waits on the Onshape 300 gate (`lab/s19`): auto-paint,
+  then `surfaceScore` with `fetm/ring1`. The single-click gain is clear; whole-part auto-paint is mixed on
+  gmsh.
+
+## CAD-clean exports: tangency, exact edges, no slivers (2026-10-03/04)
+
+**Why.** The user's hand-painted chain link exported "almost perfect", but with subtleties a CAD user meets:
+- **Near-tangent creases.** Joins that should be smooth met at 0.03–1.6°. A plane missing a cylinder of
+  radius R by a gap g creases by about √(2g/R), so a 0.0002 gap showed as 0.3°.
+- **Spline edges.** 60 of 210 edges were B-splines where the surfaces meet in a line or circle.
+- **Slivers.** Four sliver faces of about 1e-8 of the area, the kind that will not delete in CAD.
+
+None of it needs rounding dimensions, which the user did not want. Their painted groups were recovered
+from their export: each triangle of the STL takes the nearest STEP face, by exact point-to-face distance
+(`D:/abc-data/lab/s18_clean/relabel_from_step.py`). `test/rebuildGroups.mjs` then rebuilds a painted
+segmentation as the studio does.
+
+**What changed in `js/knit`:**
+- **Tangency (`axes.js`, after the shared axes).** Pairs whose surface normals agree within 3° along their
+  mesh boundary are made exactly tangent.
+  - Constraints are linear in the member being refitted:
+    - a cylinder's cross-section circle against planes along its axis;
+    - a torus's profile circle against a coaxial cylinder or a plane square to the axis;
+    - a sphere's profile circle (R = 0);
+    - a cone on its axis, which one tangent plane fixes;
+    - a plane moved or turned onto its cylinder or cone.
+  - **Whole lines first.** A shared axis line moves as a whole: its position and every cylinder radius
+    on it are solved against all the tangent planes of all its cylinders (a lug's rim is coaxial with its
+    hole and tangent to both sides).
+  - **Locks.** Coplanar planes move as a set. A direction shared by several faces never turns, and one
+    squared to another turns only while it stays square.
+- **Acceptance, from the mesh's own accuracy.**
+  - **Vertex noise.** A vertex's noise is its best residual on any surface it lies on, and only fits with
+    under 3 redundant vertices borrow it. With the worst residual, single-triangle planes moved 0.17 units
+    off their true faces.
+  - **Chordal sag.** A surface may move within the chordal sag of its own triangles, but only if its fit is
+    above the 1e-6 exactness bar. On exact CAD meshes the vertices are the truth.
+  - **Precision weights.** Weights count redundancy (n − DOF, at least 0.25). A weight of 0 gave a
+    cluster no direction and NaN surfaces.
+- **Exact edges (`build.js`).**
+  - **Contact loci.** Between exactly tangent surfaces, edge points and corners go onto the analytic
+    contact locus: their touching line or circle. Projecting onto both surfaces is degenerate there and
+    drifted up to 0.3°.
+  - **Line and circle edges.** Any edge whose points lie on a line or circle within 1e-8 of the scale
+    becomes an exact segment or arc.
+- **Tidy (`build.js`).** On a finished solid, `ShapeFix_FixSmallFace` at 8e-4 × diagonal, then
+  `ShapeUpgrade_UnifySameDomain`. Each is kept only if the solid stays closed, valid and within the
+  volume bar.
+- **Plain retry (`index.js`).** A clean build that is not fully analytic is rebuilt without shared axes,
+  exact edges or contact loci, time permitting. The plain result is kept only if it is fully analytic.
+
+**The chain** (the user's groups, `user/chain_user`):
+
+| | the user's export | now |
+|---|---|---|
+| near-tangent joins | 12 at 0.03–1.6° | 10 exactly tangent, 2 left (0.21°, 0.38°) |
+| B-spline edges | 60 | 7 (162 lines, 27 circles) |
+| sliver faces | 4 | 0 |
+
+The solid stays valid. Of the two joins left:
+- **A corner of four faces.** A small plane 0.044 off the rim's contact line cannot meet the other three
+  there.
+- **A chamfer plane.** It will not take the 0.1° turn onto the cone: 44.9° against 45.0° in the mesh.
+
+The cone and planes stay at 44.905°; nothing is rounded.
+
+**Against the true surfaces** (`test/axisScore.mjs`, adjacent pairs exact before → after):
+
+| relation | Onshape (300) | fill_eval (120) |
+|---|---|---|
+| tangent | 15.5 → 48.3% | 48.6 → 85.6% |
+| coaxial | 0 → 82.2% | 1.5 → 98.9% |
+| perpendicular | 81.5 → 99.8% | 93.9 → 99.4% |
+| end face / along | 18 / 16 → 99.2 / 95.5% | 28 / 30 → 99.4 / 97.3% |
+
+found4 is unchanged on both sets. Groups recovering their true face worse: 0 Onshape, 2 fill (better 31
+and 9).
+
+Coaxial on Onshape was 87.8% before tangency. The whole difference is part 00008178_017, a fan of strips
+typed as near-cylindrical cones (20 → 36 pairs missed).
+
+**Solids.** These gates now run with no repair time budget (`--budget 100000`). The repair loop's 300 s
+budget (75 s in the studio) made results depend on machine load, and the first comparisons measured
+contention as much as code.
+
+| set | recreated | fully analytic: plain / clean / clean + plain retry |
+|---|---|---|
+| Onshape (274) | 269 = 269 | 254 / 250 / **257** |
+| fill_eval (44) | 38 = 38 | 17 / 18 / **19** |
+
+- **Retry figures.** The retry figures are the union of the two deterministic runs. On the 13 parts that
+  differ, a run of the retry itself confirmed it (10 fully analytic against 7 plain and 3 clean).
+- **Retry cost.** The retry runs on 24 and 26 parts respectively.
+- **A crash, fixed.** Six of the clean build's first losses were `tangentLocus` reaching a B-spline group's
+  missing axis.
+
+**Open:**
+- the Python harness (`ml/solid_rebuild.py`) has none of this;
+- slivers that are real small features are only protected by the 8e-4 × diagonal size limit.
+
 ---
 
 ## Sources
