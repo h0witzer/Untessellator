@@ -30,6 +30,9 @@
 import * as ui from '../../vendor/form-studio-ui/index.js';
 import { loadModelFile } from '../stlLoader.js';
 import { fitRegionAs } from '../gaussMap.js';
+import { repairMesh } from '../meshRepair.js';
+import { preflight } from '../knit/preflight.js';
+import { capOwners, fitTriangles, projectCapVertices } from './caps.js';
 import { creaseTableFor, creaseFor } from '../regionGrow.js';
 import { coherentScores, seedOrder, autoPaint, AUTO_TANGENT } from '../autoPaint.js';
 import { annotateEdges, edgeWall } from '../edgeWall.js';
@@ -47,6 +50,12 @@ const EDGE_MODEL = 'models/edge-boundary.onnx';
  */
 const EDGE_MODEL_V2 = 'models/edge-boundary-v2.onnx';
 const REFINER = 'models/fill-refiner.onnx';
+/**
+ * The group-level type model (settings.groupTyper, js/groupType.js): after auto-paint, each new group's
+ * export type comes from a learned typer over the fit evidence classifyRegion computes, where its top
+ * probability reaches the sidecar's threshold, and from paintCore.typeFinalGroup elsewhere.
+ */
+const GROUP_TYPER = 'models/group-typer.onnx';
 /** Plane fills keep the 2 degree crease instead: with the wall they measured worse, not better. */
 const EDGE_WALL_TYPES = ['cylinder', 'cone', 'sphere', 'torus'];
 import { buildMeshModel, bodyEdges, outline } from './meshModel.js';
@@ -102,6 +111,11 @@ ui.registerIcons({
 
 const settings = {
   tool: 'fill',
+  // Repair a mesh as it opens (js/meshRepair.js): welds, duplicate triangles and walls between bodies,
+  // zero-area needles, T-junction cracks, holes, winding. A clean mesh comes through unchanged. Measured on
+  // 12 Onshape parts damaged each way (test/meshDamage.mjs): exports fully analytic 0-3 of 12 -> 11-12 of 12
+  // for duplicates, flips, holes, cracks and unwelded seams. Fill menu toggle; applies to the next file opened.
+  repair: true,
   // 'model' (the model's region -> fitter), as auto-paint uses. Through the studio's own path with the
   // type chosen automatically (test/growEval.mjs studio:*, 40 held-out parts, v7 + refined fills) it
   // is clean on 83/76/77/51% of clicks against 76/69/76/48% for 'hyp' (the model's surface -> fitter).
@@ -123,6 +137,8 @@ const settings = {
   // Confirmed through the studio's own path on 40 held-out ABC parts (v7, type chosen automatically):
   // clean single fills 75/63/65/46 -> 83/76/77/51% OCCT / NURBS / gmsh / game-style. Fill menu toggle.
   refine: true,
+  // Type auto-painted groups with the group-level type model (GROUP_TYPER), typeFinalGroup elsewhere.
+  groupTyper: true,
   perspective: ui.LIGHTING.perspectiveByDefault,
   edges: true,
   smooth: false,
@@ -239,12 +255,26 @@ async function openFile(file) {
   try {
     const loaded = await loadModelFile(file);
     const raw = loaded.geometry ?? loaded;
-    const geometry = raw.index ? raw.toNonIndexed() : raw;
+    let geometry = raw.index ? raw.toNonIndexed() : raw;
+    // The repaired soup replaces the loaded one: everything after (view, painting, export) indexes its
+    // triangles. Caps the repair added are marked, so painting and fitting can leave them out (caps.js).
+    let repair = null, synthetic = null;
+    if (settings.repair) {
+      say(`Opening ${file.name}: checking the mesh…`);
+      await new Promise((resolve) => setTimeout(resolve, 0));   // let the message show: a big mesh takes seconds
+      const r = repairMesh(geometry.attributes.position.array);
+      repair = r.report;
+      if (repairChanges(repair).length) {
+        geometry = { index: null, attributes: { position: { array: Float32Array.from(r.positions) } } };
+        if (repair.cap_triangles) synthetic = Uint8Array.from(r.src, (s) => (s < 0 ? 1 : 0));
+      }
+    }
     const model = buildMeshModel(geometry.attributes.position.array);
     const colours = new Float32Array(model.count * 9);
     for (let i = 0; i < colours.length; i += 3) colours.set(UNPAINTED, i);
     mesh = { model, geometry, name: file.name.replace(/\.[^.]+$/, ''), store: new GroupStore(model.count), colours,
-             offset: loaded.offset ?? [0, 0, 0] };   // the loader centred the mesh; the export moves it back
+             offset: loaded.offset ?? [0, 0, 0],   // the loader centred the mesh; the export moves it back
+             repair, synthetic, flags: new Map(), showFlags: false };
     active = null;
     hoverKey = null;
     paintPromise = null;
@@ -258,7 +288,10 @@ async function openFile(file) {
     empty.hidden = true;
     zoomFit();
     refreshPanel();
-    say(`${file.name}: ${model.count.toLocaleString()} triangles`);
+    const fixed = repair ? repairChanges(repair) : [];
+    const left = repair ? repairLeft(repair) : null;
+    say([`${file.name}: ${model.count.toLocaleString()} triangles`, ...(fixed.length ? [`repaired: ${fixed.join(', ')}`] : []),
+      ...(left ? [left] : [])].join(' · '), !!left);
     // Adjacency and curvature take a moment on a big mesh: start now so the first stroke doesn't wait.
     // Seed scores for auto-paint too, so the button starts at once.
     const opened = mesh;
@@ -270,6 +303,28 @@ async function openFile(file) {
     console.error(error);
     say(`Could not open ${file.name}: ${error.message}`, true);
   }
+}
+
+/** What repairMesh changed, as phrases; empty for a clean mesh. */
+function repairChanges(r) {
+  const n = (x) => x.toLocaleString();
+  const out = [];
+  if (r.dup_same) out.push(`${n(r.dup_same)} duplicate triangles removed`);
+  if (r.dup_walls) out.push(`${n(r.dup_walls)} walls between touching bodies removed`);
+  if (r.collapsed + r.needles) out.push(`${n(r.collapsed + r.needles)} zero-area triangles removed`);
+  if (r.zipped) out.push(`${n(r.zipped)} cracks closed`);
+  if (r.holes_capped) out.push(`${n(r.holes_capped)} hole${r.holes_capped > 1 ? 's' : ''} capped`);
+  if (r.welded) out.push(`${n(r.welded)} unwelded corners joined`);
+  if (r.flipped) out.push(`${n(r.flipped)} triangles turned outward`);
+  return out;
+}
+
+/** What repairMesh could not fix and the export will meet, or null. */
+function repairLeft(r) {
+  const parts = [];
+  if (r.nonmanifold_edges) parts.push(`${r.nonmanifold_edges.toLocaleString()} edges shared by 3 or more triangles (bodies touching)`);
+  if (r.holes_left) parts.push(`${r.holes_left} hole${r.holes_left > 1 ? 's' : ''} it could not cap`);
+  return parts.length ? `the mesh still has ${parts.join(' and ')}: the export may not be a closed solid` : null;
 }
 
 /** The paint tool and its per-mesh preparation, loaded on first need (it brings the ONNX runtime). */
@@ -599,7 +654,8 @@ async function runAutoPaint() {
     say('Auto-paint: preparing…');
     const { tool, mesh: paintMesh } = await preparePaint();
     say('Auto-paint: scoring seeds…');
-    const order = seedOrder(await coherenceFor(current), paintMesh.facets);
+    const caps = current.synthetic;
+    const order = seedOrder(await coherenceFor(current), paintMesh.facets).filter((t) => !caps?.[t]);   // a cap seeds nothing
     if (autoRun.stop || mesh !== current) return;
     const extended = MODELS.find((m) => m.url === settings.model)?.features === 'v6';
     const refineUrl = await refineUrlFor(current);
@@ -655,19 +711,49 @@ async function runAutoPaint() {
     const joined = Int32Array.from(store.owner);
     const { freeform } = tool.freeformMerge(joined, paintMesh.facets, paintMesh.adjacency, { only: new Set(created) });
     for (let t = 0; t < joined.length; t++) if (joined[t] !== store.owner[t]) store.assign(t, joined[t]);
+    // Caps the repair added join the group around them (caps.js), whatever the fills made of them.
+    for (const [t, id] of capOwners(store.owner, caps, current.model.neighbours)) store.assign(t, id);
     flushChanged();
-    // One pass over the mesh for every new group's triangles, not one pass per group.
+    // One pass over the mesh for every new group's triangles, not one pass per group. Typing and fitting see
+    // the input's own triangles: a flat cap would make a curved group inexact.
     const byGroup = new Map(created.map((id) => [id, new Set()]));
-    for (let t = 0; t < store.owner.length; t++) byGroup.get(store.owner[t])?.add(t);
+    for (let t = 0; t < store.owner.length; t++) if (!caps?.[t]) byGroup.get(store.owner[t])?.add(t);
     for (const [id, tris] of byGroup) if (!tris.size) byGroup.delete(id);
     // Each finished group's export type (paintCore.typeFinalGroup): untyped groups get one, and a group
     // a simpler or truer primitive fits exactly takes it; freeform groups stay untyped.
     say('Auto-paint: typing groups…');
+    // The learned typer decides where it is confident; it needs groups of 3 or more triangles. A model
+    // that fails to load leaves every group to typeFinalGroup, as before.
+    const learned = new Map();
+    const typer = settings.groupTyper ? await tool.groupTyperFor(GROUP_TYPER).catch(() => null) : null;
+    if (typer) {
+      const rows = [];
+      for (const [id, tris] of byGroup) {
+        if (freeform.has(id)) continue;
+        const f = tool.groupTypeFeatures(tris, paintMesh.facets, paintMesh.adjacency, store.groups.get(id).type);
+        if (f) rows.push([id, f]);
+        const now = performance.now();
+        if (now - uiClock.yield > 40) {
+          await new Promise((resolve) => setTimeout(resolve, 0));
+          uiClock.yield = performance.now();
+        }
+      }
+      if (rows.length) {
+        const width = tool.N_GROUP_FEATURES, k = tool.GROUP_TYPES.length;
+        const X = new Float32Array(rows.length * width);
+        rows.forEach(([, f], i) => X.set(f.features, i * width));
+        const probs = await typer.run(X, rows.length);
+        rows.forEach(([id, f], i) => learned.set(id, tool.decideGroupType(probs.subarray(i * k, i * k + k), f.rule, typer.threshold).type));
+      }
+    }
     for (const [id, tris] of byGroup) {
       const group = store.groups.get(id);
       if (freeform.has(id)) { group.type = null; refit(id, tris); continue; }
-      const typed = tool.typeFinalGroup(tris, paintMesh.facets, group.type);
-      if (typed.changed) group.type = typed.type;
+      if (learned.has(id)) group.type = learned.get(id);
+      else {
+        const typed = tool.typeFinalGroup(tris, paintMesh.facets, group.type);
+        if (typed.changed) group.type = typed.type;
+      }
       refit(id, tris);
       const now = performance.now();
       if (now - uiClock.yield > 40) {
@@ -677,7 +763,10 @@ async function runAutoPaint() {
     }
     store.commit(`Auto-paint ${result.segments} groups`);
     editOpen = false;
-    const left = result.free > 0 ? ` · ${result.free.toLocaleString()} triangles left unpainted` : '';
+    // counted now, not from the run: caps the repair added were placed after it
+    let free = 0;
+    for (let t = 0; t < store.owner.length; t++) if (store.owner[t] < 0) free++;
+    const left = free > 0 ? ` · ${free.toLocaleString()} triangles left unpainted` : '';
     const ff = freeform.size ? ` (${freeform.size} freeform, joined from ${result.segments})` : '';
     say(`Auto-paint ${result.stopped ? 'stopped' : 'done'}: ${byGroup.size} new groups${ff}${left}`);
   } catch (error) {
@@ -755,9 +844,10 @@ function finishStroke() {
 function refit(id, tris = null) {
   const { store } = mesh;
   const group = store.groups.get(id);
+  mesh.flags.delete(id);   // a changed group is no longer the one the export check flagged
   if (!group || !prepared) return;
   if (!group.type || !store.count(id)) { group.fit = null; return; }
-  const result = fitRegionAs(group.type, tris ?? store.triangles(id), prepared.mesh.facets);
+  const result = fitRegionAs(group.type, fitTriangles(tris ?? store.triangles(id), mesh.synthetic), prepared.mesh.facets);
   group.fit = result.params
     ? { params: result.params, relResidual: result.relResidual }
     : { reason: result.reason ?? 'the fit failed' };
@@ -790,6 +880,7 @@ function flushChanged() {
 function setActive(id) {
   if (active === id) return;
   active = id;
+  if (id !== null && mesh) mesh.showFlags = false;   // selecting a group ends the flagged-groups outline
   edgesDirty = true;
   refreshPanel();
 }
@@ -870,6 +961,8 @@ function redo() {
 function afterHistory() {
   // Group colours are fixed per id, but a restored group needs its triangles recoloured.
   flushChanged();
+  mesh.flags.clear();   // the export check's flags were for the groups as they were
+  mesh.showFlags = false;
   if (active !== null && !mesh.store.count(active)) active = null;
   edgesDirty = true;
   refreshPanel();
@@ -884,10 +977,10 @@ function afterHistory() {
  * the analytic build cannot close. It replaces the sewing builder, which built every face on its own and
  * closed none of 31 fully analytic test parts. Runs in a worker: builds take seconds to minutes.
  */
-async function exportStep() {
+async function exportStep({ checked = false } = {}) {
   if (!mesh) return;
   if (stroke || autoRun) { say('Finish or cancel (Esc) the stroke or auto-paint first', true); return; }
-  const { store, model, geometry, name } = mesh;
+  const { store, model, geometry, name, synthetic } = mesh;
   const groups = store.list();
   if (!groups.length) { say('Paint at least one face group first', true); return; }
   toolbar.setDisabled('export', 'Exporting…');
@@ -904,24 +997,42 @@ async function exportStep() {
     const surfaces = [];
     for (const group of groups) {
       if (!group.type) continue;                  // no analytic surface: the knitter makes it facets
-      const fit = group.fit?.params ? group.fit : fitRegionAs(group.type, store.triangles(group.id), facets);
+      const fit = group.fit?.params ? group.fit : fitRegionAs(group.type, fitTriangles(store.triangles(group.id), synthetic), facets);
       if (fit.params) surfaces.push([group.id, [group.type, fit.params]]);
     }
     // The STEP goes where the file's mesh was: the loader centred it for the view, so the centre goes
     // back on the positions, and on every fitted surface (all are anchored by points, never directions).
     const [ox, oy, oz] = mesh.offset;
     const positions = Float64Array.from(facets.positions, (v, i) => v + (i % 3 === 0 ? ox : i % 3 === 1 ? oy : oz));
-    const payload = { positions, labels: Int32Array.from(store.owner), surfaces: surfaces.map(([id, [type, p]]) => [id, [type, shifted(p, mesh.offset)]]) };
+    const labels = Int32Array.from(store.owner);
+    // Caps the repair added go to the group around them, and onto its surface (caps.js), however they were painted.
+    for (const [t, id] of capOwners(labels, synthetic, model.neighbours)) labels[t] = id;
+    const shiftedSurfaces = surfaces.map(([id, [type, p]]) => [id, [type, shifted(p, mesh.offset)]]);
+    projectCapVertices(positions, labels, synthetic, new Map(shiftedSurfaces));
+    const payload = { positions, labels, surfaces: shiftedSurfaces };
+    // Before the build, the groups that will come out wrong (knit/preflight.js), so they can be fixed now
+    // rather than after minutes of building.
+    if (!checked) {
+      say('Checking the groups…');
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const doubts = exportDoubts(payload);
+      if (doubts.groups.size || doubts.mesh) { offerDoubts(doubts); return; }
+    }
     let result;
     try {
       result = await knitInWorker({ ...payload, options: { deadline: EXPORT_DEADLINE_S } }, (text) => say(text), EXPORT_HARD_STOP_S);
     } catch (error) {
-      if (error.name !== 'TimeoutError') throw error;
       // A single OCCT repair on badly fitting surfaces can run for most of an hour and cannot be
-      // interrupted, so the worker is stopped and a fresh one exports the mesh itself.
-      say(`The surfaces took over ${Math.round(EXPORT_HARD_STOP_S / 60)} minutes to join; exporting the mesh as a faceted solid…`, true);
+      // interrupted, so the worker is stopped and a fresh one exports the mesh itself. A build that throws
+      // can leave the kernel's memory corrupt (its fallback then fails too: "table index is out of bounds"),
+      // so that too gets a fresh worker for the faceted solid.
+      const timedOut = error.name === 'TimeoutError';
+      say(timedOut
+        ? `The surfaces took over ${Math.round(EXPORT_HARD_STOP_S / 60)} minutes to join; exporting the mesh as a faceted solid…`
+        : `The solid build failed (${error.message}); exporting the mesh as a faceted solid…`, true);
       result = await knitInWorker({ ...payload, options: { mode: 'faceted' } }, (text) => say(text));
-      result.report.timedOut = true;
+      if (timedOut) result.report.timedOut = true;
+      else result.report.failed = error.message;
     }
     const { step, report } = result;
     if (!step) throw new Error('no shape came out of the build');
@@ -933,6 +1044,69 @@ async function exportStep() {
   } finally {
     refreshPanel();
   }
+}
+
+/**
+ * The export check's bar (knit/preflight.js): only the near-certain flags. Measured against the true faces of
+ * 275 Onshape parts and 45 fill_eval parts (test/exportRisk.mjs): a vertex more than 1e-3 x the part diagonal
+ * off its group's surface, at the boundary or inside, or a curved group covering under 10 degrees, is a wrong
+ * group 94-100% of the time on Onshape and alarmed at most 1 export whose groups were all right. The softer
+ * bars (1e-5) catch more but are right only about 65% of the time.
+ */
+const DOUBT = { DEV: 1e-3, SEAM: 1e-3, ARC: 10 };
+
+/** What the export check doubts: Map group -> reasons, and the mesh's own problem (or null). */
+function exportDoubts({ positions, labels, surfaces }) {
+  const pf = preflight(positions, labels, new Map(surfaces), DOUBT);
+  const size = (x) => format(x * pf.diag);
+  const groups = new Map();
+  for (const [id, r] of pf.groups) {
+    if (!mesh.store.groups.has(id)) continue;
+    const type = typeLabel(r.type).toLowerCase();
+    const why = [];
+    if (r.flags.includes('off its surface')) why.push(`vertices inside it are up to ${size(r.dev)} off its ${type}`);
+    if (r.flags.includes('seam gap')) why.push(`its border runs up to ${size(r.seam)} off its ${type}`);
+    if (r.flags.includes('narrow arc')) why.push(`it covers only ${r.arc.toFixed(0)}° of its ${type}, which a cone, cylinder or torus fit about equally`);
+    if (why.length) groups.set(id, why);
+  }
+  const m = pf.mesh;
+  const holes = [];
+  if (m.openEdges) holes.push(`${m.openEdges.toLocaleString()} open edges`);
+  if (m.nonmanifoldEdges) holes.push(`${m.nonmanifoldEdges.toLocaleString()} edges shared by 3 or more triangles`);
+  return { groups, mesh: holes.length ? `the mesh has ${holes.join(' and ')}, so the export will not be a closed solid` : null };
+}
+
+/** Say what the check found, mark the groups in the panel, and offer to show them or export anyway. */
+function offerDoubts({ groups, mesh: meshDoubt }) {
+  mesh.flags = groups;
+  mesh.showFlags = false;
+  const n = groups.size;
+  const lines = [...groups].slice(0, 3).map(([id, why]) => `${mesh.store.name(id)}: ${why[0]}`);
+  say([...(n ? [`${n} group${n > 1 ? 's' : ''} will likely come out wrong (⚠ in the list)`] : []), ...(meshDoubt ? [meshDoubt] : []),
+    ...lines, ...(n > 3 ? [`and ${n - 3} more`] : [])].join(' · '), true);
+  refreshPanel();
+  const button = toolbar.get('export');
+  ui.openMenu([
+    ...(n ? [{ id: 'show', label: `Show the ${n} group${n > 1 ? 's' : ''}`, onSelect: () => showDoubts() }] : []),
+    { id: 'export', label: 'Export anyway', onSelect: () => exportStep({ checked: true }) },
+  ], { anchor: button.parentElement, align: 'right' });
+}
+
+/** The triangles whose group is in `ids`. */
+function trianglesOf(owner, ids) {
+  const out = [];
+  for (let t = 0; t < owner.length; t++) if (ids.has(owner[t])) out.push(t);
+  return out;
+}
+
+/** Outline every flagged group (the active group's outline style) until a group is selected. */
+function showDoubts() {
+  if (!mesh?.flags.size) return;
+  setActive(null);
+  mesh.showFlags = true;
+  edgesDirty = true;
+  requestRender();
+  say(`Outlined: ${[...mesh.flags.keys()].map((id) => mesh.store.name(id)).join(', ')}. Hover a ⚠ row for why; fix, merge or retype them, then export again`);
 }
 
 /** Fitted surface params moved by `d`: every point-valued param (origin, axisPoint, apex, center). */
@@ -986,7 +1160,9 @@ function exportSummary(file, report, unpainted) {
   } else if (report.tier === 'faceted') {
     parts.push(report.timedOut
       ? `Exported ${file} as the mesh, a faceted solid: joining the fitted surfaces took too long`
-      : `Exported ${file}: the surfaces would not join into a solid, so this is the mesh as a faceted solid`);
+      : report.failed
+        ? `Exported ${file} as the mesh, a faceted solid: the solid build failed (${report.failed})`
+        : `Exported ${file}: the surfaces would not join into a solid, so this is the mesh as a faceted solid`);
   } else {
     parts.push(`Exported ${file}, but it is NOT a closed solid` +
       (report.free_edges ? `: ${report.free_edges.toLocaleString()} open edges` : '') +
@@ -1043,7 +1219,9 @@ function refreshPanel() {
     label: store.name(group.id),
     value: store.count(group.id).toLocaleString(),
     selected: group.id === active,
-    tooltip: describeGroup(group),
+    // ⚠: the export check expects this group to come out wrong (exportDoubts); cleared when it changes
+    ...(mesh.flags.has(group.id) ? { value: `⚠ ${store.count(group.id).toLocaleString()}` } : {}),
+    tooltip: [describeGroup(group), ...(mesh.flags.get(group.id) ?? []).map((why) => `⚠ ${why}`)].join('\n'),
     onClick: () => setActive(group.id === active ? null : group.id),
     onContextMenu: (row, event) => groupMenu(group.id, event),
   }));
@@ -1108,6 +1286,16 @@ function fillMenu() {
         say(settings.autoTangent
           ? 'Auto-paint stops at curvature changes: cleaner faces, many more groups to merge'
           : 'Auto-paint grows across curvature changes');
+      },
+    },
+    { separator: true },
+    {
+      id: 'repair', label: 'Repair meshes as they open', checked: settings.repair,
+      onSelect: () => {
+        settings.repair = !settings.repair;
+        say(settings.repair
+          ? 'The next mesh opened is repaired: welds, duplicates, cracks, holes'
+          : 'The next mesh opened is used as it is');
       },
     },
   ];
@@ -1287,8 +1475,11 @@ function frame(now) {
     lastEdgeBuild = now;
     const { model, store } = mesh;
     renderer.setBands('edges', bodyEdges(model, store.owner));
+    // The active group's outline; with none active, the groups the export check flagged when shown (showDoubts).
+    const flagged = active === null && mesh.showFlags && mesh.flags.size ? mesh.flags : null;
     renderer.setBands('active', active !== null && store.count(active)
-      ? outline(model, store.triangles(active), (t) => store.owner[t] === active) : null);
+      ? outline(model, store.triangles(active), (t) => store.owner[t] === active)
+      : flagged ? outline(model, trianglesOf(store.owner, flagged), (t) => flagged.has(store.owner[t])) : null);
     if (hoverKey?.startsWith('g')) { const key = hoverKey; hoverKey = null; setHover(key); }
     edgesDirty = false;
     needsRender = true;

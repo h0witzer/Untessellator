@@ -140,12 +140,18 @@ export function groupTypeFeatures(tris, facets, adjacency, painted, { bar = EXAC
  * The type a finished group exports with: the typer's class where its probability reaches
  * `threshold`, today's rule elsewhere. 'freeform' exports as null (a B-spline).
  *
+ * `freeform` (default false) lets a 'freeform' verdict override the rule. Off because rebuilt solids
+ * measured it harmful (docs/ml-experiment-scope.md, the group-level type model): on 73 changed Onshape
+ * parts the verdicts it produced turned primitive groups into B-splines and analytic solids into
+ * faceted ones. Genuine freeform faces are freeformMerge's to join, before typing.
+ *
  * @param {ArrayLike<number>} probs  softmax over GROUP_TYPES
  * @param {string|null} rule         typeFinalGroup's choice for the same group
  */
-export function decideGroupType(probs, rule, threshold) {
+export function decideGroupType(probs, rule, threshold, { freeform = false } = {}) {
   let k = 0;
   for (let j = 1; j < probs.length; j++) if (probs[j] > probs[k]) k = j;
   if (!(probs[k] >= threshold)) return { type: rule, by: 'rule', p: probs[k] };
+  if (GROUP_TYPES[k] === 'freeform' && !freeform) return { type: rule, by: 'rule', p: probs[k] };
   return { type: GROUP_TYPES[k] === 'freeform' ? null : GROUP_TYPES[k], by: 'model', p: probs[k] };
 }

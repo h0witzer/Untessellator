@@ -12,6 +12,7 @@ import { graphInputs } from './seedNet.js';
 
 export { FREEFORM_CREASE, ORDER_RANK, typeFinalGroup } from './paintCore.js';
 export { freeformMerge } from './freeformMerge.js';
+export { groupTypeFeatures, decideGroupType, GROUP_TYPES, N_GROUP_FEATURES } from './groupType.js';
 
 ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
 ort.env.wasm.numThreads = 1;   // no cross-origin isolation here, so threads are unavailable anyway
@@ -57,6 +58,20 @@ function makeRunner(session, edgeDim = 1) {
       typeLogit: Array.from(out.type_logit.data),
       surface: out.surface ? out.surface.data : null,
     };
+  };
+}
+
+/**
+ * The group-level type model (js/groupType.js, ml/group_type_train.py) and the threshold its sidecar
+ * names: `{ run: async (features, n) => probs, threshold }`. Probabilities are softmax over GROUP_TYPES.
+ */
+export async function groupTyperFor(url) {
+  const [session, meta] = await Promise.all([loadModel(url), sidecarFor(url)]);
+  return {
+    threshold: meta.threshold ?? 1.01,
+    run: async (features, n) => (await session.run({
+      features: new ort.Tensor('float32', features, [n, features.length / n]),
+    })).probs.data,
   };
 }
 

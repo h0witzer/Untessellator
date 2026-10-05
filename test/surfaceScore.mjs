@@ -103,6 +103,7 @@ const DEBUG = flag('--debug', null);
 const FF_OPTS = JSON.parse(flag('--ff', '{}'));
 const TYPER_PATH = flag('--group-typer', null);
 const TYPER_THR = flag('--typer-threshold', null);
+const TYPER_FREEFORM = flag('--typer-freeform', '0') === '1';   // let a 'freeform' verdict override the rule
 const TYPER = TYPER_PATH ? {
   session: await ort.InferenceSession.create(TYPER_PATH),
   threshold: Number(TYPER_THR ?? JSON.parse(readFileSync(TYPER_PATH.replace(/\.onnx$/, '.json'), 'utf8')).threshold),
@@ -604,7 +605,7 @@ async function scorePart(stem, manifestEntry, mesher) {
         const out = await TYPER.session.run({ features: new ort.Tensor('float32', X, [pending.length, N_GROUP_FEATURES]) });
         const probs = out.probs.data, k = GROUP_TYPES.length;
         pending.forEach((q, i) => {
-          const d = decideGroupType(probs.subarray(i * k, i * k + k), q.f.rule, TYPER.threshold);
+          const d = decideGroupType(probs.subarray(i * k, i * k + k), q.f.rule, TYPER.threshold, { freeform: TYPER_FREEFORM });
           if (d.type !== (types[q.id] ?? null)) changed++;
           if (d.by === 'model' && d.type !== q.f.rule) byModel++;
           types[q.id] = d.type;
