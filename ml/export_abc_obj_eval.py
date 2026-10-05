@@ -216,6 +216,9 @@ def main() -> int:
                     help="true surfaces per model, <part>.srf in fit_truth's layout, for test/surfaceScore.mjs")
     ap.add_argument('--truth-only', action='store_true', help='(re)write the truth for the models already in --out')
     ap.add_argument('--freeform', action='store_true', help='only models with a non-analytic face')
+    ap.add_argument('--exclude', type=Path, nargs='*', default=[],
+                    help="manifest.json files of sets whose models must not appear here (e.g. onshape_eval's, "
+                         "when this set TRAINS a model that set will score)")
     args = ap.parse_args()
     args.truth_out.mkdir(parents=True, exist_ok=True)
     if args.truth_only:
@@ -232,6 +235,10 @@ def main() -> int:
             seen.update(f.name.split('_')[0] for f in root.rglob('*') if f.is_file())
     models = sorted(d for d in args.obj.iterdir() if d.is_dir())
     held = [d for d in models if d.name not in seen]
+    skip = {e['part'].split('_')[0] for m in args.exclude for e in json.loads(Path(m).read_text())['parts']}
+    if skip:
+        held = [d for d in held if d.name not in skip]
+        print(f'excluding {len(skip)} models of {", ".join(str(m) for m in args.exclude)}')
     rng = np.random.default_rng(args.seed)
     rng.shuffle(held)
     print(f'{len(models):,} models in the OBJ chunk(s); {len(models) - len(held):,} appear in a bake or eval set; '

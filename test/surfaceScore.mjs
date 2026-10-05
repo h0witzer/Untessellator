@@ -50,6 +50,9 @@
  *   fexact   js/freeformMerge.js first (adjacent groups neither of which fits a primitive exactly, joined
  *            across crease-free boundaries; a joined inexact group stays untyped, for a B-spline), then
  *            exact on the rest. fetm = fexact, then triage and merge.
+ *   gexact   fexact with the group-level type model (js/groupType.js, --group-typer <onnx>) deciding the
+ *            type of every group of >= 3 facets where its top probability reaches the sidecar's threshold
+ *            (or --typer-threshold); typeFinalGroup elsewhere. getm = gexact, then triage and merge.
  *   oracletype  base, each group typed as its majority face truly is: what perfect typing of the
  *            painted groups would give (uses the truth; a bound, not a method)
  *   truth    the true faces with their true types: the fitter's own ceiling
@@ -75,6 +78,7 @@ import { createRequire } from 'node:module';
 
 import { preparePaintPositions, typeFinalGroup, EXACT_TYPE_BAR } from '../js/paintCore.js';
 import { freeformMerge } from '../js/freeformMerge.js';
+import { groupTypeFeatures, decideGroupType, N_GROUP_FEATURES, GROUP_TYPES } from '../js/groupType.js';
 import { fitRegionAs, classifyRegion } from '../js/gaussMap.js';
 import { mergeRegions } from '../js/mergeRegions.js';
 import { pearlRefine } from '../js/pearl.js';
@@ -97,11 +101,17 @@ const PATCHES_OUT = flag('--patches-out', null);
 const DEBUG = flag('--debug', null);
 // --ff '{"robust":true}': freeformMerge options for the fexact / fetm variants (default: its defaults)
 const FF_OPTS = JSON.parse(flag('--ff', '{}'));
+const TYPER_PATH = flag('--group-typer', null);
+const TYPER_THR = flag('--typer-threshold', null);
+const TYPER = TYPER_PATH ? {
+  session: await ort.InferenceSession.create(TYPER_PATH),
+  threshold: Number(TYPER_THR ?? JSON.parse(readFileSync(TYPER_PATH.replace(/\.onnx$/, '.json'), 'utf8')).threshold),
+} : null;
 // --faces: also keep every analytic face's verdict (kind, L's type, share, whether L is its own, dev).
 const FACES = args.includes('--faces');
 if (FACES) args.splice(args.indexOf('--faces'), 1);   // a stem: print every analytic face's verdict per variant
 const PATCH_VARIANTS = ['base/all', 'retype/all', 'retype/ring1', 'tm/ring1', 'tmo/ring1', 'truth/all', 'reclass/all',
-  'rtm/ring1', 'oracletype/all', 'exact/all', 'etm/ring1', 'fexact/all', 'fetm/ring1'];
+  'rtm/ring1', 'oracletype/all', 'exact/all', 'etm/ring1', 'fexact/all', 'fetm/ring1', 'getm/ring1'];
 const [MESH_DIR, TRUTH_DIR, SEG_DIR] = args;
 if (!MESH_DIR || !TRUTH_DIR || !SEG_DIR) {
   console.error('usage: node test/surfaceScore.mjs <mesh dir> <truth dir> <seg dir> [--variants ...]');
@@ -570,8 +580,39 @@ async function scorePart(stem, manifestEntry, mesher) {
         types[id] = r.type;
       }
       r = { seg, types, info: { retyped: changed, merged, freeform: freeform.size } };
-    } else if (name === 'rtm' || name === 'etm' || name === 'fetm') {
-      const base = await segmentation(name === 'rtm' ? 'reclass' : name === 'etm' ? 'exact' : 'fexact');
+    } else if (name === 'gexact') {
+      if (!TYPER) throw new Error('gexact needs --group-typer <onnx>');
+      const seg = Int32Array.from(seg0);
+      const { freeform, merged } = freeformMerge(seg, facets, adjacency, FF_OPTS);
+      const types = [...types0];
+      let changed = 0, byModel = 0;
+      const pending = [];
+      for (const [id, sg] of segmentsOf(seg)) {
+        if (freeform.has(id)) { types[id] = null; continue; }
+        const f = groupTypeFeatures(new Set(sg.tris), facets, adjacency, types[id] ?? null, { bar: EXACT_BAR, looseTol: TOL });
+        if (!f) {
+          const r = typeFinalGroup(sg.tris, facets, types[id], { bar: EXACT_BAR, looseTol: TOL });
+          if (r.changed) changed++;
+          types[id] = r.type;
+          continue;
+        }
+        pending.push({ id, f });
+      }
+      if (pending.length) {
+        const X = new Float32Array(pending.length * N_GROUP_FEATURES);
+        pending.forEach((q, i) => X.set(q.f.features, i * N_GROUP_FEATURES));
+        const out = await TYPER.session.run({ features: new ort.Tensor('float32', X, [pending.length, N_GROUP_FEATURES]) });
+        const probs = out.probs.data, k = GROUP_TYPES.length;
+        pending.forEach((q, i) => {
+          const d = decideGroupType(probs.subarray(i * k, i * k + k), q.f.rule, TYPER.threshold);
+          if (d.type !== (types[q.id] ?? null)) changed++;
+          if (d.by === 'model' && d.type !== q.f.rule) byModel++;
+          types[q.id] = d.type;
+        });
+      }
+      r = { seg, types, info: { retyped: changed, byModel, merged, freeform: freeform.size } };
+    } else if (name === 'rtm' || name === 'etm' || name === 'fetm' || name === 'getm') {
+      const base = await segmentation({ rtm: 'reclass', etm: 'exact', fetm: 'fexact', getm: 'gexact' }[name]);
       const surf = fitAll(base.seg, base.types, 'ring1');
       const tr = triage(base.seg, base.types, surf, false);
       const mg = mergeSame(tr.seg, tr.types, fitAll(tr.seg, tr.types, 'ring1'));

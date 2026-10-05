@@ -53,6 +53,9 @@ def main(argv=None) -> int:
                     help="val (the default) for evaluation sets; train for TRAINING data of models "
                          "other than the seed model, e.g. the edge model (test/edgeScreen.mjs), "
                          "which then has every validation part held out")
+    ap.add_argument("--exclude", type=Path, nargs="*", default=[],
+                    help="manifest.json files of sets whose parts must not appear here (e.g. fill_eval's, "
+                         "when this set trains a model that fill_eval will score)")
     args = ap.parse_args(argv)
 
     variants = dict(pair.split("=", 1) for pair in args.variants.split(","))
@@ -61,8 +64,10 @@ def main(argv=None) -> int:
 
     val, train = val_split(args.bake)
     pool = val if args.split == "val" else train
+    skip = {e["part"] for m in args.exclude for e in json.loads(Path(m).read_text())["parts"]}
     cands = [f for f in pool
-             if all((root / f.relative_to(args.bake)).exists() for root in variants.values())
+             if f.stem not in skip
+             and all((root / f.relative_to(args.bake)).exists() for root in variants.values())
              and (args.relabel / f.parent.name / f.name).exists()]
     rng = np.random.default_rng(args.seed)
     pick = [cands[i] for i in sorted(rng.choice(len(cands), size=min(args.n, len(cands)), replace=False))]
@@ -89,7 +94,8 @@ def main(argv=None) -> int:
     (args.out / "manifest.json").write_text(json.dumps(
         {"variants": list(variants), "density": args.density, "parts": manifest}, indent=1))
     per = sum(len(e["variants"]) for e in manifest) / max(len(manifest), 1)
-    print(f"{len(cands):,} {args.split} parts present in all of {', '.join(variants)}; "
+    print(f"{len(cands):,} {args.split} parts present in all of {', '.join(variants)}"
+          f"{f' after excluding {len(skip)}' if skip else ''}; "
           f"exported {len(manifest)} ({per:.2f} variants each) -> {args.out}")
     return 0
 

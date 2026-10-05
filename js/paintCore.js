@@ -109,7 +109,7 @@ const DOF = { plane: 3, cylinder: 5, cone: 6, sphere: 4, torus: 7 };
  *
  * @returns {{type: string|null, changed: boolean, exact: boolean}}
  */
-export function typeFinalGroup(tris, facets, painted, { bar = EXACT_TYPE_BAR, looseTol = 5e-4, support = 3 } = {}) {
+export function typeFinalGroup(tris, facets, painted, { bar = EXACT_TYPE_BAR, looseTol = 5e-4, support = 3, cls = null } = {}) {
   const set = tris instanceof Set ? tris : new Set(tris);
   const diag = partDiagonal(facets);
   const keep = { type: painted ?? null, changed: false, exact: false };
@@ -119,14 +119,18 @@ export function typeFinalGroup(tris, facets, painted, { bar = EXACT_TYPE_BAR, lo
     return plane.params && vertexDeviation(set, facets, 'plane', plane.params).d <= looseTol * diag
       ? { type: 'plane', changed: true, exact: false } : keep;
   }
-  const cls = classifyRegion(set, facets);
-  if (!(cls.type in ORDER_RANK)) return keep;
-  if (!painted) return { type: cls.type, changed: true, exact: false };
-  if (cls.type === painted) return keep;
-  const { d, n } = vertexDeviation(set, facets, cls.type, cls.params);
-  return d <= bar * diag && n >= support * DOF[cls.type]
-    ? { type: cls.type, changed: true, exact: true } : keep;
+  // `cls`: a classifyRegion result for this same group, when the caller already has one (groupType.js)
+  const c = cls ?? classifyRegion(set, facets);
+  if (!(c.type in ORDER_RANK)) return keep;
+  if (!painted) return { type: c.type, changed: true, exact: false };
+  if (c.type === painted) return keep;
+  const { d, n } = vertexDeviation(set, facets, c.type, c.params);
+  return d <= bar * diag && n >= support * DOF[c.type]
+    ? { type: c.type, changed: true, exact: true } : keep;
 }
+
+/** The part diagonal typeFinalGroup measures exactness against (cached per facets object). */
+export { partDiagonal };
 
 /**
  * The piece of `region` connected to `seed` across edges below `creaseDeg`, through region facets
