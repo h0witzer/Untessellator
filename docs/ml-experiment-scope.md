@@ -2930,6 +2930,73 @@ pairs anywhere in the part for the size and through-axis relations):
 
 ---
 
+## A learned type for every finished group (2026-10-04/05)
+
+**Why.** Every painted group becomes one face of the solid, and the exporter needs its type. Today that is
+a rule, `paintCore.typeFinalGroup`: the painted type, replaced by classifyRegion's choice only where that
+fit holds every vertex within 1e-6 of the part diagonal. With true types on today's groups, surfaces found
+rise 9.3 points on fill_eval and 3.6 on the Onshape exports. Re-running the classifier's
+simplest-within-1% rule on every group recovers about 1.
+
+**The model.**
+- **Inputs** (`js/groupType.js`): 58 features per group of at least 3 facets.
+  - For each primitive: the residual, its ratio to the best fit, the worst vertex deviation, and the
+    vertex support against degrees of freedom.
+  - Parameter sanity: radius against extent, cone half-angle, torus radii.
+  - The group's size, border share and Gauss map.
+  - The painted, classified and rule types.
+  - Triangle size is deliberately left out.
+- **Network** (`ml/group_type_train.py`): an MLP 58 → 128 → 128 → 6 with normalisation baked in, about
+  25k parameters.
+- **Decision:** it overrides `typeFinalGroup` only where its top probability reaches a threshold chosen on
+  fill_eval's even parts, and it never returns geometry.
+
+**Data.** Rows come from `test/groupTypeDump.mjs` on the shipped stack's auto-paint segmentations, after
+freeform merge.
+- **Labels:** the canonical type of the true face holding most of each group's area, weighted by purity.
+- **Training sets** cannot overlap any set that scores the model:
+  - 184 validation-split parts × 4 meshers, from `export_fill_eval.py --exclude`;
+  - 400 held-out Onshape models, from `export_abc_obj_eval.py --exclude`.
+
+  About 82k groups in total.
+- **Selection:** per-face accuracy on fill_eval even parts (groups holding most of an analytic face,
+  counted per face).
+
+**Results** (fill_eval odd parts and the 300 Onshape exports are held out from everything):
+
+| | per-face type accuracy | surfaces found | found once | parts once up/down |
+|---|---|---|---|---|
+| fill_eval odd, today | 90.8% | 82.3% | 79.2% | |
+| fill_eval odd, v0.1 typer | 93.9% | 84.4% | 81.1% | 66 / 10 |
+| fill_eval odd, v0.2 (no freeform overrides) | | 84.5% | 81.2% | 65 / 4 |
+| Onshape, today | 94.8% | 86.6% | 85.4% | |
+| Onshape, v0 (no Onshape training data) | 95.1% | 86.8% | 85.7% | 36 / 22 |
+| Onshape, v0.1 | 97.3% | 87.9% | 86.5% | 40 / 1 |
+| Onshape, v0.2 (no freeform overrides; shipped, c9eb73d) | | 88.0% | 86.5% | 39 / 1 |
+
+- **Onshape training data was decisive.** Without it, the typer barely helped on real exports and called
+  more cones wrong.
+
+**Solids** (`test/knitRebuild.mjs` from a clean worktree, on the parts whose patches the typer changed):
+- **v0.1 cost analytic solids.** On 73 changed Onshape parts it built 38 analytic solids against 43 today
+  (paired tier: 3 better, 10 worse).
+  - The cause was its "freeform" verdicts. 21 tori, 13 cylinders and cones and 47 planes became
+    B-splines, and the knitter fell back to facets.
+  - Surfaces found could not show this: it does not score freeform faces.
+- **v0.2 lets only a primitive override the rule.** Genuine freeform faces are `freeformMerge`'s to join.
+  On its 67 changed Onshape parts it builds 40 analytic solids against 40 today (paired: 3 better, 3
+  worse). All three losses involve planes flipped to cylinders.
+- On fill_eval's 87 changed odd part-meshers v0.2 recreates 36 solids against 35, and 10 analytic
+  against 8 (paired: recreated +4 / −3; tier 3 better, 1 worse). This set is harder: about 40% fail to
+  build either way.
+
+**Lessons.**
+- A type-correctness metric can improve while solids get worse. A freeform verdict on a primitive face, or
+  a type that does not knit, never appears in "surfaces found". Judge typing by rebuilt solids too.
+- Mesher coverage in training is again what decides real-export performance.
+
+---
+
 ## Sources
 
 - ABC dataset: https://deep-geometry.github.io/abc-dataset/ — paper https://arxiv.org/abs/1812.06216, supplementary https://cims.nyu.edu/gcl/papers/2019-ABC-Dataset-Supplemental.pdf (surface taxonomy and feature-file schema)
