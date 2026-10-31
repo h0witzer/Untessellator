@@ -345,6 +345,7 @@ shutter.addEventListener('pointermove', (event) => {
 });
 const endShutterDrag = (event) => { if (event.pointerId === shutterDrag) shutterDrag = null; };
 shutter.addEventListener('pointerup', endShutterDrag);
+shutter.addEventListener('wheel', (event) => { event.preventDefault(); zoomAt(event); }, { passive: false });   // zoom on, over the line
 shutter.addEventListener('pointercancel', endShutterDrag);
 shutter.addEventListener('keydown', (event) => {
   const step = event.shiftKey ? 0.01 : 0.05;
@@ -660,10 +661,18 @@ function pan(dx, dy) {
 function setTool(tool) {
   settings.tool = tool;
   for (const id of ['select', 'fill', 'raw', 'erase']) toolbar.setPressed(id, id === tool);
+  showHeldTool();
   drawCursor();
 }
 
 const strokeMode = () => (modifiers.alt ? 'erase' : modifiers.shift ? 'raw' : settings.tool);
+
+/** While Alt holds the eraser or Shift the brush, that button lights up; the chosen tool keeps an outline meanwhile. */
+function showHeldTool() {
+  const held = modifiers.alt ? 'erase' : modifiers.shift ? 'raw' : null;
+  for (const id of ['select', 'fill', 'raw', 'erase']) toolbar.get(id)?.toggleAttribute('data-held', id === held && id !== settings.tool);
+  toolRow.classList.toggle('wb-tools--holding', held !== null && held !== settings.tool);
+}
 
 function devicePoint(event) {
   const rect = canvas.getBoundingClientRect();
@@ -2688,12 +2697,20 @@ function flagCause(id) {
 }
 
 const RANK = { off: 0, maybe: 1, none: 2, on: 3, skip: 4 };
-function sortValue(r, key) {
-  if (key === 'name') return r.id;
-  if (key === 'type') return SURFACE_KINDS.indexOf(r.type ?? 'freeform');
-  if (key === 'count') return r.count;
-  if (key === 'area') return r.area;
-  return RANK[r.verdict] * 1e12 - (Number.isFinite(r.worst) ? r.worst : 0);   // worst first
+const order = (x, y) => (x < y ? -1 : x > y ? 1 : 0);
+/**
+ * How rows `a` and `b` compare on column `key`, ascending. Fit is worst first: by verdict, then by the farthest
+ * distance, largest first (no distance last). Two keys, never one number: rank x 1e12 - worst lost every distance
+ * under about 5e-4 to rounding, so the groups on their surfaces sorted by name.
+ */
+function compareRows(a, b, key) {
+  if (key === 'fit') {
+    const worst = (r) => (Number.isNaN(r.worst) ? -1 : r.worst);
+    return RANK[a.verdict] - RANK[b.verdict] || order(worst(b), worst(a));
+  }
+  if (key === 'name') return a.id - b.id;
+  if (key === 'type') return SURFACE_KINDS.indexOf(a.type ?? 'freeform') - SURFACE_KINDS.indexOf(b.type ?? 'freeform');
+  return order(a[key], b[key]);   // count, area
 }
 /** The table's rows as filtered, searched and sorted. */
 function visibleRows() {
@@ -2702,7 +2719,7 @@ function visibleRows() {
   const rows = groupRows().filter((r) => (!table.types.size || table.types.has(r.type ?? 'freeform'))
     && (!table.fits.size || table.fits.has(r.verdict)) && (!q || r.name.toLowerCase().includes(q)));
   const { key, dir } = table.sort;
-  rows.sort((a, b) => { const x = sortValue(a, key), y = sortValue(b, key); return ((x < y ? -1 : x > y ? 1 : 0) || a.id - b.id) * dir; });
+  rows.sort((a, b) => (compareRows(a, b, key) || a.id - b.id) * dir);
   return rows;
 }
 
@@ -2760,7 +2777,8 @@ function refreshPanel() {
   if (rows.length > shown) body += `<tr class="wb-unp"><td colspan="5">${(rows.length - shown).toLocaleString()} more: filter or search to see them</td></tr>`;
   const unpainted = mesh.model.count - store.painted;
   if (unpainted) body += `<tr class="wb-unp"><td>Unpainted</td><td></td><td class="wb-num">${unpainted.toLocaleString()}</td><td class="wb-col-area"></td><td></td></tr>`;
-  const arrow = (k) => (table.sort.key === k ? (table.sort.dir > 0 ? ' ▲' : ' ▼') : '');
+  // the arrow points the way the numbers run: Fit's first order is worst first, so its numbers fall
+  const arrow = (k) => (table.sort.key !== k ? '' : (k === 'fit' ? table.sort.dir < 0 : table.sort.dir > 0) ? ' ▲' : ' ▼');
   const fitOptions = (current) => SURFACE_KINDS.map((t) => `<option value="${t}" ${current === t ? 'selected' : ''}>${typeLabel(t)}</option>`).join('');
 
   // the fixes card
@@ -3000,7 +3018,7 @@ function drawCursor() {
   const context = overlay.getContext('2d');
   context.clearRect(0, 0, overlay.width, overlay.height);
   const mode = strokeMode();
-  canvas.classList.toggle('studio-canvas--brush', mode === 'raw' || mode === 'erase');
+  canvas.classList.toggle('studio-canvas--brush', !previewing && (mode === 'raw' || mode === 'erase'));   // no circle in a preview
   if (!cursor || !mesh || previewing || mode === 'fill' || mode === 'select') return;
   const ratio = dpr();
   context.beginPath();
@@ -3020,7 +3038,7 @@ const noteModifiers = (event) => {
   const changed = modifiers.shift !== event.shiftKey || modifiers.alt !== event.altKey;
   modifiers.shift = event.shiftKey;
   modifiers.alt = event.altKey;
-  if (changed) { drawCursor(); if (strokeMode() !== 'fill') setHover(null); }
+  if (changed) { showHeldTool(); drawCursor(); if (strokeMode() !== 'fill') setHover(null); }
 };
 
 canvas.addEventListener('contextmenu', (event) => event.preventDefault());
@@ -3125,7 +3143,7 @@ window.addEventListener('keyup', (event) => {
   noteModifiers(event);
   if (event.key === 'Alt') event.preventDefault();
 });
-window.addEventListener('blur', () => { modifiers.shift = false; modifiers.alt = false; drawCursor(); });
+window.addEventListener('blur', () => { modifiers.shift = false; modifiers.alt = false; showHeldTool(); drawCursor(); });
 
 // ── frame loop ────────────────────────────────────────────────────────────────
 
