@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Untessellator Workbench</title>
+  <link rel="icon" href="data:,">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+  <!-- the kit's sheet for the view cube, menus and tooltips; studio.css for the viewport's own pieces; workbench.css
+       for the chrome -->
+  <link rel="stylesheet" href="vendor/form-studio-ui/onshape.css">
+  <link rel="stylesheet" href="studio.css">
+  <link rel="stylesheet" href="workbench.css">
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
+      "fflate": "https://cdn.jsdelivr.net/npm/fflate@0.8.2/esm/browser.js",
+      "onnxruntime-web": "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.wasm.min.mjs"
+    }
+  }
+  </script>
+</head>
+<body data-os-theme="dark">
+  <!-- The studio (js/studio/workbenchReal.js, a copy of studio.js) without the Onshape shell: real parts, the real
+       fills, fitters and export, in the workbench's interface. -->
+  <div class="wb">
+    <header class="wb-top">
+      <span class="wb-brand">Untessellator</span>
+      <button type="button" class="wb-iconbtn" id="open" data-tb="open" title="Open a mesh (Ctrl+O), or drop one on the view">Open…</button>
+      <button type="button" class="wb-iconbtn" id="undo" data-tb="undo" title="Undo (Ctrl+Z)">↶<span class="wb-lbl"> Undo</span></button>
+      <button type="button" class="wb-iconbtn" id="redo" data-tb="redo" title="Redo (Ctrl+Y)">↷<span class="wb-lbl"> Redo</span></button>
+      <span class="wb-spacer"></span>
+      <span class="wb-tag">Workbench · real parts</span>
+      <button type="button" class="wb-summary" id="summary" hidden title="Color by fit and list the groups that need a look, worst first"></button>
+      <button type="button" class="wb-btn wb-primary" id="export" data-tb="export">Export STEP</button>
+    </header>
+
+    <div class="wb-tools" id="tools"></div>
+
+    <main class="wb-view os-stage" id="view">
+      <div class="wb-colorby" role="group" aria-label="Color by">
+        <span class="wb-glabel">Color by</span>
+        <div class="wb-opts" id="colorby"></div>
+        <kbd title="C steps through them">C</kbd>
+      </div>
+      <div class="wb-hints" id="hint">Left: paint · Shift: brush · Alt: erase · [ ]: brush size · T: triangle edges · C: color by<br>Right-drag: orbit · Ctrl+right or middle: pan · Wheel: zoom · F: fit · right-click a group: menu</div>
+    </main>
+
+    <aside class="wb-panel" id="panel"></aside>
+
+    <footer class="wb-status"><span id="painted" class="wb-painted"></span><span id="status" class="wb-msg"></span></footer>
+  </div>
+  <script>
+    if (location.protocol === 'file:') {
+      document.body.innerHTML = '<p style="font:14px sans-serif;color:#ddd;background:#333;margin:0;padding:40px;height:100vh;box-sizing:border-box">'
+        + 'This page has to be served, not opened as a file. Run the local server and open '
+        + '<a style="color:#3e94ff" href="http://localhost:3000/workbench-real.html">http://localhost:3000/workbench-real.html</a></p>';
+    }
+  </script>
+  <script type="module" src="js/studio/workbenchReal.js"></script>
+</body>
+</html>
