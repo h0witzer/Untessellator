@@ -4,7 +4,11 @@
  * onnxruntime-node in place of the browser runtime. What it writes is what the studio's Export STEP
  * would download after one Auto-paint with the default settings.
  *
- * Usage:  node test/studioExport.mjs <out dir> <file.stl> [<file.stl> ...] [--dump] [--no-axes]
+ * Usage:  node test/studioExport.mjs <out dir> <file.stl> [<file.stl> ...] [--dump] [--no-axes] [--repair]
+ *
+ * --repair: the studio's flow when that export is not every face analytic: press Repair (knit/index.js
+ * repairGroups with the worker's defaults, every move it keeps applied) and Export STEP again. The STEP is the
+ * second export; the row keeps the first one's tier as `first` and the kept moves as `repair`.
  *
  * Per file: <name>.step and <name>.json (the knitter's report, groups by type, timings). The mesh is
  * centred as js/stlLoader.js does and moved back for the export, as the studio does. --synthetic: where
@@ -28,7 +32,7 @@ import { coherentScores, seedOrder, autoPaint } from '../js/autoPaint.js';
 import { annotateEdges, edgeWall } from '../js/edgeWall.js';
 import { fitRegionAs } from '../js/gaussMap.js';
 import { freeformMerge } from '../js/freeformMerge.js';
-import { loadOcct, knitSolid, writeStep } from '../js/knit/index.js';
+import { loadOcct, knitSolid, repairGroups, writeStep } from '../js/knit/index.js';
 import { distNormal } from '../js/knit/geometry.js';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
@@ -39,6 +43,8 @@ const DEADLINE = Number(flag('--deadline', '150'));   // the studio's EXPORT_DEA
 const DUMP = args.includes('--dump');
 const NO_AXES = args.includes('--no-axes');
 const SYNTHETIC = args.includes('--synthetic');
+const REPAIR = args.includes('--repair');
+if (REPAIR) args.splice(args.indexOf('--repair'), 1);
 if (SYNTHETIC) args.splice(args.indexOf('--synthetic'), 1);
 if (NO_AXES) args.splice(args.indexOf('--no-axes'), 1);
 if (DUMP) args.splice(args.indexOf('--dump'), 1);
@@ -184,11 +190,21 @@ for (const file of FILES) {
     writeFileSync(join(OUT, `${name}.fits.json`), JSON.stringify({ faces: [...surfaces].map(([id, [type, params]]) => ({ id, type, params })) }));
   }
   const t1 = performance.now();
-  const { solid, report } = knitSolid(oc, { positions, labels: owner, surfaces }, { deadline: DEADLINE, axes: !NO_AXES });
+  let { solid, report } = knitSolid(oc, { positions, labels: owner, surfaces }, { deadline: DEADLINE, axes: !NO_AXES });
   const knitSecs = (performance.now() - t1) / 1000;
+  let repaired = {};
+  if (REPAIR && report.tier !== 'analytic') {
+    const t2 = performance.now();
+    const r = repairGroups(oc, { positions, labels: owner, surfaces }, { axes: !NO_AXES });
+    const repairSecs = (performance.now() - t2) / 1000;
+    const first = { tier: report.tier, secs: report.secs };
+    ({ solid, report } = knitSolid(oc, { positions, labels: r.labels, surfaces: r.surfaces }, { deadline: DEADLINE, axes: !NO_AXES }));
+    repaired = { first, repair: { ok: r.ok, secs: Math.round(repairSecs * 10) / 10, builds: r.info.repair_builds,
+      kept: r.moves.filter((m) => m.kept).map(({ move, group, groups, from, to }) => ({ move, group, groups, from, to })) } };
+  }
   if (solid) writeFileSync(join(OUT, `${name}.step`), writeStep(oc, solid));
   const row = { file, name, triangles: facets.count, segments, groups: byGroup.size, inexactShare: Math.round(inexactShare * 100) / 100, unpainted: result.free, retyped, typeCount,
-    paint_secs: Math.round(paintSecs * 10) / 10, knit_secs: Math.round(knitSecs * 10) / 10, ...report };
+    paint_secs: Math.round(paintSecs * 10) / 10, knit_secs: Math.round(knitSecs * 10) / 10, ...report, ...repaired };
   writeFileSync(join(OUT, `${name}.json`), JSON.stringify(row, null, 1));
   console.log(JSON.stringify({ ...row, info: undefined }));
 }
