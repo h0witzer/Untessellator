@@ -2,19 +2,21 @@
  * reportReplay.mjs — a conversion report (the studio's Report button, js/studio/report.js), read face by face;
  * with the mesh in it, the reported export rebuilt.
  *
- * Usage:  node test/reportReplay.mjs <stlToStep-report.zip> [<out dir>]
+ * Usage:  node test/reportReplay.mjs <Untessellator-report.zip> [<out dir>]
  *
  * Prints the run (settings, auto-paint, export tier) and every group that went wrong somewhere: flagged by the
- * export check, rejected by the kernel, moved by the repair loop, retyped, absorbed or built as facets. Each row
+ * export check, rejected by the kernel, moved by Repair (in older reports, the export's repair loop), retyped,
+ * absorbed or built as facets. Each row
  * says where the group is (centroid, share of the area), how it came to be (auto-paint seed with the model's
  * prediction and confidence and how its type was decided, or a stroke) and how well its surface fits, so a
  * failure can be traced to the step that caused it rather than guessed from a screenshot.
  *
  * With part.stl in the report it also writes test/knit.mjs's input to <out dir> (part.pos, part.fid,
- * part.fits.json; default: a folder named after the report) and builds it once, with no repair loop and no facet
- * tiers: the kernel's verdict on every face exactly as the studio painted it, which a report whose export timed
- * out does not carry. Those verdicts join the table. The full export (repair loop, facet tiers) is test/knit.mjs
- * on the same folder; on a part with hundreds of bad groups it runs for most of an hour.
+ * part.fits.json; default: a folder named after the report) and builds it once, with no facet tiers: the
+ * kernel's verdict on every face exactly as the studio painted it, which a report whose export timed out does
+ * not carry. Those verdicts join the table. The full export (facet tiers) is test/knit.mjs on the same folder,
+ * and the studio's Repair before it is test/knit.mjs --repair; on a part with hundreds of bad groups the repair
+ * runs for most of an hour.
  */
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
@@ -26,12 +28,15 @@ import { unzipSync, strFromU8 } from 'fflate';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const [zipPath, outArg] = process.argv.slice(2);
 if (!zipPath) {
-  console.log('Usage: node test/reportReplay.mjs <stlToStep-report.zip> [<out dir>]');
+  console.log('Usage: node test/reportReplay.mjs <Untessellator-report.zip> [<out dir>]');
   process.exit(1);
 }
 const files = unzipSync(readFileSync(zipPath));
 const report = JSON.parse(strFromU8(files['report.json']));
-if (report.format !== 'stltostep-report/1') console.log(`warning: report format ${report.format}, this reads stltostep-report/1`);
+// stltostep-report/1 is the same format, from before the rename
+if (!['untessellator-report/1', 'stltostep-report/1'].includes(report.format)) {
+  console.log(`warning: report format ${report.format}, this reads untessellator-report/1`);
+}
 
 const n = (x) => Number(x).toLocaleString('en-US');
 const ex = report.export;
@@ -57,6 +62,14 @@ for (const m of faces.moves ?? []) {
 }
 for (const [id, from, to] of faces.retyped ?? []) row(id).retyped = `${from}->${to}`;
 for (const id of faces.absorbed ?? []) row(id).absorbed = true;
+// the studio's Repair (reports since the export stopped repairing): every move it tried, by group
+const gr = report.groupRepair;
+if (gr) {
+  console.log(`repair     ${gr.stopped ? 'stopped' : gr.ok ? 'closed solid' : 'not a solid yet'} after ${gr.secs} s, kept ${gr.kept} of ${gr.moves?.length ?? '?'} moves`);
+  for (const m of gr.moves ?? []) {
+    for (const id of m.groups ?? [m.group]) row(id).moves.push(`${m.move}${m.to ? ` ${m.from}->${m.to}` : ''}${m.kept ? ' kept' : ''}`);
+  }
+}
 const allFacets = faces.demoted === 'all';
 for (const id of allFacets ? [] : faces.demoted ?? []) row(id).facets = true;
 
@@ -86,9 +99,9 @@ if (files['part.stl']) {
   writeFileSync(join(out, 'part.fid'), Buffer.from(files['part.fid']));
   writeFileSync(join(out, 'part.fits.json'), Buffer.from(files['part.fits.json']));
   if (files['view.png']) writeFileSync(join(out, 'view.png'), Buffer.from(files['view.png']));
-  console.log(`\nBuilding ${out} once (test/knit.mjs, no repair loop, no facet tiers) for the kernel's verdict on every face…`);
+  console.log(`\nBuilding ${out} once (test/knit.mjs, no facet tiers) for the kernel's verdict on every face…`);
   const rowPath = join(out, 'verdicts.json');
-  spawnSync(process.execPath, [join(HERE, 'knit.mjs'), out, out, 'part', '--no-loop', '--no-fallback', '--out', rowPath],
+  spawnSync(process.execPath, [join(HERE, 'knit.mjs'), out, out, 'part', '--no-fallback', '--out', rowPath],
     { stdio: ['ignore', 'ignore', 'inherit'] });
   if (existsSync(rowPath)) {
     const r = JSON.parse(readFileSync(rowPath, 'utf8'));
@@ -96,7 +109,7 @@ if (files['part.stl']) {
     const kinds = Object.entries(r.faces?.problems ?? {}).map(([k, v]) => `${k} ${v.length}`);
     console.log(`built      ${r.tier === 'analytic' ? 'a closed, valid solid with every face analytic' : `not a solid yet (${r.free_edges ?? 0} open edges)`}` +
       ` in ${r.secs} s; kernel rejected ${kinds.length ? kinds.join(', ') : 'no face'}`);
-    console.log(`           the full export, with the repair loop and facet tiers: node test/knit.mjs ${out} ${out} part`);
+    console.log(`           the full export, with the facet tiers: node test/knit.mjs ${out} ${out} part (--repair: the studio's Repair first)`);
   } else console.log('built      the build wrote no result (see the error above)');
 } else console.log('\nNo mesh in the report: no build, so only the verdicts the studio recorded.');
 

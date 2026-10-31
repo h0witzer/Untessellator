@@ -1,6 +1,7 @@
 /**
  * knit/index.js — a STEP solid from painted groups: the topo knitter (ml/solid_rebuild.py's method,
- * ported), its kernel-judged repair loop, and the facet fallback, with an honest account of what came out.
+ * ported), the facet fallback, with an honest account of what came out, and the kernel-judged repair loop
+ * as a step of its own (repairGroups), so the export builds the groups and types it is given.
  *
  *   const oc = await loadOcct();
  *   const { solid, report } = knitSolid(oc, { positions, labels, surfaces });
@@ -98,20 +99,19 @@ export function addFreeform(mesh, surfaces, onProgress = null, { split = true } 
  * face on a fitted surface), hybrid / planar (some patches as facets: report.facetTris triangles,
  * report.facetArea of the area), faceted (the mesh itself), or none (no closed, valid solid of the
  * mesh's volume; the best attempt is still returned, and report says how it fails). freeform: groups with
- * no surface get a fitted B-spline first (addFreeform). `deadline` (s): past
- * it no new repair build or facet tier starts (a running OCCT call cannot be stopped, so callers that
- * must bound the time also need a hard stop, as the studio's worker timeout). mode 'faceted': the mesh
- * as a polyhedral solid only.
+ * no surface get a fitted B-spline first (addFreeform). No group changes type or gives facets to another:
+ * that is repairGroups, which the studio runs in view. `deadline` (s): past it no plain retry or facet tier
+ * starts (a running OCCT call cannot be stopped, so callers that must bound the time also need a hard stop,
+ * as the studio's worker timeout). mode 'faceted': the mesh as a polyhedral solid only.
  */
-export function knitSolid(oc, { positions, labels, surfaces }, { loop = true, fallback = true, budget = LOOP.BUDGET_S,
-  maxBuilds = LOOP.MAX_BUILDS, onProgress = null, deadline = Infinity, mode = 'knit', freeform = true, split = true,
-  axes = true, axesOptions = {}, tidy: tidyUp = true, retryPlain = true } = {}) {
+export function knitSolid(oc, { positions, labels, surfaces }, { fallback = true, onProgress = null, deadline = Infinity,
+  mode = 'knit', freeform = true, split = true, axes = true, axesOptions = {}, tidy: tidyUp = true, retryPlain = true } = {}) {
   const t0 = performance.now();
-  const end = now() + deadline;                  // past it: no new repair builds or facet tiers
+  const end = now() + deadline;                  // past it: no plain retry or facet tiers
   const mesh = new KnitMesh(positions, labels);
   let surfs = surfaces instanceof Map ? surfaces : new Map(Object.entries(surfaces).map(([k, v]) => [Number(k), v]));
   const info = {};
-  let shape = null, state = null, out;
+  let shape = null, state = null, out, pieces = null;
   if (mode === 'faceted') {
     // The mesh as a solid and nothing else: the studio's answer when the analytic build ran out of time.
     const { shape: sh } = buildPolyhedral(oc, mesh);
@@ -119,8 +119,9 @@ export function knitSolid(oc, { positions, labels, surfaces }, { loop = true, fa
     out = { shape: sh, sc, tier: g[0] ? 'faceted' : 'none', bestTier: 'faceted', facetTris: mesh.T.length, facetArea: 1 };
     return finish(out);
   }
-  budget = Math.min(budget, deadline / 2);
+  const unsplit = Int32Array.from(mesh.F);
   if (freeform) Object.assign(info, addFreeform(mesh, surfs, onProgress, { split }));
+  pieces = piecesOf(unsplit, mesh.F);
   const plainSurfs = new Map(surfs);              // the fits as they came, for the plain retry
   // shared axes and directions made exact (knit/axes.js): coaxial faces meet without a kink
   if (axes) {
@@ -131,8 +132,7 @@ export function knitSolid(oc, { positions, labels, surfaces }, { loop = true, fa
   }
   const attempt = (sf) => {
     try {
-      return buildRepaired(oc, mesh, sf, { fitCandidates: loop ? fitCandidatesFor(positions) : null,
-        maxBuilds: loop ? maxBuilds : 1, budget, onProgress });
+      return buildRepaired(oc, mesh, sf, { maxBuilds: 1, onProgress });
     } catch (err) {
       info.exception = String(err?.message ?? err).slice(0, 120);
       if (globalThis.process?.env?.KNIT_DEBUG) info.exception_stack = String(err?.stack ?? '').split(/\r?\n/).slice(0, 8).join(' | ');
@@ -185,7 +185,7 @@ export function knitSolid(oc, { positions, labels, surfaces }, { loop = true, fa
     nonmanifold_edges: sc.nonmanifold_edges ?? null, shells: sc.shells ?? null,
     groups: new Set(mesh.F).size, bodies: mesh.nBodies, triangles: mesh.T.length,
     secs: Math.round((performance.now() - t0) / 100) / 10, info,
-    faces: faceOutcomes(labels, surfaces, state, out),
+    faces: { ...faceOutcomes(labels, surfaces, state, out), pieces: pieces ? [...pieces] : [] },
   };
   return { solid: sc.solid ?? out.shape, report };
   }
@@ -197,7 +197,7 @@ export function knitSolid(oc, { positions, labels, surfaces }, { loop = true, fa
  * the repair loop's moves; the groups it absorbed into neighbours or that ended on another surface type
  * (repair or shared axes); each group's final surface type; and the groups the facet tier built as facets
  * ('all' when the result is the mesh itself). Group ids are the labels the knitter was given; a freeform
- * group split into pieces adds labels above them.
+ * group split into pieces adds labels above them (knitSolid's report.faces.pieces: [piece, group]).
  */
 function faceOutcomes(labels, surfaces, state, out) {
   const ids = (s) => [...s].sort((a, b) => a - b);
@@ -216,4 +216,79 @@ function faceOutcomes(labels, surfaces, state, out) {
     if (was && was !== s[0]) faces.retyped.push([g, was, s[0]]);
   }
   return faces;
+}
+
+/** The labels addFreeform made (a split group's later pieces and its unfitted rest): Map label -> its group. */
+function piecesOf(before, after) {
+  const out = new Map();
+  for (let t = 0; t < after.length; t++) if (after[t] !== before[t]) out.set(after[t], before[t]);
+  return out;
+}
+
+/**
+ * The studio's Repair: the export's build (freeform fits, shared axes), then the repair loop (repair.js
+ * buildRepaired) until the part is a closed, valid solid of the mesh's volume or the builds or the budget run
+ * out. No facet tiers. Each move kept goes to onMove in the input's terms, for the caller to apply as an edit:
+ *   {move: 'retype', group, from, to, params, changes}
+ *   {move: 'absorb', group, changes} and {move: 'absorb_slivers', groups, changes}
+ * changes: [input triangle, its new group, ...]. Groups are the input's labels, except that a freeform piece
+ * (addFreeform's split) that is retyped, or whose group is, becomes a group of its own under its piece label:
+ * the export then fits each group as the loop built it. Facets moved onto a piece stay in its group.
+ * onProgress gets knitSolid's progress, with `trying` (the move about to be built) in the same terms.
+ * Returns {ok, labels (per input triangle), surfaces (Map group -> [type, params]: the input's, retypes
+ * applied, emptied groups gone), moves, info, problems}.
+ */
+export function repairGroups(oc, { positions, labels, surfaces }, { budget = LOOP.BUDGET_S, maxBuilds = LOOP.MAX_BUILDS,
+  onProgress = null, onMove = null, split = true, axes = true, axesOptions = {} } = {}) {
+  const t0 = performance.now();
+  const mesh = new KnitMesh(positions, labels);
+  const surfs = surfaces instanceof Map ? new Map(surfaces) : new Map(Object.entries(surfaces).map(([k, v]) => [Number(k), v]));
+  const out = { labels: Int32Array.from(labels), surfaces: new Map(surfs) };
+  const info = {};
+  const unsplit = Int32Array.from(mesh.F);
+  Object.assign(info, addFreeform(mesh, surfs, onProgress, { split }));
+  const pieces = piecesOf(unsplit, mesh.F);
+  // Every build gets its shared axes from the groups and fits as they stand, as the export will make them:
+  // the loop used to build a retype on its own fit, which the export never would (00000270_015)
+  const prepare = axes ? (lab, sf) => {
+    const r = shareAxes(mesh.withLabels(lab), sf, axesOptions);
+    if (!info.axes_surfaces) Object.assign(info, r.info);
+    return r.surfaces;
+  } : null;
+  const own = new Set();                         // pieces that are groups of their own
+  const groupOf = (l) => (pieces.has(l) && !own.has(l) ? pieces.get(l) : l);
+  const kept = (m) => {
+    if (m.move === 'retype') {
+      if (pieces.has(m.group)) own.add(m.group);
+      else for (const [p, g] of pieces) if (g === m.group) own.add(p);
+    }
+    const changes = [];
+    for (let t = 0; t < m.labels.length; t++) {
+      const s = mesh.src[t], g = groupOf(m.labels[t]);
+      if (out.labels[s] !== g) { out.labels[s] = g; changes.push(s, g); }
+    }
+    const move = { move: m.move, changes };
+    if (m.move === 'retype') {
+      const params = m.surfaces.get(m.group)[1];
+      out.surfaces.set(m.group, [m.to, params]);
+      Object.assign(move, { group: m.group, from: m.from, to: m.to, params });
+    } else if (m.move === 'absorb') move.group = groupOf(m.group);
+    else move.groups = [...new Set(m.groups.map(groupOf))];
+    const present = new Set(out.labels);
+    for (const g of [...out.surfaces.keys()]) if (!present.has(g)) out.surfaces.delete(g);
+    onMove?.(move);
+  };
+  const progress = onProgress && ((p) => {
+    const trying = p.trying && { ...p.trying, ...(p.trying.group !== undefined ? { group: groupOf(p.trying.group) } : {}),
+      ...(p.trying.groups ? { groups: [...new Set(p.trying.groups.map(groupOf))] } : {}) };
+    onProgress(trying ? { ...p, trying } : p);
+  });
+  const r = buildRepaired(oc, mesh, surfs, { fitCandidates: fitCandidatesFor(positions), maxBuilds, budget,
+    onProgress: progress, onMove: kept, prepare });
+  Object.assign(info, r.info, { secs: Math.round((performance.now() - t0) / 100) / 10 });
+  const problems = {};
+  for (const [k, v] of Object.entries(r.state.problems ?? {})) if (v.size) problems[k] = [...new Set([...v].map(groupOf))].sort((a, b) => a - b);
+  const moves = r.state.moves.map((m) => ({ ...m, ...(m.group !== undefined ? { group: groupOf(m.group) } : {}),
+    ...(m.groups ? { groups: [...new Set(m.groups.map(groupOf))] } : {}) }));
+  return { ok: r.state.ok, labels: out.labels, surfaces: out.surfaces, moves, info, problems };
 }

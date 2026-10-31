@@ -1,6 +1,6 @@
-# stlToStep
+# Untessellator
 
-**Turn meshes back into real CAD.** stlToStep reads an STL, OBJ or 3MF file and writes a STEP
+**Turn meshes back into real CAD.** Untessellator reads an STL, OBJ or 3MF file and writes a STEP
 solid made of real faces:
 
 - exact planes, cylinders, cones, spheres and tori
@@ -14,6 +14,8 @@ It runs in your browser: nothing is uploaded, there's no per-conversion fee, and
 
 **See what it recovers: <https://h0witzer.github.io/Untessellator-Gallery/>**. Every part in the gallery
 was checked face by face against its original CAD file: the same faces, of the same types, each within 1 µm.
+
+Untessellator was called stlToStep until October 2026. Links to the old repository redirect here.
 
 Inspired by [CNCKitchen's stlTexturizer](https://github.com/CNCKitchen/stlTexturizer), which this
 project began as a fork of.
@@ -42,7 +44,7 @@ There's one engine with several front ends:
 ## Quick start
 
 ```sh
-git clone https://github.com/h0witzer/stlToStep && cd stlToStep
+git clone https://github.com/h0witzer/Untessellator && cd Untessellator
 node server.js
 ```
 
@@ -91,8 +93,9 @@ mesh ─► repair ─► paint face groups ─► fit + type each group ─► 
 4. **Make relations exact.** Shared axes, tangency, equal radii and mirror symmetry become exact.
    Values are never rounded to nice numbers.
 5. **Knit.** Take the topology from the mesh and the geometry from the fits. A geometry kernel
-   checks the result. A repair loop fixes what it rejects, and regions that still can't be built
-   fall back to facets, so the export still closes.
+   checks the result. The export never changes your groups: the ones the kernel rejects are marked,
+   and **Repair** tries other surface types and merges on them in view, each kept change an undo
+   step. Regions that still can't be built fall back to facets, so the export still closes.
 
 ## What to expect
 
@@ -113,14 +116,14 @@ The trained models ship with the studio and run in your browser, so we only lear
 real parts if you tell us. After a conversion, press the **flag** button next to Export STEP and
 choose what goes in. It does two things:
 
-1. **Downloads a report file** (`stlToStep-report-….zip`). It records every face group:
+1. **Downloads a report file** (`Untessellator-report-….zip`). It records every face group:
    - where the group is and how big it is
    - how it was made: the auto-paint seed, what the model predicted and how confident it was, and
      what decided its final type
    - how well its surface fits
    - what the export check flagged
-   - what the export did with it: the kernel's verdict on that face, repair attempts, and whether it
-     was retyped or went out as facets
+   - what the export did with it: the kernel's verdict on that face and whether it went out as
+     facets, and what Repair changed
 
    It also holds the groups and surfaces exactly as the export received them. A picture of the view
    and the mesh go in only if you choose them; with the mesh, we can rebuild your export exactly.

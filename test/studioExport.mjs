@@ -4,7 +4,7 @@
  * onnxruntime-node in place of the browser runtime. What it writes is what the studio's Export STEP
  * would download after one Auto-paint with the default settings.
  *
- * Usage:  node test/studioExport.mjs <out dir> <file.stl> [<file.stl> ...] [--budget 300] [--dump] [--no-axes]
+ * Usage:  node test/studioExport.mjs <out dir> <file.stl> [<file.stl> ...] [--dump] [--no-axes]
  *
  * Per file: <name>.step and <name>.json (the knitter's report, groups by type, timings). The mesh is
  * centred as js/stlLoader.js does and moved back for the export, as the studio does. --synthetic: where
@@ -35,7 +35,6 @@ const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const ort = createRequire(import.meta.url)('onnxruntime-node');
 const args = process.argv.slice(2);
 const flag = (name, dflt) => { const i = args.indexOf(name); if (i < 0) return dflt; const v = args[i + 1]; args.splice(i, 2); return v; };
-const BUDGET = Number(flag('--budget', '300'));
 const DEADLINE = Number(flag('--deadline', '150'));   // the studio's EXPORT_DEADLINE_S
 const DUMP = args.includes('--dump');
 const NO_AXES = args.includes('--no-axes');
@@ -185,7 +184,7 @@ for (const file of FILES) {
     writeFileSync(join(OUT, `${name}.fits.json`), JSON.stringify({ faces: [...surfaces].map(([id, [type, params]]) => ({ id, type, params })) }));
   }
   const t1 = performance.now();
-  const { solid, report } = knitSolid(oc, { positions, labels: owner, surfaces }, { budget: BUDGET, deadline: DEADLINE, axes: !NO_AXES });
+  const { solid, report } = knitSolid(oc, { positions, labels: owner, surfaces }, { deadline: DEADLINE, axes: !NO_AXES });
   const knitSecs = (performance.now() - t1) / 1000;
   if (solid) writeFileSync(join(OUT, `${name}.step`), writeStep(oc, solid));
   const row = { file, name, triangles: facets.count, segments, groups: byGroup.size, inexactShare: Math.round(inexactShare * 100) / 100, unpainted: result.free, retyped, typeCount,

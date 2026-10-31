@@ -14,6 +14,10 @@
  *     face fill, which would cover the group's colour; the border's hidden-side copy is
  *     drawn without the stipple, because mesh edges come in pieces too short to dash
  *   - picking is a triangle-ID buffer, rendered only when the view has changed
+ *   - a HEAT mode (setHeat) for the deviation view: a second per-corner value, a level, is
+ *     interpolated across each triangle and mapped through the HEAT ramp per pixel, so a
+ *     triangle whose corners differ shows the ramp between them rather than a blend of two
+ *     colors; a corner at NO_LEVEL keeps its color
  */
 
 import {
@@ -21,26 +25,48 @@ import {
   setLightingUniforms, createSsao, occlusionFactor, PART_GLSL,
 } from '../../vendor/form-studio-ui/index.js';
 
+/**
+ * The heat ramp: stop k is level FROM + k, held flat below the first and above the last. The levels are
+ * log10 of a distance over the part diagonal, so each stop is a decade; studio.js labels them.
+ */
+export const HEAT = { from: -7, stops: ['#2c5fd6', '#22a6c9', '#3fbf5a', '#f2d43a', '#f0612e', '#b3141b'] };
+/** A level that means "no value here": the corner keeps its color. */
+export const NO_LEVEL = -100;
+
+const glslColor = (hex) => `vec3(${[1, 3, 5].map((i) => (parseInt(hex.slice(i, i + 2), 16) / 255).toFixed(4)).join(', ')})`;
+const STOPS = HEAT.stops.length;
+const HEAT_GLSL = `
+const vec3 HEAT[${STOPS}] = vec3[${STOPS}](${HEAT.stops.map(glslColor).join(', ')});
+vec3 heat(float level) {
+  float x = clamp(level - (${HEAT.from.toFixed(1)}), 0.0, ${(STOPS - 1).toFixed(1)});
+  int i = int(min(floor(x), ${(STOPS - 2).toFixed(1)}));
+  return mix(HEAT[i], HEAT[i + 1], x - float(i));
+}`;
+
 const SURFACE_VERTEX = `#version 300 es
-in vec3 position; in vec3 normal; in vec3 colour;
+in vec3 position; in vec3 normal; in vec3 colour; in float level;
 uniform mat4 uProjection; uniform mat4 uView;
-out vec3 vPositionEye; out vec3 vNormalEye; out vec3 vColour;
+out vec3 vPositionEye; out vec3 vNormalEye; out vec3 vColour; out float vLevel;
 void main() {
   vec4 positionEye = uView * vec4(position, 1.0);
   vPositionEye = positionEye.xyz;
   vNormalEye = mat3(uView) * normal;
   vColour = colour;
+  vLevel = level;
   gl_Position = uProjection * positionEye;
 }`;
 
 const SURFACE_FRAGMENT = `#version 300 es
 precision highp float;
-in vec3 vPositionEye; in vec3 vNormalEye; in vec3 vColour;
+in vec3 vPositionEye; in vec3 vNormalEye; in vec3 vColour; in float vLevel;
+uniform bool uHeat;
 out vec4 color;
 ${PART_GLSL}
+${HEAT_GLSL}
 void main() {
   if (!gl_FrontFacing) { color = vec4(0.45, 0.08, 0.10, 1.0); return; }
-  color = vec4(onshapeLight(vColour, vPositionEye, vNormalEye, 0.0), 1.0);
+  vec3 base = uHeat && vLevel > ${(NO_LEVEL / 2).toFixed(1)} ? heat(vLevel) : vColour;
+  color = vec4(onshapeLight(base, vPositionEye, vNormalEye, 0.0), 1.0);
 }`;
 
 // Non-indexed geometry, so a vertex's triangle is gl_VertexID / 3 and no id attribute is needed.
@@ -74,6 +100,7 @@ export function createRenderer(canvas) {
   }
 
   let mesh = null;
+  let heatOn = false;
   const bands = { edges: null, active: null, hover: null };
   let pickTarget = null;
   let pickDirty = true;
@@ -97,7 +124,7 @@ export function createRenderer(canvas) {
   function disposeMesh() {
     if (!mesh) return;
     for (const vao of [mesh.surfaceVao, mesh.aoVao, mesh.pickVao]) if (vao) gl.deleteVertexArray(vao);
-    for (const handle of [mesh.position, mesh.facet, mesh.smooth, mesh.colour]) gl.deleteBuffer(handle);
+    for (const handle of [mesh.position, mesh.facet, mesh.smooth, mesh.colour, mesh.level]) gl.deleteBuffer(handle);
     mesh = null;
   }
 
@@ -178,6 +205,7 @@ export function createRenderer(canvas) {
         facet: arrayBuffer(model.facetNormals),
         smooth: arrayBuffer(model.smoothNormals),
         colour: arrayBuffer(new Float32Array(model.count * 9), gl.DYNAMIC_DRAW),
+        level: arrayBuffer(new Float32Array(model.count * 3).fill(NO_LEVEL), gl.DYNAMIC_DRAW),
         smoothOn: false,
       };
       mesh.surfaceVao = gl.createVertexArray();
@@ -185,6 +213,7 @@ export function createRenderer(canvas) {
       bindAttribute(surfaceProgram, 'position', mesh.position, 3);
       bindAttribute(surfaceProgram, 'normal', mesh.facet, 3);
       bindAttribute(surfaceProgram, 'colour', mesh.colour, 3);
+      bindAttribute(surfaceProgram, 'level', mesh.level, 1);
       if (ssao) {
         mesh.aoVao = gl.createVertexArray();
         gl.bindVertexArray(mesh.aoVao);
@@ -216,6 +245,18 @@ export function createRenderer(canvas) {
       if (!mesh || last < first) return;
       gl.bindBuffer(gl.ARRAY_BUFFER, mesh.colour);
       gl.bufferSubData(gl.ARRAY_BUFFER, first * 9 * 4, colours, first * 9, (last - first + 1) * 9);
+    },
+
+    /** Re-upload triangles first..last (inclusive) of a per-corner level array, three numbers per triangle. */
+    updateLevels(levels, first, last) {
+      if (!mesh || last < first) return;
+      gl.bindBuffer(gl.ARRAY_BUFFER, mesh.level);
+      gl.bufferSubData(gl.ARRAY_BUFFER, first * 3 * 4, levels, first * 3, (last - first + 1) * 3);
+    },
+
+    /** Color corners by their level through the HEAT ramp (the deviation view), or by their color. */
+    setHeat(on) {
+      heatOn = on;
     },
 
     /** Replace one of the band sets ('edges', 'active', 'hover') with segment endpoints, or clear it. */
@@ -261,6 +302,7 @@ export function createRenderer(canvas) {
       gl.useProgram(surfaceProgram);
       gl.uniformMatrix4fv(gl.getUniformLocation(surfaceProgram, 'uProjection'), false, projection);
       gl.uniformMatrix4fv(gl.getUniformLocation(surfaceProgram, 'uView'), false, view);
+      gl.uniform1i(gl.getUniformLocation(surfaceProgram, 'uHeat'), heatOn ? 1 : 0);
       setLightingUniforms(gl, surfaceProgram, {
         occlusionFactor: occlusionFactor(occlusionPercent),
         occlusionTexture: occluding ? ssao.texture : null,

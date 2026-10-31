@@ -1,7 +1,7 @@
-# Contributing to stlToStep
+# Contributing to Untessellator
 
 STL is the worst way to hand someone a part. It has no faces, no edges and no dimensions, only
-triangles. stlToStep turns the mesh back into the B-rep it came from. It recovers exact planes,
+triangles. Untessellator turns the mesh back into the B-rep it came from. It recovers exact planes,
 cylinders, cones, spheres and tori, uses B-splines only where nothing simpler fits, and knits them
 into a closed STEP solid. It runs in the browser, nothing is uploaded, and it's MIT.
 
@@ -58,7 +58,7 @@ with no code from `vendor/form-studio-ui`.
 You need Node.js. It's tested on 24; older versions may work.
 
 ```sh
-git clone https://github.com/h0witzer/stlToStep && cd stlToStep
+git clone https://github.com/h0witzer/Untessellator && cd Untessellator
 npm install          # onnxruntime-node and opencascade.js, for the Node harnesses
 npm start            # then open http://localhost:3000 in Chrome or Edge
 ```
@@ -81,8 +81,8 @@ the stages.
 ```
 mesh ─► repair ─► paint groups ─► fit + type each group ─► make relations exact ─► knit ─► STEP
         meshRepair  paintCore,     gaussMap, freeformFit,    knit/axes.js            knit/
-                    autoPaint      groupType                                         (repair loop,
-                    (models help                                                     facet fallback)
+                    autoPaint      groupType                                         (facet fallback;
+                    (models help                                                     Repair in view)
                      choose triangles)
 ```
 
@@ -91,9 +91,11 @@ almost every failure traces back to the wrong triangles. Models help choose them
 optional.
 
 **The knitter takes topology from the mesh and geometry from the fits.** Each boundary between two
-groups becomes an edge on both fitted surfaces. OCCT then judges the result, a repair loop fixes
-what it rejects, and fallback tiers (hybrid, planar, faceted) make sure a closed solid always comes
-out. The report says which tier it reached.
+groups becomes an edge on both fitted surfaces. OCCT then judges the result, and fallback tiers
+(hybrid, planar, faceted) make sure a closed solid always comes out. The report says which tier it
+reached. The export builds the groups and types it is given and never changes them: the groups OCCT
+rejects are flagged in the studio, where Repair (`repairGroups` in `js/knit/index.js`) tries other
+types and merges on them, and each change it keeps becomes an undo step the user can see.
 
 | Path | What it is |
 |---|---|
@@ -164,6 +166,8 @@ out. The report says which tier it reached.
       reuses proven code.
     - Porting our own working code to another language needs a measured reason, stated in the PR.
       One example would be a host where JavaScript is too slow.
+    - "Why not Rust, with solidcore?" is answered, with numbers and what would change the answer, in
+      [docs/rust-and-solidcore.md](docs/rust-and-solidcore.md).
 11. **`vendor/form-studio-ui/` is never edited.** Where the studio needs different behaviour, build
     it in `js/studio/` from the kit's exports.
 
@@ -190,8 +194,8 @@ with their true B-reps:
 game-style mesher, because models learn a mesher's triangle pattern. A change has to hold on all of
 them. The 300-part Onshape set (ABC's own Onshape exports) is the real-exporter gate.
 
-**Make builder gates deterministic.** The repair loop has a time budget, so solids depend on machine
-load. Compare builder changes with `--budget 100000` and a few workers.
+**Make builder gates deterministic.** Repair has a time budget, so its solids depend on machine
+load. Compare changes to it with `test/knit.mjs --repair --budget 100000` and a few workers.
 
 **Real parts come in as conversion reports.** The studio's flag button opens an issue labelled
 `conversion report`, with a report file attached by the user. `node test/reportReplay.mjs <report.zip>`
@@ -212,7 +216,7 @@ Ranked, each with what "done" means.
    setting. Make a single command that runs the standard gates and prints the tables. Done: a new
    contributor gets the Onshape-set numbers from one command.
 2. **A standalone web deployment.** The studio is live on GitHub Pages
-   ([h0witzer.github.io/stlToStep](https://h0witzer.github.io/stlToStep/)), served straight from
+   ([h0witzer.github.io/Untessellator](https://h0witzer.github.io/Untessellator/)), served straight from
    `main`. What's left:
    - a check in a headless browser, run on every push, that converts the fixtures
    - CDN libraries pinned, with an option to serve them ourselves so the app works offline
@@ -293,5 +297,5 @@ same thing.
 
 ## Credits
 
-stlToStep began as a fork of [CNCKitchen's stlTexturizer](https://github.com/CNCKitchen/stlTexturizer),
+Untessellator began as a fork of [CNCKitchen's stlTexturizer](https://github.com/CNCKitchen/stlTexturizer),
 and its file loader still carries that code (see [LICENSE](LICENSE)).

@@ -5,7 +5,9 @@
  *
  * The loop: while the part is not a closed, valid solid of the mesh's volume, find the failing patches,
  * try ONE move (absorb the group into the neighbours it lies on, or its next surface type from the
- * fitters), rebuild, keep it only if the part got better. Inference-time signals only.
+ * fitters), rebuild, keep it only if the part got better. Inference-time signals only. The export never
+ * runs it: the studio's Repair does (knit/index.js repairGroups), and each move it keeps becomes an edit
+ * the user sees and can undo, so the export builds only what the view shows.
  *
  * The fallback, tried only when the loop's best is not recreated:
  *   hybrid   the patches still failing (and surfaceless ones) as facets, the rest analytic
@@ -24,6 +26,7 @@ export const LOOP = {
   BUDGET_S: 300,
   MAX_RESIDUAL_RATIO: 10,    // a retype candidate fits within this factor of the best candidate
   ABSORB_TOL: 2e-3,          // x diagonal: a larger group's facets move only onto a surface this near
+  EXACT: 1e-6,               // x diagonal: a group its own type fits this closely is never retyped (axes.js's bar)
 };
 const SIMPLER = { plane: 0, sphere: 1, cylinder: 2, cone: 3, torus: 4 };
 const KINDS = ['missing', 'invalid', 'orient', 'area', 'open'];
@@ -90,8 +93,14 @@ function absorbGroup(mesh, labels, surfaces, g, tol = null) {
   return moved;
 }
 
-/** Candidate surfaces other than the current type: the simplest first among those tied with the best. */
+/**
+ * Candidate surfaces other than the current type: the simplest first among those tied with the best. None
+ * for a group its current type fits exactly: the Manta report (2026-10-31) had exact planes retyped to
+ * cylinders and exact cylinders to spheres, kept because the build improved (a band with vertices on its two
+ * rims only lies exactly on a sphere too).
+ */
 function alternatives(cands, current, scaleLen) {
+  if (current && cands.some((c) => c.params && c.type === current[0] && c.residual <= LOOP.EXACT * scaleLen)) return [];
   cands = cands.filter((c) => c.params && (!current || c.type !== current[0]));
   if (!cands.length) return [];
   const best = Math.min(...cands.map((c) => c.residual));
@@ -108,12 +117,16 @@ function countOf(labels, g) {
 }
 
 /**
- * buildTopo, then repair moves while the part is not a closed, valid solid of the mesh's volume.
- * fitCandidates({group: soupTris}) -> {group: [{type, params, residual}]}. Returns {shape, info, state}
- * with state = the best build's labels, surfaces, problems and verdict (for facetFallback).
+ * buildTopo, then repair moves while the part is not a closed, valid solid of the mesh's volume (with
+ * maxBuilds 1, the build alone). fitCandidates({group: soupTris}) -> {group: [{type, params, residual}]}.
+ * onProgress({builds, ok, trying?}) before and after each build; onMove({move, ..., labels, surfaces}) after
+ * each move kept, with the state it made. prepare(labels, surfaces) -> the surfaces each build gets (the
+ * studio's Repair: shared axes, as the export will make them from the same groups); the state keeps the
+ * surfaces before it. Returns {shape, info, state} with state = the best build's labels, surfaces, problems
+ * and verdict (for facetFallback).
  */
 export function buildRepaired(oc, mesh, surfaces, { fitCandidates = null, maxBuilds = LOOP.MAX_BUILDS,
-  budget = LOOP.BUDGET_S, onProgress = null } = {}) {
+  budget = LOOP.BUDGET_S, onProgress = null, onMove = null, prepare = null } = {}) {
   const t0 = now();
   const log = {};
   let slowest = 0;
@@ -122,7 +135,7 @@ export function buildRepaired(oc, mesh, surfaces, { fitCandidates = null, maxBui
     const t = now();
     try {
       const work = mesh.withLabels(labels);
-      const r = buildTopo(oc, work, surfs);
+      const r = buildTopo(oc, work, prepare ? prepare(labels, surfs) : surfs);
       const probs = patchProblems(oc, r.shape, r.faceOf, labels, r.ratios);
       const { g, sc } = grade(oc, r.shape, work, probs);
       return { g, shape: r.shape, info: r.info, probs, labels, surfs, sc };
@@ -157,18 +170,20 @@ export function buildRepaired(oc, mesh, surfaces, { fitCandidates = null, maxBui
 
   // Untyped slivers first, all at once: a patch with no surface has no face, so moving its facets to a
   // neighbour cannot lose anything.
-  if (!best.g[0]) {
+  if (!best.g[0] && builds < maxBuilds) {
     const lab = Int32Array.from(best.labels), sf = new Map(best.surfs);
     const slivers = [...best.probs.missing].filter((g) => !sf.has(g) && countOf(lab, g) <= LOOP.SMALL_GROUP);
     let movedAny = 0;
     for (const g of slivers) movedAny += absorbGroup(mesh, lab, sf, g);
     if (slivers.length && movedAny && timeLeft()) {
+      onProgress?.({ builds, ok: false, trying: { move: 'absorb_slivers', groups: slivers } });
       const trial = build(lab, sf);
       builds++;
       bump(log, 'sliver_absorb_tried');
       const kept = !!trial && !better(best.g, trial.g);
       if (kept) { best = trial; bump(log, 'slivers_absorbed', slivers.length); }
       moves.push({ move: 'absorb_slivers', groups: slivers, kept });
+      if (kept) onMove?.({ move: 'absorb_slivers', groups: slivers, labels: best.labels, surfaces: best.surfs });
     }
     for (const g of slivers) tried.add(`absorb|${g}`);
   }
@@ -209,8 +224,13 @@ export function buildRepaired(oc, mesh, surfaces, { fitCandidates = null, maxBui
       if (!absorbGroup(mesh, lab, sf, move[1], big ? LOOP.ABSORB_TOL * mesh.diag : null)) continue;
       if (!lab.includes(move[1])) sf.delete(move[1]);     // fully absorbed; stranded facets keep it
     }
+    const record = move[0] === 'retype'
+      ? { move: 'retype', group: move[1], from: sf0.get(move[1])?.[0] ?? null, to: move[3].type }
+      : { move: 'absorb', group: move[1] };
+    onProgress?.({ builds, ok: false, trying: record });
     const kept = attempt(lab, sf, move[0]);
-    moves.push(move[0] === 'retype' ? { move: 'retype', group: move[1], to: move[3].type, kept } : { move: 'absorb', group: move[1], kept });
+    moves.push({ ...record, kept });
+    if (kept) onMove?.({ ...record, labels: best.labels, surfaces: best.surfs });
   }
   const info = { ...best.info };
   for (const [k, v] of Object.entries(log)) info[`repair_${k}`] = v;

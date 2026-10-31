@@ -29,9 +29,6 @@ export const AXES = { ANGLE_DEG: 1, OFFSET: 1e-3, RADIUS: 1e-3, ACCEPT: 1.5, FLO
   PRECISION_MIN: 1e-9, SIGMA_K: 10, FLOAT: 1e-7, AXIS_COND: 100, LOW_REDUNDANCY: 3, EXACT: 1e-6,
   MIRROR_ROUNDS: 3, VALUE_REL: 1e-3, VALUE_ANGLE_DEG: 0.5,
   INTENT_DEG: 0.25, INTENT_REL: 2e-4, INTENT_FLOOR: 2e-5, THROUGH: true, CONE_REL: 0.01 };
-// The profiles a member on a shared line may be retyped to when its own type fails the check, simplest first.
-const RETYPE = ['cylinder', 'cone', 'torus'];
-
 const AXIAL = new Set(['cylinder', 'cone', 'torus']);
 const DOF = { plane: 3, cylinder: 5, cone: 6, sphere: 4, torus: 7 };
 const SNAPPABLE = new Set([...AXIAL, 'plane', 'sphere']);
@@ -305,8 +302,7 @@ export function shareAxes(mesh, surfaces, opts = {}) {
   for (let round = 0; round < cfg.ROUNDS; round++) {
     out = new Map(surfaces);
     info = { axes_surfaces: 0, axes_directions: 0, axes_lines_shared: 0, axes_snapped: 0, axes_rejected: 0,
-      axes_retyped: 0, axes_same_radius: 0, axes_same_plane: 0, axes_perpendicular: 0 };
-    const lineFor = new Map();                  // members of shared lines: the line, for a retype
+      axes_same_radius: 0, axes_same_plane: 0, axes_perpendicular: 0 };
     locks.dir.clear(); locks.line.clear(); locks.plane.clear(); locks.lines.length = 0; locks.planeSet.clear(); locks.perpTo.clear();
     intent.clear();
     const items = [];
@@ -436,7 +432,7 @@ export function shareAxes(mesh, surfaces, opts = {}) {
         const cyl = [];
         for (const it of L.items) {
           if (L.items.length > 1) {
-            lineFor.set(it.g, { o: L.q, d }); locks.line.add(it.g);
+            locks.line.add(it.g);
             if (it === L.items[0]) locks.lines.push({ o: L.q, d, members: L.items.map((m) => m.g) });
           }
           const np = refitAbout(it.kind, it.p, pts.get(it.g), L.q, d, cfg.FLOOR * mesh.diag);
@@ -497,27 +493,14 @@ export function shareAxes(mesh, surfaces, opts = {}) {
       }
       if (best) { const np = refitAbout('sphere', s[1], pts.get(g), best.o, best.d, cfg.FLOOR * mesh.diag); if (np) out.set(g, ['sphere', np]); }
     }
-    // 4. the check: each changed surface must still fit its own vertices; a member of a shared line that
-    // fails as its own type may pass as another profile about the line (a cone fitted to a cylinder strip)
+    // 4. the check: each changed surface must still fit its own vertices, or it keeps its own fit. Never
+    // another type: a type change is the studio's Repair, where the user sees it (the Manta report: two
+    // rim-only bands passed as tori about the fan axis on their vertices, 90 degrees off their normals)
     let newly = 0;
     for (const [g, s] of out) {
-      const old = surfaces.get(g);
-      if (s === old) continue;
-      const P = pts.get(g);
-      if (accepts(g, s[0], s[1])) continue;
-      // its own line first, then every other axis line of the part: a loose fit's own axis may be too
-      // far off to have joined the right line at all; the best profile that passes wins
-      let alt = null, best = Infinity;
-      if (AXIAL.has(old[0])) {
-        const own = lineFor.get(g);
-        for (const L of own ? [own, ...lines] : lines) for (const kind of RETYPE) {
-          if (L === own && kind === s[0]) continue;
-          const np = refitAbout(kind, {}, P, L.o, L.d, cfg.FLOOR * mesh.diag);
-          const r = np ? rms(kind, np, P) : Infinity;
-          if (r < best && accepts(g, kind, np)) { best = r; alt = [kind, np]; }
-        }
-      }
-      if (alt) { out.set(g, alt); info.axes_retyped++; } else { rejected.add(g); newly++; }
+      if (s === surfaces.get(g) || accepts(g, s[0], s[1])) continue;
+      rejected.add(g);
+      newly++;
     }
     if (!newly) break;
   }

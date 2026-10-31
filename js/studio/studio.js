@@ -31,7 +31,8 @@ import * as ui from '../../vendor/form-studio-ui/index.js';
 import { loadModelFile } from '../stlLoader.js';
 import { fitRegionAs } from '../gaussMap.js';
 import { repairMesh } from '../meshRepair.js';
-import { preflight } from '../knit/preflight.js';
+import { preflight, PREFLIGHT } from '../knit/preflight.js';
+import { distNormal } from '../knit/geometry.js';
 import { capOwners, fitTriangles, projectCapVertices } from './caps.js';
 import { creaseTableFor, creaseFor } from '../regionGrow.js';
 import { coherentScores, seedOrder, autoPaint, AUTO_TANGENT } from '../autoPaint.js';
@@ -59,7 +60,7 @@ const GROUP_TYPER = 'models/group-typer.onnx';
 /** Plane fills keep the 2 degree crease instead: with the wall they measured worse, not better. */
 const EDGE_WALL_TYPES = ['cylinder', 'cone', 'sphere', 'torus'];
 import { buildMeshModel, bodyEdges, outline } from './meshModel.js';
-import { createRenderer } from './renderer.js';
+import { createRenderer, HEAT, NO_LEVEL } from './renderer.js';
 import { GroupStore, typeLabel } from './groups.js';
 import { conversionNumbers, reportUrl, reportJson, placeGroups, binaryStl, fingerprint } from './report.js';
 import { zipSync, strToU8 } from 'fflate';
@@ -147,6 +148,10 @@ const settings = {
   edges: true,
   smooth: false,
   occlusion: true,
+  // The deviation views (D steps through them; view cube menu): 'groups' colors each group by whether the
+  // export check expects it to come out right, 'heat' maps where the mesh lies off each group's surface.
+  // Off (null) by default, so painting shows group colors and measures nothing extra.
+  deviation: null,
 };
 
 // ── frame ─────────────────────────────────────────────────────────────────────
@@ -162,6 +167,14 @@ const empty = document.createElement('div');
 empty.className = 'studio-empty';
 empty.textContent = 'Open or drop an STL, OBJ or 3MF file';
 shell.stage.append(empty);
+const legend = document.createElement('div');
+legend.className = 'studio-legend';
+legend.hidden = true;
+const legendBody = document.createElement('div');
+const legendProbe = document.createElement('div');
+legendProbe.className = 'studio-legend__probe';
+legend.append(legendBody, legendProbe);
+shell.stage.append(legend);
 const fileInput = document.createElement('input');
 fileInput.type = 'file';
 fileInput.accept = '.stl,.obj,.3mf';
@@ -183,6 +196,28 @@ const corner = ui.mountViewCube(shell.stage, {
     ];
   },
 });
+
+// The view switch, by Export: group colors, the export check's verdict per group (which), or the heat map
+// (where). Its own control, not the kit's: three labelled states, one lit. D steps through them.
+const viewSwitch = document.createElement('div');
+viewSwitch.className = 'studio-views';
+viewSwitch.setAttribute('role', 'group');
+viewSwitch.setAttribute('aria-label', 'View');
+for (const [view, label, tip] of [
+  ['off', 'Groups', 'Each group in its own color (D steps through the views)'],
+  ['groups', 'Check', 'Each group colored by whether the export check expects it to come out right; hover one for why (D)'],
+  ['heat', 'Heat map', 'Where the mesh lies off each group\'s fitted surface, on a log scale (D)'],
+]) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'studio-views__button';
+  button.dataset.view = view;
+  button.textContent = label;
+  button.setAttribute('data-tooltip', tip);
+  button.setAttribute('aria-pressed', view === 'off' ? 'true' : 'false');
+  button.addEventListener('click', () => setDeviationView(view === 'off' ? null : view));
+  viewSwitch.append(button);
+}
 
 const toolbar = ui.createToolbar(shell.toolbar, [
   { kind: 'tool', id: 'open', icon: 'folder', title: 'Open mesh (Ctrl+O)', onClick: () => fileInput.click() },
@@ -211,6 +246,7 @@ const toolbar = ui.createToolbar(shell.toolbar, [
   { kind: 'tool', id: 'autopaint', icon: 'wand', title: 'Auto-paint every unpainted face (P); Esc stops', onClick: () => runAutoPaint() },
   { kind: 'split', id: 'fill-options', icon: 'surface', title: 'Fill method and model', onClick: () => openFillMenu(), menu: () => fillMenu() },
   { kind: 'spacer' },
+  { kind: 'element', id: 'view', element: viewSwitch },
   { kind: 'tool', id: 'report', icon: 'flag', title: 'Report how this conversion went: opens a GitHub issue with this run\'s numbers; nothing is sent until you submit it', onClick: () => reportConversion() },
   { kind: 'labelled', id: 'export', icon: 'build', label: 'Export STEP', accent: true, onClick: () => exportStep() },
 ]);
@@ -235,6 +271,7 @@ let paintPromise = null;
 let prepared = null;
 let needsRender = true;
 let edgesDirty = false;
+let legendDirty = false;
 let cursor = null;
 const modifiers = { shift: false, alt: false };
 
@@ -277,9 +314,14 @@ async function openFile(file) {
     const model = buildMeshModel(geometry.attributes.position.array);
     const colours = new Float32Array(model.count * 9);
     for (let i = 0; i < colours.length; i += 3) colours.set(UNPAINTED, i);
-    mesh = { model, geometry, name: file.name.replace(/\.[^.]+$/, ''), store: new GroupStore(model.count), colours,
+    mesh = { model, geometry, name: file.name.replace(/\.[^.]+$/, ''), store: new GroupStore(model.count, model.neighbours), colours,
              offset: loaded.offset ?? [0, 0, 0],   // the loader centred the mesh; the export moves it back
              repair, synthetic, flags: new Map(), showFlags: false,
+             // the deviation views: each triangle's farthest corner off its group's surface (x diagonal, NaN
+             // with none), each corner's level for the renderer, the groups refit since last colored, and
+             // per group its farthest triangle and its verdict ('on', 'maybe', 'off' or 'none')
+             deviation: new Float32Array(model.count).fill(NaN), levels: new Float32Array(model.count * 3).fill(NO_LEVEL),
+             refitted: new Set(), groupWorst: new Map(), verdicts: new Map(),
              // how each group came to be, for the conversion report (report.js): group id -> origin
              origins: new Map() };
     active = null;
@@ -292,6 +334,8 @@ async function openFile(file) {
     renderer.setBands('active', null);
     renderer.setBands('hover', null);
     edgesDirty = true;
+    legendDirty = true;
+    legend.hidden = !settings.deviation;
     empty.hidden = true;
     zoomFit();
     refreshPanel();
@@ -421,7 +465,7 @@ function devicePoint(event) {
 function beginStroke(event) {
   if (!mesh) return;
   if (stroke) { say('Still filling the last stroke (Esc cancels it)', true); return; }
-  if (autoRun) { say('Auto-painting (Esc stops it)', true); return; }
+  if (autoRun) { say(`${autoRun.what ?? 'Auto-painting'} (Esc stops it)`, true); return; }
   const point = devicePoint(event);
   const mode = strokeMode();
   mesh.store.begin();
@@ -809,6 +853,7 @@ async function runAutoPaint() {
   } finally {
     autoRun = null;
     toolbar.setPressed('autopaint', false);
+    flushChanged();   // groups the commit recolored apart from their neighbors
     edgesDirty = true;
     refreshPanel();
   }
@@ -865,6 +910,7 @@ function finishStroke() {
   const label = s.mode === 'erase' ? 'Erase' : s.mode === 'raw' ? `Paint facets into ${name}` : `Fill ${name}`;
   if (s.blocked) say(`${s.lastMessage ? `${s.lastMessage} · ` : ''}stopped at a crease`);
   const changed = store.commit(label);
+  flushChanged();   // a group the commit recolored apart from its neighbors
   stroke = null;
   // A click that painted nothing on empty space clears the active group, as it clears a selection.
   if (!changed && s.moved <= 4 && s.started < 0) setActive(null);
@@ -879,33 +925,65 @@ function refit(id, tris = null) {
   const group = store.groups.get(id);
   mesh.flags.delete(id);   // a changed group is no longer the one the export check flagged
   if (!group || !prepared) return;
+  // the deviation view recolors the group against its new surface (in the frame loop, once per frame)
+  if (settings.deviation) mesh.refitted.add(id);
   if (!group.type || !store.count(id)) { group.fit = null; return; }
   const result = fitRegionAs(group.type, fitTriangles(tris ?? store.triangles(id), mesh.synthetic), prepared.mesh.facets);
+  // the type goes with the params: a stroke can retype the group before its refit
   group.fit = result.params
-    ? { params: result.params, relResidual: result.relResidual }
+    ? { type: group.type, params: result.params, relResidual: result.relResidual }
     : { reason: result.reason ?? 'the fit failed' };
 }
 
 /** Push changed triangles' colours to the GPU and mark the edges for a rebuild. */
 function flushChanged() {
   if (!mesh) return;
-  const { store, colours } = mesh;
-  const changed = store.takeChanged();
+  const changed = mesh.store.takeChanged();
   if (!changed.size) return;
+  recolor(changed);
+  edgesDirty = true;
+}
+
+/** Color triangles `tris` (every triangle when null) for the current view and push them to the GPU. */
+function recolor(tris = null) {
+  const { colours, model, store } = mesh;
+  // The deviation views measure first: a group's verdict is its farthest triangle's, and a triangle that
+  // changes it recolors the whole group in the group view.
+  if (settings.deviation) {
+    if (tris) for (const t of tris) mesh.deviation[t] = measureTriangle(t);
+    else for (let t = 0; t < model.count; t++) mesh.deviation[t] = measureTriangle(t);
+    const changed = updateVerdicts(tris ? new Set(Array.from(tris, (t) => store.owner[t])) : null);
+    if (tris && changed.size && settings.deviation === 'groups') tris = new Set([...tris, ...trianglesOf(store.owner, changed)]);
+  }
   let first = Infinity;
   let last = -1;
-  for (const t of changed) {
-    const id = store.owner[t];
-    const colour = id >= 0 ? store.groups.get(id)?.colour ?? UNPAINTED : UNPAINTED;
-    colours.set(colour, t * 9);
-    colours.set(colour, t * 9 + 3);
-    colours.set(colour, t * 9 + 6);
+  const paint = (t) => {
+    const color = triangleColor(t);
+    colours.set(color, t * 9);
+    colours.set(color, t * 9 + 3);
+    colours.set(color, t * 9 + 6);
     if (t < first) first = t;
     if (t > last) last = t;
-  }
+  };
+  if (tris) for (const t of tris) paint(t);
+  else for (let t = 0; t < model.count; t++) paint(t);
   renderer.updateColours(colours, first, last);
-  edgesDirty = true;
+  if (settings.deviation === 'heat') renderer.updateLevels(mesh.levels, first, last);
+  if (settings.deviation) legendDirty = true;
   requestRender();
+}
+
+/**
+ * A triangle's color: its group's, or in the group view its group's verdict. In the heat view the renderer
+ * colors measured corners by their levels instead, so only a triangle with no surface needs a color.
+ */
+function triangleColor(t) {
+  const { store } = mesh;
+  const id = store.owner[t];
+  if (id < 0) return UNPAINTED;
+  if (settings.deviation === 'groups') return VERDICTS[mesh.verdicts.get(id) ?? 'none'].rgb;
+  if (settings.deviation === 'heat' && Number.isNaN(mesh.deviation[t])) return NO_SURFACE;
+  return store.groups.get(id)?.colour ?? UNPAINTED;
 }
 
 // ── groups ────────────────────────────────────────────────────────────────────
@@ -994,6 +1072,8 @@ function redo() {
 function afterHistory() {
   // Group colours are fixed per id, but a restored group needs its triangles recoloured.
   flushChanged();
+  // a restored group has its old surface back, so in the deviation view all of its triangles change
+  if (settings.deviation) recolor();
   mesh.flags.clear();   // the export check's flags were for the groups as they were
   mesh.showFlags = false;
   if (active !== null && !mesh.store.count(active)) active = null;
@@ -1048,6 +1128,9 @@ async function exportStep({ checked = false } = {}) {
     const { step, report } = result;
     current.lastExport = report;                  // for the conversion report (report.js)
     if (!step) throw new Error('no shape came out of the build');
+    // Faces off their surfaces: the STEP waits while the user sees which groups failed and picks Repair or this
+    // export as it is (a stopped or failed build went out as the mesh itself, with no verdicts to repair from)
+    if (report.tier !== 'analytic' && !report.timedOut && !report.failed) { offerRepair(current, step, report); return; }
     downloadFile(step, `${name}.stp`);
     say(exportSummary(`${name}.stp`, report, model.count - store.painted), report.tier !== 'analytic');
   } catch (error) {
@@ -1126,6 +1209,7 @@ async function sendReport({ picture = false, withMesh = false } = {}) {
     painted: store?.painted ?? 0,
     check: current?.lastCheck ?? null,
     exported: current?.lastExport ?? null,
+    groupRepair: current?.lastRepair ?? null,
   });
   const issue =(extra = '') => reportUrl(numbers + extra, { tier: current?.lastExport?.tier, groups: store?.list().length ?? 0 });
   if (!current) {
@@ -1142,7 +1226,7 @@ async function sendReport({ picture = false, withMesh = false } = {}) {
       repair: current.repair, fingerprint: await fingerprint(current.geometry.attributes.position.array),
       includesMesh: withMesh, autoPaint: current.autoPaint, groups: store.list(),
       placed: placeGroups(payload.positions, payload.labels), origins: current.origins,
-      check: current.lastCheck, exported: current.lastExport,
+      check: current.lastCheck, exported: current.lastExport, groupRepair: current.lastRepair ?? null,
     });
     const files = {
       'report.json': strToU8(JSON.stringify(json, null, 1)),
@@ -1152,7 +1236,7 @@ async function sendReport({ picture = false, withMesh = false } = {}) {
     if (picture) files['view.png'] = await captureView();
     if (withMesh) files['part.stl'] = binaryStl(payload.positions);
     const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-    const file = `stlToStep-report-${stamp}.zip`;
+    const file = `Untessellator-report-${stamp}.zip`;
     downloadFile(zipSync(files, { level: 6 }), file);
     window.open(issue(`\nreport file: ${file}`), '_blank', 'noopener');
     say(`Downloaded ${file}: drag it into the GitHub issue that just opened, check the numbers, then submit it`);
@@ -1231,6 +1315,232 @@ function showDoubts() {
   say(`Outlined: ${[...mesh.flags.keys()].map((id) => mesh.store.name(id)).join(', ')}. Hover a ⚠ row for why; fix, merge or retype them, then export again`);
 }
 
+// ── deviation view ────────────────────────────────────────────────────────────
+
+/**
+ * The deviation views (settings.deviation; the toolbar's view switch, D steps through them), measured
+ * against the export check's bars: past DOUBT.DEV (1e-3 x the part diagonal) it calls a group wrong (94-100%
+ * right on Onshape parts); past PREFLIGHT.DEV (1e-5), right about 65% of the time.
+ *
+ *   'groups'  WHICH groups: each group in one color, its verdict. Red where the export check flags it (off its
+ *             surface, a seam gap, or a narrow arc, which no distance shows) or a triangle is past its bar,
+ *             yellow past the soft bar, green on its surface. Hover a group for why.
+ *   'heat'    WHERE in them: every corner gets its distance from its own group's surface as a decade level
+ *             (log10); the renderer interpolates the level across the triangle and maps it through its HEAT
+ *             ramp per pixel, so within a group the map is continuous, and a triangle of another face is a
+ *             hot spot that cools to its edge on the group's surface.
+ *
+ * On a CAD tessellation every vertex lies on its face, so a right group sits at float precision (~1e-7, the
+ * ramp's cold end) and a triangle of another face stands out by orders of magnitude. A wrong type that still
+ * fits (a plane on a few strips of a cylinder) is on its surface: only the narrow-arc flag can catch it.
+ */
+const DEVIATION_VIEWS = [null, 'groups', 'heat'];
+/** The group view's verdicts: the reserved status colors, always named beside them in the legend. */
+const VERDICTS = {
+  off: { rgb: hexRgb('#d03b3b'), label: 'Likely wrong' },
+  maybe: { rgb: hexRgb('#fab219'), label: 'Doubtful' },
+  on: { rgb: hexRgb('#0ca30c'), label: 'On its surface' },
+  none: { rgb: [0.42, 0.42, 0.42], label: 'No surface (freeform or failed fit)' },
+};
+const NO_SURFACE = VERDICTS.none.rgb;
+
+function hexRgb(hex) {
+  return [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255);
+}
+// Levels are clamped: an exact zero has no log, and an infinite one would interpolate to NaN on the GPU.
+const LEVEL_RANGE = [-12, 3];
+
+/**
+ * Measure triangle t against its group's surface: each corner's level into mesh.levels (NO_LEVEL with no
+ * surface), and the farthest corner's distance, x the diagonal, returned (NaN with no surface).
+ */
+function measureTriangle(t) {
+  const { store, levels, model } = mesh;
+  const fit = store.groups.get(store.owner[t])?.fit;
+  if (!fit?.params) { levels.fill(NO_LEVEL, t * 3, t * 3 + 3); return NaN; }
+  const diag = 2 * model.radius;
+  const P = model.positions;
+  let worst = 0;
+  for (let k = 0; k < 3; k++) {
+    const o = t * 9 + k * 3;
+    // a cap the repair added: the export puts its corners on the surface (caps.js)
+    let d = mesh.synthetic?.[t] ? 0 : Math.abs(distNormal(fit.type, fit.params, [P[o], P[o + 1], P[o + 2]])[0]) / diag;
+    if (Number.isNaN(d)) d = Infinity;   // a NaN distance counts as far
+    levels[t * 3 + k] = Math.min(LEVEL_RANGE[1], Math.max(LEVEL_RANGE[0], Math.log10(d)));
+    if (d > worst) worst = d;
+  }
+  return worst;
+}
+
+function deviationBand(d) {
+  if (Number.isNaN(d)) return 'none';
+  return d <= PREFLIGHT.DEV ? 'on' : d <= DOUBT.DEV ? 'maybe' : 'off';
+}
+
+/**
+ * Recompute the verdict of groups `ids` (every group when null) from their triangles' distances and the export
+ * check's flags; returns the ids whose verdict changed.
+ */
+function updateVerdicts(ids = null) {
+  const { store, deviation, verdicts, groupWorst, flags } = mesh;
+  const worst = new Map();
+  for (let t = 0; t < store.owner.length; t++) {
+    const id = store.owner[t];
+    if (id < 0 || (ids && !ids.has(id))) continue;
+    worst.set(id, Math.max(worst.get(id) ?? -Infinity, deviation[t]));   // NaN (no surface) wins, as it should
+  }
+  if (!ids) { verdicts.clear(); groupWorst.clear(); }
+  const changed = new Set();
+  for (const id of ids ?? worst.keys()) {
+    if (id < 0) continue;
+    const w = worst.get(id);
+    if (w === undefined) { if (verdicts.delete(id)) changed.add(id); groupWorst.delete(id); continue; }
+    groupWorst.set(id, w);
+    const verdict = Number.isNaN(w) ? 'none' : flags.has(id) ? 'off' : deviationBand(w);
+    if (verdicts.get(id) !== verdict) { verdicts.set(id, verdict); changed.add(id); }
+  }
+  return changed;
+}
+
+/** D: the next deviation view (groups, heat, off). */
+function cycleDeviation() {
+  setDeviationView(DEVIATION_VIEWS[(DEVIATION_VIEWS.indexOf(settings.deviation) + 1) % DEVIATION_VIEWS.length]);
+}
+
+/** Show the group verdicts, the heat map, or neither. Coming from neither, it also runs the export check. */
+async function setDeviationView(view) {
+  const was = settings.deviation;
+  settings.deviation = view;
+  for (const v of DEVIATION_VIEWS) viewSwitch.querySelector(`[data-view="${v ?? 'off'}"]`).setAttribute('aria-pressed', v === view ? 'true' : 'false');
+  legend.hidden = !view || !mesh;
+  renderer.setHeat(view === 'heat');
+  if (!mesh) return;
+  recolor();
+  if (!view) { say('Group colors'); return; }
+  drawLegend();
+  showProbe(-1);
+  say(deviationSummary(), hasBad());
+  if (was || stroke || autoRun || !mesh.store.list().length) return;
+  const current = mesh;
+  await new Promise((resolve) => setTimeout(resolve, 50));   // let the view show: the check takes ~1 s per 55k triangles
+  if (mesh !== current || !settings.deviation || stroke || autoRun) return;
+  const doubts = exportDoubts(await knitPayload(current));
+  if (mesh !== current || !settings.deviation || stroke || autoRun) return;
+  current.flags = doubts.groups;
+  recolor();                                       // a flagged group is red in the group view
+  refreshPanel();
+  say(deviationSummary(doubts.groups.size), hasBad());
+}
+
+const hasBad = () => [...mesh.verdicts.values()].includes('off');
+
+/** How many groups have each verdict. */
+function verdictCounts() {
+  const counts = { off: 0, maybe: 0, on: 0, none: 0 };
+  for (const v of mesh.verdicts.values()) counts[v]++;
+  return counts;
+}
+
+/** Count the painted triangles in each band, and the groups holding off and maybe ones. */
+function deviationCounts() {
+  const { store, deviation, model } = mesh;
+  const counts = { on: 0, maybe: 0, off: 0, none: 0, unpainted: 0, offGroups: new Set(), maybeGroups: new Set(), noneGroups: new Set() };
+  for (let t = 0; t < model.count; t++) {
+    const id = store.owner[t];
+    if (id < 0) { counts.unpainted++; continue; }
+    const band = deviationBand(deviation[t]);
+    counts[band]++;
+    if (band !== 'on') counts[`${band}Groups`].add(id);
+  }
+  return counts;
+}
+
+function deviationSummary(flagged = null) {
+  const groups = (n) => `${n.toLocaleString()} group${n === 1 ? '' : 's'}`;
+  const parts = [];
+  if (settings.deviation === 'groups') {
+    const v = verdictCounts();
+    if (v.off) parts.push(`${groups(v.off)} likely wrong`);
+    if (v.maybe) parts.push(`${groups(v.maybe)} doubtful`);
+    if (!v.off && !v.maybe) parts.push(v.on ? 'every group with a surface is on it' : 'no group has a surface yet');
+    if (v.none) parts.push(`${groups(v.none)} with no surface`);
+    parts.push('Heat map shows where');
+  } else {
+    const c = deviationCounts();
+    if (c.off) parts.push(`${c.off.toLocaleString()} triangles in ${groups(c.offGroups.size)} are past the export check's bar`);
+    if (c.maybe) parts.push(`${c.maybe.toLocaleString()} triangles in ${groups(c.maybeGroups.size)} are doubtful`);
+    if (!c.off && !c.maybe) parts.push(c.on ? 'every painted triangle with a surface is on it' : 'nothing painted has a surface yet');
+    if (c.none) parts.push(`${groups(c.noneGroups.size)} have no surface`);
+  }
+  if (flagged !== null) parts.push(flagged ? `the export check flags ${groups(flagged)} (⚠ in the list)` : 'the export check flags no groups');
+  return parts.join(' · ');
+}
+
+/** A length for the legend: two figures, in exponent form when small. */
+const shortLength = (v) => (v >= 0.01 ? v.toPrecision(2) : v.toExponential(1));
+
+const legendKey = (rgb, label, count) => `<span class="studio-legend__swatch" style="background:rgb(${rgb.map((v) => Math.round(v * 255)).join(',')})"></span>`
+  + `<span>${label}</span><span class="studio-legend__value">${count.toLocaleString()}</span>`;
+
+/** Fill the legend in for the view: the verdicts with group counts, or the heat ramp. */
+function drawLegend() {
+  if (settings.deviation === 'heat') { drawHeatLegend(); return; }
+  const v = verdictCounts();
+  legendBody.innerHTML = '<div class="studio-legend__title">Will each group come out right? (groups)</div>'
+    + `<div class="studio-legend__keys">${Object.entries(VERDICTS).map(([k, b]) => legendKey(b.rgb, b.label, v[k])).join('')}`
+    + `${legendKey(UNPAINTED, 'Unpainted (triangles)', mesh.model.count - mesh.store.painted)}</div>`
+    + '<div class="studio-legend__counts">Red: the export check flags it, or it holds a triangle past its bar. Heat map: where.</div>';
+  legendDirty = false;
+}
+
+/** The heat view's legend: the ramp in model units with the export check's bars on it, and the counts. */
+function drawHeatLegend() {
+  const counts = deviationCounts();
+  const diag = 2 * mesh.model.radius;
+  const { from, stops } = HEAT;
+  const top = from + stops.length - 1;
+  const notes = { [from]: 'on it (float precision)', [Math.round(Math.log10(PREFLIGHT.DEV))]: 'export check: doubtful',
+                  [Math.round(Math.log10(DOUBT.DEV))]: 'export check: wrong' };
+  // hot at the top; stop k sits at the middle of its row
+  const gradient = stops.map((hex, k) => `${hex} ${(((k + 0.5) / stops.length) * 100).toFixed(1)}%`).join(', ');
+  const ticks = stops.map((_, i) => {
+    const level = top - i;
+    const prefix = level === top ? '≥ ' : level === from ? '≤ ' : '';
+    return `<span class="studio-legend__tick" style="grid-row:${i + 1}">${prefix}${shortLength(10 ** level * diag)}</span>`
+      + `<span class="studio-legend__note" style="grid-row:${i + 1}">${notes[level] ?? ''}</span>`;
+  }).join('');
+  const groups = (set) => `${set.size} group${set.size > 1 ? 's' : ''}`;
+  legendBody.innerHTML = '<div class="studio-legend__title">Distance off the fitted surface</div>'
+    + `<div class="studio-legend__scale" style="grid-template-rows:repeat(${stops.length}, 17px)">`
+    + `<span class="studio-legend__bar" style="background:linear-gradient(to top, ${gradient})"></span>${ticks}</div>`
+    + `<div class="studio-legend__keys">${legendKey(NO_SURFACE, 'No surface (freeform or failed fit)', counts.none)}${legendKey(UNPAINTED, 'Unpainted', counts.unpainted)}</div>`
+    + `<div class="studio-legend__counts">Past the bar: ${counts.off.toLocaleString()} triangles${counts.off ? ` in ${groups(counts.offGroups)}` : ''}`
+    + `<br>Doubtful: ${counts.maybe.toLocaleString()} triangles${counts.maybe ? ` in ${groups(counts.maybeGroups)}` : ''}</div>`;
+  legendDirty = false;
+}
+
+/** The legend's reading for triangle t under the cursor (-1: none): the group's verdict and why, or the distance there. */
+function showProbe(t) {
+  if (!mesh || t < 0) { legendProbe.textContent = `Point at a ${settings.deviation === 'groups' ? 'group' : 'face'} for a reading`; return; }
+  const id = mesh.store.owner[t];
+  if (id < 0) { legendProbe.textContent = 'Here: unpainted'; return; }
+  const name = mesh.store.name(id);
+  const diag = 2 * mesh.model.radius;
+  if (settings.deviation === 'groups') {
+    const verdict = mesh.verdicts.get(id) ?? 'none';
+    const why = mesh.flags.get(id);
+    const worst = mesh.groupWorst.get(id);
+    legendProbe.textContent = why ? `${name}: ${why.join('; ')}`
+      : verdict === 'none' ? `${name} has no surface`
+        : `${name}: ${VERDICTS[verdict].label.toLowerCase()}, up to ${shortLength(worst * diag)} off`;
+    return;
+  }
+  const d = mesh.deviation[t];
+  legendProbe.textContent = Number.isNaN(d)
+    ? `Here: ${name} has no surface`
+    : `Here: up to ${shortLength(d * diag)} off ${name} (${d.toExponential(0)} of the part)`;
+}
+
 /** Fitted surface params moved by `d`: every point-valued param (origin, axisPoint, apex, center). */
 function shifted(p, d) {
   const out = { ...p };
@@ -1238,8 +1548,8 @@ function shifted(p, d) {
   return out;
 }
 
-// The knitter stops starting repair builds and facet tiers after EXPORT_DEADLINE_S; a build already
-// running is stopped with its worker at EXPORT_HARD_STOP_S. Measured without them: 26 min (Fencepost,
+// The knitter starts no plain retry or facet tier after EXPORT_DEADLINE_S; a build already running is
+// stopped with its worker at EXPORT_HARD_STOP_S. Measured without them: 26 min (Fencepost,
 // 54k triangles) and 49 min (Cake Pan, 23k) before a faceted result, both badly typed freeform parts.
 const EXPORT_DEADLINE_S = 150;
 const EXPORT_HARD_STOP_S = 240;
@@ -1293,6 +1603,195 @@ function exportSummary(file, report, unpainted) {
   if (unpainted > 0) parts.push(`${unpainted.toLocaleString()} unpainted triangles went out as facets`);
   parts.push(`${report.secs} s`);
   return parts.join(' · ');
+}
+
+// ── repair ────────────────────────────────────────────────────────────────────
+
+// The kernel's complaints about a group's face (knit/build.js patchProblems), as the ⚠ rows say them.
+const KERNEL_PROBLEMS = {
+  missing: 'the kernel could not build its face',
+  invalid: 'its face came out invalid',
+  orient: 'its face runs the wrong way against a neighbor',
+  area: 'its face came out a quarter or more off the area of its triangles',
+  open: 'it leaves a gap in the solid',
+};
+
+/** Map group -> reasons from the knitter's problems ({kind: [label]}), each label first through `idOf` (null: skip). */
+function kernelFlags(problems, idOf, store) {
+  const out = new Map();
+  for (const [kind, labels] of Object.entries(problems ?? {})) {
+    for (const label of labels) {
+      const id = idOf(label);
+      if (id == null || !store.groups.has(id)) continue;
+      const why = out.get(id) ?? out.set(id, []).get(id);
+      const text = KERNEL_PROBLEMS[kind] ?? kind;
+      if (!why.includes(text)) why.push(text);
+    }
+  }
+  return out;
+}
+
+/**
+ * An export with faces off their surfaces: each group the kernel rejected, or the facet tier built as facets,
+ * gets a ⚠ with why, and the user picks Repair (in view) or this export as it is. The STEP waits for that.
+ */
+function offerRepair(current, step, report) {
+  const faces = report.faces ?? {};
+  const pieces = new Map(faces.pieces ?? []);           // a freeform group's pieces are that group
+  const idOf = (label) => pieces.get(label) ?? label;
+  const flags = kernelFlags(faces.problems, idOf, current.store);
+  if (Array.isArray(faces.demoted)) {
+    for (const id of new Set(faces.demoted.map(idOf))) {
+      if (!current.store.groups.has(id)) continue;
+      (flags.get(id) ?? flags.set(id, []).get(id)).push('it went out as flat facets');
+    }
+  }
+  current.flags = flags;
+  current.showFlags = false;
+  refreshPanel();
+  const n = flags.size;
+  const groups = `${n} group${n === 1 ? '' : 's'}`;
+  const file = `${current.name}.stp`;
+  const pct = (x) => `${(100 * x).toFixed(x < 0.01 ? 1 : 0)}%`;
+  const what = report.tier === 'none' ? 'it is not a closed solid'
+    : report.tier === 'faceted' ? 'it is the mesh as flat facets'
+      : `${pct(report.facetArea)} of the area is flat facets`;
+  say(`Not saved yet: ${what}${n ? `, from ${groups} the kernel rejected (⚠ in the list)` : ''}. Repair tries other types and merges on them in view; or save it as it is`, true);
+  ui.openMenu([
+    { id: 'repair', label: n ? `Repair the ${groups}` : 'Repair the groups', onSelect: () => repairInView() },
+    ...(n ? [{ id: 'show', label: `Show the ${groups}`, onSelect: () => showDoubts() }] : []),
+    { id: 'save', label: report.tier === 'none' ? 'Save it anyway (not a closed solid)' : 'Save it as it is', onSelect: () => {
+      downloadFile(step, file);
+      say(exportSummary(file, report, current.model.count - current.store.painted), true);
+    } },
+  ], { anchor: toolbar.get('export').parentElement, align: 'right' });
+}
+
+/**
+ * Repair, in view: the repair loop (knit/index.js repairGroups) in a worker, on the groups as they stand. It
+ * builds the solid as the export will, and while a group's face fails, tries that group as its next type or
+ * merged into its neighbors, keeping a change only when the solid gets better. Each change it keeps lands here
+ * at once as its own undo step, so the groups always show what the export will build; the group being tried
+ * is outlined. Esc stops it (the worker with it), keeping the changes made so far.
+ */
+async function repairInView() {
+  if (!mesh) return;
+  if (stroke || autoRun) { say('Finish or cancel (Esc) the stroke or auto-paint first', true); return; }
+  const current = mesh;
+  let payload;
+  try {
+    payload = await knitPayload(current);
+  } catch (error) {
+    console.error(error);
+    say(`Repair failed: ${error.message}`, true);
+    return;
+  }
+  if (mesh !== current || stroke || autoRun) return;
+  const known = new Set(payload.labels);         // the groups as sent; any other label is a freeform piece
+  const made = new Map();                        // freeform pieces the repair made groups of: label -> id
+  const idOf = (label) => (known.has(label) ? label : made.get(label) ?? null);
+  const worker = new Worker(new URL('../knit/worker.js', import.meta.url), { type: 'module' });
+  const started = performance.now();
+  let kept = 0;
+  let ended = false;
+  const end = (text, bad, result = null) => {
+    if (ended) return;
+    ended = true;
+    worker.terminate();
+    autoRun = null;
+    current.lastRepair = { ok: !!result?.ok, kept, stopped: !result, secs: Math.round((performance.now() - started) / 100) / 10,
+                           moves: result?.moves ?? null };        // for the conversion report
+    if (result) { current.flags = kernelFlags(result.problems, idOf, current.store); current.showFlags = false; }
+    setActive(null);
+    refreshPanel();
+    say(text, bad);
+  };
+  const changes = () => `${kept} change${kept === 1 ? '' : 's'}${kept ? ' (each an undo step)' : ''}`;
+  // auto-paint's guard: no strokes, edits or exports while it runs; Esc, which sets stop, ends it at once
+  autoRun = {
+    what: 'Repairing the groups',
+    get stop() { return ended; },
+    set stop(value) { if (value) end(`Repair stopped: kept ${changes()}`, false); },
+  };
+  toolbar.setDisabled('export', 'Repairing the groups (Esc stops it)');
+  worker.onmessage = ({ data }) => {
+    if (ended) return;
+    if (mesh !== current) { end('Repair stopped: another mesh was opened', true); return; }
+    if (data.type === 'status') say(`Repair: ${data.text}`);
+    else if (data.type === 'progress') {
+      if (data.freeform) say(`Repair: fitting freeform surfaces… ${data.freeform} of ${data.of}`);
+      else if (data.trying) {
+        const move = repairMoveText(current, data.trying, idOf);
+        say(`Repair: trying ${data.trying.move === 'retype' ? move : `to ${move}`}… (${kept} kept so far)`);
+        const id = data.trying.group !== undefined ? idOf(data.trying.group) : null;
+        if (id !== null && current.store.groups.has(id)) setActive(id);
+      }
+    } else if (data.type === 'move') {
+      applyRepairMove(current, data.move, idOf, made);
+      kept++;
+    } else if (data.type === 'done') {
+      const r = data.repair;
+      const left = kernelFlags(r.problems, idOf, current.store).size;
+      end(r.ok
+        ? `Repair: the groups now build a closed solid, every face on its surface · kept ${changes()} · Export to save it`
+        : `Repair kept ${changes()}; ${left ? `${left} group${left === 1 ? '' : 's'} still fail (⚠ in the list): fix them by hand, or export and save with them as facets` : 'the solid still does not close'}`,
+      !r.ok, r);
+    } else end(`Repair failed: ${data.message}`, true);
+  };
+  worker.onerror = (event) => end(`Repair failed: ${event.message || 'the worker stopped'}`, true);
+  say('Repair: building the solid to find what fails…');
+  worker.postMessage({ ...payload, repair: true });
+}
+
+/** A repair move in words, as its undo step is named: "Cone 12 as a cylinder", "merge Plane 4 into its neighbors". */
+function repairMoveText(current, m, idOf) {
+  const name = (label) => { const id = idOf(label); return id !== null && current.store.groups.has(id) ? current.store.name(id) : 'a freeform piece'; };
+  if (m.move === 'retype') return `${name(m.group)} as a ${typeLabel(m.to).toLowerCase()}`;
+  if (m.move === 'absorb') return `merge ${name(m.group)} into its neighbors`;
+  return `merge ${m.groups.length} sliver${m.groups.length === 1 ? '' : 's'} into their neighbors`;
+}
+
+/**
+ * One change the repair kept, as its own undo step: triangles to their new groups (a freeform piece the
+ * repair split off becomes a new, untyped group), and a retyped group's new type with the surface the repair
+ * built (in the view's coordinates), not a refit, so the export builds what the repair did.
+ */
+function applyRepairMove(current, m, idOf, made) {
+  const { store } = current;
+  const label = `Repair: ${repairMoveText(current, m, idOf)}`;
+  const touched = new Set();
+  store.begin();
+  const groupFor = (l) => {
+    let id = idOf(l);
+    if (id === null) {
+      id = store.create(null).id;
+      made.set(l, id);
+      current.origins.set(id, { by: 'repair', split: true });
+    }
+    touched.add(id);
+    return id;
+  };
+  for (let i = 0; i < m.changes.length; i += 2) {
+    const was = store.owner[m.changes[i]];
+    if (was >= 0) touched.add(was);
+    store.assign(m.changes[i], groupFor(m.changes[i + 1]));
+  }
+  if (m.move === 'retype') {
+    const id = groupFor(m.group);
+    const group = store.groups.get(id);
+    group.type = m.to;
+    group.fit = { type: m.to, params: shifted(m.params, current.offset.map((v) => -v)) };
+    const origin = current.origins.get(id) ?? current.origins.set(id, { by: 'repair' }).get(id);
+    (origin.repaired ??= []).push({ from: m.from, to: m.to });
+  }
+  for (const id of touched) {
+    current.flags.delete(id);                     // a changed group is no longer the one the kernel rejected
+    if (settings.deviation) current.refitted.add(id);
+  }
+  store.commit(label);
+  flushChanged();
+  edgesDirty = true;
+  refreshPanel();
 }
 
 function downloadFile(data, filename) {
@@ -1362,7 +1861,7 @@ function refreshPanel() {
   } else {
     shell.setStatus('');
   }
-  shell.hint.textContent = `P: auto-paint · Shift: facets · Alt: erase · [ ]: brush ${settings.brushPx}px`;
+  shell.hint.textContent = `P: auto-paint · D: next view · Shift: facets · Alt: erase · [ ]: brush ${settings.brushPx}px`;
 }
 
 function setType(type) {
@@ -1449,8 +1948,9 @@ function setHover(key, triangle = -1) {
 }
 
 function updateHover(point) {
+  const centre = mesh ? renderer.pick(point.x, point.y, 0).centre : -1;
+  if (settings.deviation) showProbe(centre);
   if (!mesh || strokeMode() !== 'fill') { setHover(null); return; }
-  const { centre } = renderer.pick(point.x, point.y, 0);
   if (centre < 0) { setHover(null); return; }
   const id = mesh.store.owner[centre];
   if (id === active && id >= 0) setHover(null);
@@ -1566,6 +2066,7 @@ window.addEventListener('keydown', (event) => {
     refreshPanel();
     drawCursor();
   } else if (key === 'f' && !mod) zoomFit();
+  else if (key === 'd' && !mod) cycleDeviation();
   else if (key === 'p' && !mod) runAutoPaint();
   else if (!mod && event.key >= '1' && event.key <= String(FILL_TYPES.length)) setType(FILL_TYPES[Number(event.key) - 1]);
   else if (event.key === 'Alt') event.preventDefault();   // keep Alt from reaching a browser menu
@@ -1592,6 +2093,17 @@ function frame(now) {
     needsRender = true;
     drawCursor();
   }
+  // The deviation views: a new set of flags (the export check's, or a Repair's kernel rejections) changes
+  // verdicts; groups refit since the last frame are recolored in one pass over the mesh.
+  if (mesh && settings.deviation && mesh.verdictFlags !== mesh.flags) {
+    mesh.verdictFlags = mesh.flags;
+    recolor();
+  }
+  if (mesh?.refitted.size) {
+    if (settings.deviation) recolor(trianglesOf(mesh.store.owner, mesh.refitted));
+    mesh.refitted.clear();
+  }
+  if (legendDirty && mesh && settings.deviation && (!autoRun || now - lastEdgeBuild > 500)) drawLegend();
   // While auto-paint runs, edges are rebuilt at most twice a second rather than after every fill.
   if (edgesDirty && mesh && (!autoRun || now - lastEdgeBuild > 500)) {
     lastEdgeBuild = now;

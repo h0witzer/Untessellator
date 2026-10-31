@@ -21,7 +21,7 @@
  *                    with it, test/reportReplay.mjs rebuilds the reported export exactly
  */
 
-export const REPORT_REPO = 'https://github.com/h0witzer/stlToStep';
+export const REPORT_REPO = 'https://github.com/h0witzer/Untessellator';
 /** The issue form in .github/ISSUE_TEMPLATE; the query keys are its field ids. */
 const TEMPLATE = 'conversion-report.yml';
 
@@ -49,8 +49,10 @@ function browserName() {
  *   painted     triangles in any group
  *   check       the export check's last flags ({ groups: [[id, reasons]], mesh }), or null
  *   exported    the knitter's report from the last export, { failed } when it threw, or null
+ *   groupRepair the last Repair of the groups ({ ok, kept, stopped, secs, moves }), or null
  */
-export function conversionNumbers({ triangles, repaired, model, settings, autoPaint, groups, painted, check, exported }) {
+export function conversionNumbers({ triangles, repaired, model, settings, autoPaint, groups, painted, check, exported,
+  groupRepair = null }) {
   const lines = [`browser: ${browserName()}`];
   if (!triangles) return [...lines, 'mesh: none open'].join('\n');
   lines.push(`mesh: ${n(triangles)} triangles${repaired.length ? `; repaired: ${repaired.join(', ')}` : ''}`);
@@ -87,11 +89,13 @@ export function conversionNumbers({ triangles, repaired, model, settings, autoPa
       lines.push('export faces: not recorded (the analytic build was stopped); the report file can rebuild it');
     } else if (f) {
       const kinds = Object.entries(f.problems ?? {}).map(([k, v]) => `${k} ${v.length}`);
-      const kept = (f.moves ?? []).filter((m) => m.kept).length;
       lines.push(`export faces: kernel rejected ${kinds.length ? kinds.join(', ') : 'none'}; ` +
-        `repair kept ${kept} of ${(f.moves ?? []).length} moves; retyped ${(f.retyped ?? []).length}; ` +
-        `absorbed ${(f.absorbed ?? []).length}; facets ${f.demoted === 'all' ? 'all' : `${(f.demoted ?? []).length} groups`}`);
+        `facets ${f.demoted === 'all' ? 'all' : `${(f.demoted ?? []).length} groups`}`);
     }
+  }
+  if (groupRepair) {
+    lines.push(`repair: ${groupRepair.stopped ? 'stopped' : groupRepair.ok ? 'closed solid' : 'not a solid yet'} after ` +
+      `${groupRepair.secs} s, kept ${groupRepair.kept} of ${groupRepair.moves ? groupRepair.moves.length : '?'} moves`);
   }
   return lines.join('\n');
 }
@@ -135,7 +139,7 @@ export function binaryStl(positions) {
   const count = positions.length / 9;
   const bytes = new Uint8Array(84 + 50 * count);
   const view = new DataView(bytes.buffer);
-  bytes.set(new TextEncoder().encode('stlToStep conversion report mesh'), 0);
+  bytes.set(new TextEncoder().encode('Untessellator conversion report mesh'), 0);
   view.setUint32(80, count, true);
   for (let t = 0; t < count; t++) {
     for (let k = 0; k < 9; k++) view.setFloat32(84 + t * 50 + 12 + k * 4, positions[t * 9 + k], true);
@@ -152,14 +156,15 @@ export async function fingerprint(floats) {
 
 /**
  * The report file's report.json, as an object. `groups` are the studio's ({ id, type, fit }), `placed` is
- * placeGroups' map, `origins` the studio's per-group origins, `check` the export check's last flags
- * ({ groups: [[id, reasons]], mesh }).
+ * placeGroups' map, `origins` the studio's per-group origins (a group the Repair changed lists its retypes
+ * under `repaired`), `check` the export check's last flags ({ groups: [[id, reasons]], mesh }), `groupRepair`
+ * the last Repair of the groups.
  */
 export function reportJson({ page, settings, model, triangles, repair, fingerprint: print, includesMesh, autoPaint,
-  groups, placed, origins, check, exported }) {
+  groups, placed, origins, check, exported, groupRepair = null }) {
   const flags = new Map(check?.groups ?? []);
   return {
-    format: 'stltostep-report/1',
+    format: 'untessellator-report/1',
     created: new Date().toISOString(),
     page,
     browser: browserName(),
@@ -168,6 +173,7 @@ export function reportJson({ page, settings, model, triangles, repair, fingerpri
     autoPaint: autoPaint ?? null,
     check: check ? { mesh: check.mesh, flagged: check.groups.length } : null,
     export: exported ?? null,
+    groupRepair,
     groups: groups.map((g) => ({
       id: g.id,
       type: g.type ?? null,
