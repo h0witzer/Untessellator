@@ -10,7 +10,10 @@ Open the result in any CAD program and you can select a hole, measure a diameter
 
 It runs in your browser: nothing is uploaded, there's no per-conversion fee, and it's MIT.
 
-**Try it: <https://h0witzer.github.io/stlToStep/>**
+**Try it: <https://h0witzer.github.io/Untessellator/>**
+
+**See what it recovers: <https://h0witzer.github.io/Untessellator-Gallery/>**. Every part in the gallery
+was checked face by face against its original CAD file: the same faces, of the same types, each within 1 µm.
 
 Inspired by [CNCKitchen's stlTexturizer](https://github.com/CNCKitchen/stlTexturizer), which this
 project began as a fork of.
@@ -31,7 +34,7 @@ There's one engine with several front ends:
 
 | Front end | Status |
 |---|---|
-| **Standalone web app** (`index.html`) | Live at [h0witzer.github.io/stlToStep](https://h0witzer.github.io/stlToStep/), served by GitHub Pages straight from `main` and tied to no CAD system. It's static files plus libraries from public CDNs, so any static host can serve it. |
+| **Standalone web app** (`index.html`) | Live at [h0witzer.github.io/Untessellator](https://h0witzer.github.io/Untessellator/), served by GitHub Pages straight from `main` and tied to no CAD system. It's static files plus libraries from public CDNs, so any static host can serve it. |
 | **Command line** (`test/studioExport.mjs`) | Works today. It runs the studio's own code and default settings headless. |
 | **SolidCraft plugin** | Wanted. SolidCraft's WebAssembly plugin interface is still being designed ([tangency-labs/solidcraft#1221](https://github.com/tangency-labs/solidcraft/issues/1221)). Until it lands, SolidCraft opens our STEP files with its own reader. |
 | **Onshape app** | In progress. The studio already looks and handles like Onshape (through the vendored Form Studio kit), but the integration with Onshape itself isn't built yet. |
