@@ -1,18 +1,19 @@
 #!/usr/bin/env node
 /**
- * Minimal development server for STL → STEP B-rep Converter.
+ * Minimal development server for the stlToStep studio.
  *
  * Usage:
- *   node server.js          # serves on http://localhost:3000
+ *   node server.js          # serves the studio on http://localhost:3000
  *   PORT=8080 node server.js
  */
 
-const http = require('http');
-const fs   = require('fs');
-const path = require('path');
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const PORT = parseInt(process.env.PORT, 10) || 3000;
-const ROOT = __dirname;
+const ROOT = path.dirname(fileURLToPath(import.meta.url));
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -30,7 +31,7 @@ const MIME = {
 
 const server = http.createServer((req, res) => {
   let urlPath = req.url.split('?')[0];
-  if (urlPath === '/') urlPath = '/index.html';
+  if (urlPath === '/') urlPath = '/studio.html';
 
   // Normalise and guard against path traversal
   const filePath = path.normalize(path.join(ROOT, urlPath));
@@ -62,7 +63,7 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, '127.0.0.1', () => {
   const url = `http://localhost:${PORT}/`;
   console.log('');
-  console.log('  STL → STEP B-rep Converter');
+  console.log('  stlToStep Studio');
   console.log('  ───────────────────────────────────');
   console.log(`  Open in your browser: ${url}`);
   console.log('');

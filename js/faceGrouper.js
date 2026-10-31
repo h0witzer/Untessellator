@@ -4,7 +4,7 @@
  * Segments every triangle in the mesh into groups where adjacent triangles share
  * an edge whose dihedral angle is ≤ creaseAngleDeg.
  *
- * Adjacency comes from meshCore rather than exclusion.js so that this module —
+ * Adjacency comes from meshCore rather than a three.js graph so that this module —
  * and everything downstream of it — carries no three.js dependency and can run
  * headlessly under node. meshCore also recomputes geometric face normals from
  * vertex winding instead of trusting the source file's normals.

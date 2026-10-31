@@ -3,7 +3,7 @@
  * the headless test harness.
  *
  * Nothing here imports three.js, so the segmentation + fitting pipeline can be
- * exercised under plain node. The browser modules (exclusion.js, faceGrouper.js)
+ * exercised under plain node. Browser-side modules such as faceGrouper.js
  * are thin adapters over this.
  *
  * Key difference from the original pipeline: fitting operates on FACETS
