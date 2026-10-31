@@ -18,7 +18,7 @@
 
 const TYPE_LABELS = {
   plane: 'Plane', cylinder: 'Cylinder', cone: 'Cone', sphere: 'Sphere', torus: 'Torus',
-  skip: 'Skip',   // the workbench's set-aside group (workbenchReal.js); never fitted or typed
+  skip: 'Skip',   // set aside: what the import mangled (studio.js); never fitted or typed
 };
 
 export function typeLabel(type) {

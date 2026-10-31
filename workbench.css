@@ -43,6 +43,7 @@ body { background: var(--wb-bg); color: var(--wb-text); font: 14px/1.45 var(--wb
 .wb-iconbtn { border: 1px solid transparent; background: transparent; border-radius: 5px; padding: 5px 8px; cursor: pointer; color: var(--wb-muted); white-space: nowrap; }
 .wb-iconbtn:hover:not([disabled]) { background: var(--wb-raised); color: var(--wb-text); }
 .wb-iconbtn[disabled] { opacity: 0.35; cursor: default; }
+.wb-iconbtn .wb-ticon { width: 18px; height: 18px; vertical-align: -4px; }
 .wb-summary { border: 1px solid var(--wb-line-strong); background: var(--wb-raised); border-radius: 999px; padding: 5px 12px; cursor: pointer; display: inline-flex; gap: 12px; align-items: center; font-size: 12.5px; white-space: nowrap; }
 .wb-summary:hover { border-color: var(--wb-faint); }
 .wb-summary span { display: inline-flex; align-items: center; gap: 6px; }
@@ -168,10 +169,10 @@ body { background: var(--wb-bg); color: var(--wb-text); font: 14px/1.45 var(--wb
 .wb-status .wb-painted { color: var(--wb-faint); flex: none; }
 .wb-status .wb-msg { overflow: hidden; text-overflow: ellipsis; }
 .wb-status .wb-msg.wb-status--bad { color: #e2777d; }
-/* workbench-real.html: the legend's reading under the cursor, and the view's own canvas and overlay (studio.css) */
+/* the studio (index.html): the legend's reading under the cursor; the canvas and overlay are studio.css's */
 .wb-probe { color: var(--wb-muted); font-size: 12px; border-top: 1px solid var(--wb-line); padding-top: 6px; }
 .wb-legend[hidden] { display: none; }
-.wb-legend > div:first-child { display: grid; gap: 7px; }   /* workbench-real.html: the legend's body, one line each */
+.wb-legend > div:first-child { display: grid; gap: 7px; }   /* the studio's legend body, one line each */
 .wb-fixcard .wb-fixlist .wb-irow { margin-top: 2px; }
 div.wb-fixhead { cursor: default; }
 

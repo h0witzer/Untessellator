@@ -39,7 +39,7 @@ There's one engine with several front ends:
 | **Standalone web app** (`index.html`) | Live at [h0witzer.github.io/Untessellator](https://h0witzer.github.io/Untessellator/), served by GitHub Pages straight from `main` and tied to no CAD system. It's static files plus libraries from public CDNs, so any static host can serve it. |
 | **Command line** (`test/studioExport.mjs`) | Works today. It runs the studio's own code and default settings headless. |
 | **SolidCraft plugin** | Wanted. SolidCraft's WebAssembly plugin interface is still being designed ([tangency-labs/solidcraft#1221](https://github.com/tangency-labs/solidcraft/issues/1221)). Until it lands, SolidCraft opens our STEP files with its own reader. |
-| **Onshape app** | In progress. The studio already looks and handles like Onshape (through the vendored Form Studio kit), but the integration with Onshape itself isn't built yet. |
+| **Onshape app** | In progress. The studio's viewport handles like Onshape's (camera, view cube and lighting from the vendored Form Studio kit), but the integration with Onshape itself isn't built yet. |
 
 ## Quick start
 
@@ -51,20 +51,30 @@ node server.js
 Open <http://localhost:3000> in Chrome or Edge (`npm start` does the same as `node server.js`). The
 page has to be served; opening `index.html` directly from disk leaves it blank.
 
-1. Drop an `.stl`, `.obj` or `.3mf` file onto the viewport, or open one from the toolbar.
-2. Press **Auto-paint** (or <kbd>P</kbd>). Every face of the part gets a face group with a surface type
-   and a fit. <kbd>Esc</kbd> stops it.
-3. Fix anything it got wrong by hand:
+1. Drop an `.stl`, `.obj` or `.3mf` file onto the viewport, or press **Open…**.
+2. Press **Auto-paint** (or <kbd>P</kbd>). Every unpainted face gets a face group with a surface type
+   and a fit; groups you painted are left alone. <kbd>Esc</kbd> stops it.
+3. See what's wrong. **Color by** over the viewport (<kbd>C</kbd> steps through it) shows each group
+   in its own color, by surface type, by **Fit** (will it come out right?) or by **Deviation** (a heat
+   map of where the mesh lies off its group's surface). The summary in the top bar lists the groups
+   that need a look, worst first, in the face-group table.
+4. Fix it. In **Fix bad areas**, **Find fixes** proposes re-fills (triangles off their group's surface
+   that lie on a neighbour's), merges (neighbours one surface fits) and skips (stray shells); apply
+   them as one undo step. Or fix by hand:
 
    | Input | Action |
    |---|---|
-   | Left-drag | Fill |
+   | Left-drag | Fill, as the surface chosen under **Paint as** (<kbd>1</kbd>–<kbd>8</kbd>) |
    | <kbd>Alt</kbd> + drag | Erase |
    | <kbd>Shift</kbd> + drag | Paint triangles directly |
+   | **Select** (<kbd>V</kbd>), or a row of the table | Select a group; right-click one for its menu |
    | Right-drag | Orbit |
    | Middle-drag, or <kbd>Ctrl</kbd> + right-drag | Pan |
+   | <kbd>T</kbd> | Show every triangle edge |
 
-4. Press **Export STEP**. The report says what you got: a fully analytic solid, or which regions
+   Paint geometry the import mangled as **Skip**: it is left out of fitting and the checks, and the
+   export heals it over with the group around it, or drops it if nothing painted borders it.
+5. Press **Export STEP**. The report says what you got: a fully analytic solid, or which regions
    fell back to flat facets and why.
 
 The first export downloads the OpenCASCADE WebAssembly build. It's large, and the browser caches it
@@ -93,9 +103,10 @@ mesh ─► repair ─► paint face groups ─► fit + type each group ─► 
 4. **Make relations exact.** Shared axes, tangency, equal radii and mirror symmetry become exact.
    Values are never rounded to nice numbers.
 5. **Knit.** Take the topology from the mesh and the geometry from the fits. A geometry kernel
-   checks the result. The export never changes your groups: the ones the kernel rejects are marked,
-   and **Repair** tries other surface types and merges on them in view, each kept change an undo
-   step. Regions that still can't be built fall back to facets, so the export still closes.
+   checks the result. The export never changes your groups: the ones the kernel rejects are marked ⚠
+   in the face-group table, and **Repair with the kernel** (offered after such an export, and in Fix
+   bad areas) tries other surface types and merges on them in view, each kept change an undo step.
+   Regions that still can't be built fall back to facets, so the export still closes.
 
 ## What to expect
 
@@ -162,7 +173,7 @@ Then open an issue saying what you're picking up.
 | [fflate](https://github.com/101arrowz/fflate) | 0.8.2 | MIT | Reading 3MF archives |
 | [onnxruntime-web](https://onnxruntime.ai/) | 1.22.0 | MIT | Running the optional models |
 | [opencascade.js](https://github.com/donalffons/opencascade.js) | 2.0.0-beta | LGPL-2.1 | The geometry kernel behind the STEP export |
-| Form Studio UI kit (`vendor/form-studio-ui/`) | vendored | LGPL-2.1-or-later | The studio's frame, toolbar, view cube and renderer |
+| Form Studio UI kit (`vendor/form-studio-ui/`) | vendored | LGPL-2.1-or-later | The studio's camera, view cube, menus, tooltips and rendering pieces |
 
 The browser loads the libraries from jsDelivr and unpkg. The Node harnesses use `onnxruntime-node`
 and `opencascade.js` from `npm install`.

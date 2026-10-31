@@ -1,11 +1,14 @@
 /**
- * studio.js — paint face groups onto a mesh, then export them as a STEP solid.
+ * studio.js — the Untessellator studio: paint face groups onto a mesh, see how well each one fits, fix what
+ * doesn't, and export a STEP solid. index.html loads it.
  *
- * Built on the Form Studio kit (vendor/form-studio-ui), which carries Onshape's frame,
- * camera, lighting and gestures as measured from the product. The mouse follows it:
- * RIGHT-drag orbits, the wheel zooms, a right click opens the menu for what is under the
- * cursor, Space clears the active group. Where a Part Studio's LEFT button selects, here it
- * paints:
+ * The page is the studio's own (index.html, workbench.css): a top bar; a tool row with Select, Bucket, Brush and
+ * Erase, the surface to paint as (each with its icon, and Skip for what the import mangled), the brush and
+ * Auto-paint; Color by over the viewport (groups, type, fit, deviation); and a face-group table with Fix bad areas
+ * and an inspector. The viewport's pieces come from the Form Studio kit (vendor/form-studio-ui): the camera, view
+ * cube, menus, tooltips, and Onshape's lighting and gestures as measured from the product. The mouse follows it:
+ * RIGHT-drag orbits, the wheel zooms, a right click opens the menu for what is under the cursor, Space clears the
+ * selection. Where a Part Studio's LEFT button selects, here it paints (with the Select tool, it selects):
  *
  *   drag            FILL: every unpainted triangle the cursor crosses fills its surface
  *                   (paintTool.paintAt: model proposal, then the analytic fitter) into the
@@ -64,6 +67,7 @@ import { createRenderer, HEAT, NO_LEVEL } from './renderer.js';
 import { GroupStore, typeLabel } from './groups.js';
 import { conversionNumbers, reportUrl, reportJson, placeGroups, binaryStl, fingerprint } from './report.js';
 import { zipSync, strToU8 } from 'fflate';
+import { typeRgb } from './palette.js';
 
 const UNPAINTED = [0.74, 0.74, 0.74];
 const FOV = ui.LIGHTING.fieldOfViewDegrees;
@@ -77,7 +81,7 @@ const METHODS = [
 ];
 const TYPES = ['auto', 'plane', 'cylinder', 'cone', 'sphere', 'torus'];
 // The toolbar's surface buttons: the types, then a freeform fill (no primitive: the export fits a B-spline).
-const FILL_TYPES = [...TYPES, 'freeform'];
+const FILL_TYPES = [...TYPES, 'freeform', 'skip'];   // skip: mangled import geometry, set aside
 // A freeform fill floods the unpainted triangles to 30-degree creases. One click per true freeform face
 // of the user's parts (scratchpad fffill.mjs): whole and clean on 20/20 Star faces at every resolution
 // and 28/28 Cake Pan faces (coarse, medium); the coarse Ornament 8/14, 14/14 once its neighbours are
@@ -97,7 +101,7 @@ const MODELS = [
   { url: 'models/seedfill-s1nogmsh.onnx', label: 's1 (CAD exports)' },
   { url: 'models/seedfill-s3all.onnx', label: 's3 (all meshers)' },
 ];
-const TYPE_ICONS = { plane: 'face', cylinder: 'cylinder', cone: 'cone', sphere: 'sphere', torus: 'torus' };
+const TYPE_ICONS = { plane: 'face', cylinder: 'cylinder', cone: 'cone', sphere: 'sphere', torus: 'torus', freeform: 'freeform', skip: 'skip', auto: 'auto' };
 
 ui.registerIcons({
   folder: '<path d="M2 3.6h6.2l2 2H18v10.8H2zm1.6 4v7.2h12.8V7.6z" fill-rule="evenodd" />',
@@ -112,6 +116,10 @@ ui.registerIcons({
   wand: '<path d="M2.5 16.4 12.9 6l1.6 1.6L4.1 18z" /><path d="M14 4.9l1.3-1.3 1.6 1.6-1.3 1.3zM8.6 1.5l.6 1.5 1.5.6-1.5.6-.6 1.5-.6-1.5-1.5-.6 1.5-.6zM16.4 9.6l.5 1.2 1.2.5-1.2.5-.5 1.2-.5-1.2-1.2-.5 1.2-.5z" />',
   // A flag on a pole: report how the conversion went.
   flag: '<path d="M4 2h1.6v16H4z" /><path d="M6.4 2.8h10l-2.6 3.9 2.6 3.9h-10z" />',
+  // A circle struck through: skipped, set aside.
+  skip: '<path d="M10 2a8 8 0 1 0 0 16 8 8 0 1 0 0-16zm0 2a6 6 0 1 1 0 12 6 6 0 1 1 0-12zM6.5 5.1l8.4 8.4-1.4 1.4-8.4-8.4z" fill-rule="evenodd" />',
+  // An arrow: select a group.
+  select: '<path d="M4 2l11 7-5 1.2L12.6 16l-2 .9-2.6-5.7L4 14z" />',
 });
 
 const settings = {
@@ -148,15 +156,39 @@ const settings = {
   edges: true,
   smooth: false,
   occlusion: true,
-  // The deviation views (D steps through them; view cube menu): 'groups' colors each group by whether the
-  // export check expects it to come out right, 'heat' maps where the mesh lies off each group's surface.
-  // Off (null) by default, so painting shows group colors and measures nothing extra.
-  deviation: null,
+  // Color by (the viewport's switch; C steps through it): 'groups' each its own color, 'type' its surface type,
+  // 'fit' the export check's verdict, 'deviation' the heat map. The workbench measures in every view (the table
+  // shows each group's fit), so this is never off.
+  deviation: 'groups',
+  // Every triangle edge drawn over the shading (T), to see the tessellation.
+  triangleEdges: false,
 };
 
 // ── frame ─────────────────────────────────────────────────────────────────────
 
-const shell = ui.createShell(document.getElementById('app'), { theme: 'dark' });
+// ── the page: colors, icons, and the shell the studio's code talks to ─────────
+// index.html is the studio's own page: its top bar, tool row and face-group table around the kit's viewport
+// and view cube. `shell` and `toolbar` keep the studio's calls on them working.
+
+const hexRgb = (hex) => [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255);
+const css = (rgb) => `rgb(${rgb.map((v) => Math.round(v * 255)).join(',')})`;
+const SURFACE_KINDS = ['plane', 'cylinder', 'cone', 'sphere', 'torus', 'freeform', 'skip'];
+// the types' colors (js/studio/palette.js): chosen to stay apart under color blindness, test/palette.mjs checks it
+const TYPE_RGB = Object.fromEntries(SURFACE_KINDS.map((t) => [t, typeRgb(t)]));
+// skipped triangles look the same in every view: the palette's dark gray, their triangle edges drawn over them
+const SKIP_RGB = TYPE_RGB.skip;
+/** A type's icon in a color: the panel's group swatch, the group drawn as its type. */
+const typeIcon = (type, rgb, size = 16) => `<svg class="wb-ticon" viewBox="0 0 20 20" width="${size}" height="${size}" aria-hidden="true" style="color:${rgb ? css(rgb) : 'currentColor'}">${ui.iconInner(TYPE_ICONS[type ?? 'freeform'])}</svg>`;
+const COLOR_MODES = [{ id: 'groups', label: 'Groups' }, { id: 'type', label: 'Type' }, { id: 'fit', label: 'Fit' }, { id: 'deviation', label: 'Deviation' }];
+
+const statusLine = document.getElementById('status');
+const shell = {
+  stage: document.getElementById('view'),
+  hint: document.getElementById('hint'),
+  setStatus(text) { document.getElementById('painted').textContent = text; },
+  say(text, bad = false) { statusLine.textContent = text; statusLine.classList.toggle('wb-status--bad', bad); },
+};
+ui.installTooltips(document.body);
 const canvas = document.createElement('canvas');
 canvas.className = 'studio-canvas';
 shell.stage.prepend(canvas);
@@ -168,11 +200,11 @@ empty.className = 'studio-empty';
 empty.textContent = 'Open or drop an STL, OBJ or 3MF file';
 shell.stage.append(empty);
 const legend = document.createElement('div');
-legend.className = 'studio-legend';
+legend.className = 'wb-legend';
 legend.hidden = true;
 const legendBody = document.createElement('div');
 const legendProbe = document.createElement('div');
-legendProbe.className = 'studio-legend__probe';
+legendProbe.className = 'wb-probe';
 legend.append(legendBody, legendProbe);
 shell.stage.append(legend);
 const fileInput = document.createElement('input');
@@ -191,77 +223,82 @@ const corner = ui.mountViewCube(shell.stage, {
   // A getter, so the menu shows the current state each time it opens.
   get extraMenu() {
     return [
+      { id: 'triangles', label: 'Triangle edges (T)', checked: settings.triangleEdges, onSelect: () => toggleTriangleEdges() },
       { id: 'smooth', label: 'Smooth shading', checked: settings.smooth, onSelect: () => { settings.smooth = !settings.smooth; renderer.setShading(settings.smooth); requestRender(); } },
       { id: 'occlusion', label: 'Ambient occlusion', checked: settings.occlusion, onSelect: () => { settings.occlusion = !settings.occlusion; requestRender(); } },
     ];
   },
 });
 
-// The view switch, by Export: group colors, the export check's verdict per group (which), or the heat map
-// (where). Its own control, not the kit's: three labelled states, one lit. D steps through them.
-const viewSwitch = document.createElement('div');
-viewSwitch.className = 'studio-views';
-viewSwitch.setAttribute('role', 'group');
-viewSwitch.setAttribute('aria-label', 'View');
-for (const [view, label, tip] of [
-  ['off', 'Groups', 'Each group in its own color (D steps through the views)'],
-  ['groups', 'Check', 'Each group colored by whether the export check expects it to come out right; hover one for why (D)'],
-  ['heat', 'Heat map', 'Where the mesh lies off each group\'s fitted surface, on a log scale (D)'],
-]) {
-  const button = document.createElement('button');
-  button.type = 'button';
-  button.className = 'studio-views__button';
-  button.dataset.view = view;
-  button.textContent = label;
-  button.setAttribute('data-tooltip', tip);
-  button.setAttribute('aria-pressed', view === 'off' ? 'true' : 'false');
-  button.addEventListener('click', () => setDeviationView(view === 'off' ? null : view));
-  viewSwitch.append(button);
-}
-
-const toolbar = ui.createToolbar(shell.toolbar, [
-  { kind: 'tool', id: 'open', icon: 'folder', title: 'Open mesh (Ctrl+O)', onClick: () => fileInput.click() },
-  { kind: 'separator' },
-  { kind: 'toggle', id: 'fill', icon: 'bucket', title: 'Fill brush: each triangle crossed fills its surface into the group', pressed: true, onClick: () => setTool('fill') },
-  { kind: 'toggle', id: 'raw', icon: 'brush', title: 'Facet brush (hold Shift): paints just the triangles under the brush', onClick: () => setTool('raw') },
-  { kind: 'toggle', id: 'erase', icon: 'eraseFill', title: 'Eraser (hold Alt): back to unpainted', onClick: () => setTool('erase') },
-  { kind: 'separator' },
-  { kind: 'tool', id: 'undo', icon: 'undo', title: 'Undo (Ctrl+Z)', onClick: () => undo() },
-  { kind: 'tool', id: 'redo', icon: 'redo', title: 'Redo (Ctrl+Y)', onClick: () => redo() },
-  { kind: 'separator' },
-  // The surface a fill paints with: one button each, since it changes stroke to stroke.
-  ...FILL_TYPES.map((type, i) => ({
-    kind: 'toggle',
-    id: `type-${type}`,
-    icon: type === 'auto' ? 'auto' : type === 'freeform' ? 'freeform' : TYPE_ICONS[type],
-    title: type === 'auto'
-      ? `Model picks the surface from the seed (${i + 1})`
-      : type === 'freeform'
-        ? `Freeform fill: grows to creases; exported as a B-spline (${i + 1})`
-        : `Fill as ${typeLabel(type).toLowerCase()} (${i + 1})`,
-    pressed: settings.type === type,
-    onClick: () => setType(type),
-  })),
-  { kind: 'separator' },
-  { kind: 'tool', id: 'autopaint', icon: 'wand', title: 'Auto-paint every unpainted face (P); Esc stops', onClick: () => runAutoPaint() },
-  { kind: 'split', id: 'fill-options', icon: 'surface', title: 'Fill method and model', onClick: () => openFillMenu(), menu: () => fillMenu() },
-  { kind: 'spacer' },
-  { kind: 'element', id: 'view', element: viewSwitch },
-  { kind: 'tool', id: 'report', icon: 'flag', title: 'Report how this conversion went: opens a GitHub issue with this run\'s numbers; nothing is sent until you submit it', onClick: () => reportConversion() },
-  { kind: 'labelled', id: 'export', icon: 'build', label: 'Export STEP', accent: true, onClick: () => exportStep() },
-]);
-
-const panel = ui.createPanel(shell.panel, { filter: null });
-const section = panel.addSection({
-  title: 'Face groups',
-  buttons: [{ id: 'delete', icon: 'deleteFace', title: 'Delete the active group (Del)', onClick: () => active !== null && deleteGroup(active) }],
+// The tool row: the tools, the surface to paint as (each its icon), the brush, auto-paint, the fill options and
+// the report. `toolbar` gives the studio's code its calls (setPressed, setDisabled, get) by each control's data-tb.
+const TOOL_ICONS = { select: 'select', fill: 'bucket', raw: 'brush', erase: 'eraseFill' };
+const toolRow = document.getElementById('tools');
+const typeTip = (type, i) => (type === 'auto' ? `The model picks the surface from the seed (${i + 1})`
+  : type === 'freeform' ? `Freeform fill: grows to creases; exported as a B-spline (${i + 1})`
+    : type === 'skip' ? `Skip what the import mangled: left out of fitting, auto-paint and the checks; export heals it over with the group around it, or drops a stray shell (${i + 1})`
+      : `Fill as ${typeLabel(type).toLowerCase()}; painting into a group retypes it (${i + 1})`);
+toolRow.innerHTML = `
+  <div class="wb-tgroup">${[
+    ['select', 'Select', 'Click a face to select its group (V)'],
+    ['fill', 'Bucket', 'Fill: each triangle crossed fills its surface into the group (G)'],
+    ['raw', 'Brush', 'Facet brush: just the triangles under the brush (B, or hold Shift)'],
+    ['erase', 'Erase', 'Back to unpainted (E, or hold Alt)'],
+  ].map(([id, label, tip]) => `<button type="button" class="wb-tool" data-tb="${id}" aria-pressed="${settings.tool === id}" title="${tip}">${ui.iconMarkup(TOOL_ICONS[id], { className: 'wb-ticon' })}${label}</button>`).join('')}</div>
+  <span class="wb-vsep"></span>
+  <div class="wb-tgroup"><span class="wb-glabel">Paint as</span>${FILL_TYPES.map((type, i) => `${type === 'skip' ? '<span class="wb-vsep wb-vsep--short"></span>' : ''}<button type="button" class="wb-ftype${type === 'skip' ? ' wb-ftype--skip' : ''}" data-tb="type-${type}" aria-pressed="${settings.type === type}" title="${typeTip(type, i)}">${typeIcon(type, type === 'auto' ? null : TYPE_RGB[type])}${type === 'auto' ? 'Auto' : typeLabel(type)}</button>`).join('')}</div>
+  <span class="wb-vsep"></span>
+  <label class="wb-size" for="brush-size">Brush <input type="range" id="brush-size" min="3" max="64" value="${settings.brushPx}"> <span class="mono" id="brush-px">${settings.brushPx}px</span></label>
+  <span class="wb-vsep"></span>
+  <button type="button" class="wb-tool" data-tb="autopaint" title="Auto-paint every unpainted face; your groups are left alone (P). Esc stops">${ui.iconMarkup('wand', { className: 'wb-ticon' })}Auto-paint</button>
+  <button type="button" class="wb-tool" data-tb="fill-options" title="Fill method, model and options" aria-label="Fill options">${ui.iconMarkup('surface', { className: 'wb-ticon' })}</button>`;
+toolRow.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-tb]');
+  if (!button) return;
+  const id = button.dataset.tb;
+  if (['select', 'fill', 'raw', 'erase'].includes(id)) setTool(id);
+  else if (id.startsWith('type-')) setType(id.slice(5));
+  else if (id === 'autopaint') runAutoPaint();
+  else if (id === 'fill-options') openFillMenu();
 });
+// the flag, next to Export STEP: report how this conversion went (report.js)
+const reportButton = document.getElementById('report');
+reportButton.innerHTML = ui.iconMarkup('flag', { className: 'wb-ticon' });
+reportButton.addEventListener('click', () => reportConversion());
+document.getElementById('brush-size').addEventListener('input', (event) => {
+  settings.brushPx = Number(event.target.value);
+  document.getElementById('brush-px').textContent = `${settings.brushPx}px`;
+  drawCursor();
+});
+document.getElementById('open').addEventListener('click', () => fileInput.click());
+document.getElementById('undo').addEventListener('click', () => undo());
+document.getElementById('redo').addEventListener('click', () => redo());
+document.getElementById('export').addEventListener('click', () => exportStep());
+document.getElementById('summary').addEventListener('click', () => showNeedsALook());
+document.getElementById('colorby').addEventListener('click', (event) => {
+  const button = event.target.closest('[data-color]');
+  if (button) setColorBy(button.dataset.color);
+});
+
+const toolbar = {
+  get: (id) => document.querySelector(`[data-tb="${id}"]`),
+  setPressed(id, on) { this.get(id)?.setAttribute('aria-pressed', on ? 'true' : 'false'); },
+  setDisabled(id, reason) {
+    const button = this.get(id);
+    if (!button) return;
+    button.disabled = !!reason;
+    if (reason) button.dataset.why = reason; else delete button.dataset.why;
+  },
+};
+const panelEl = document.getElementById('panel');
 
 // ── state ─────────────────────────────────────────────────────────────────────
 
 /** { model, geometry, name, store, colours } for the open mesh. */
 let mesh = null;
 let active = null;
+/** The groups picked in the table or the viewport; `active` is the last one picked. */
+let selection = new Set();
 let hoverKey = null;
 let stroke = null;
 /** The auto-paint in progress: { stop } — Esc sets stop. */
@@ -451,7 +488,7 @@ function pan(dx, dy) {
 
 function setTool(tool) {
   settings.tool = tool;
-  for (const id of ['fill', 'raw', 'erase']) toolbar.setPressed(id, id === tool);
+  for (const id of ['select', 'fill', 'raw', 'erase']) toolbar.setPressed(id, id === tool);
   drawCursor();
 }
 
@@ -548,7 +585,7 @@ async function pump() {
         : group.type ?? (mesh.store.count(s.gid) ? 'freeform' : 'auto');
       if (!strokeZone(s, type, paintMesh.adjacency).has(seed)) { s.blocked++; continue; }
       let out;
-      if (type === 'freeform') out = freeformFill(seed, paintMesh);
+      if (type === 'freeform' || type === 'skip') out = freeformFill(seed, paintMesh);
       else {
         const refineUrl = await refineUrlFor(mesh);
         out = await tool.paintAt(seed, paintMesh, {
@@ -608,7 +645,7 @@ function strokeZone(s, type, adjacency) {
 /** The crease a fill of `type` stops at (degrees). */
 function creaseOf(type, adjacency) {
   if (!type || type === 'auto') return 30;
-  if (type === 'freeform') return FREEFORM_CREASE;
+  if (type === 'freeform' || type === 'skip') return FREEFORM_CREASE;   // a skip fill floods as a freeform one does
   return creaseFor(creaseTableFor(adjacency), type);
 }
 
@@ -927,7 +964,7 @@ function refit(id, tris = null) {
   if (!group || !prepared) return;
   // the deviation view recolors the group against its new surface (in the frame loop, once per frame)
   if (settings.deviation) mesh.refitted.add(id);
-  if (!group.type || !store.count(id)) { group.fit = null; return; }
+  if (!group.type || group.type === 'skip' || !store.count(id)) { group.fit = null; return; }   // skipped: never fitted
   const result = fitRegionAs(group.type, fitTriangles(tris ?? store.triangles(id), mesh.synthetic), prepared.mesh.facets);
   // the type goes with the params: a stroke can retype the group before its refit
   group.fit = result.params
@@ -953,7 +990,7 @@ function recolor(tris = null) {
     if (tris) for (const t of tris) mesh.deviation[t] = measureTriangle(t);
     else for (let t = 0; t < model.count; t++) mesh.deviation[t] = measureTriangle(t);
     const changed = updateVerdicts(tris ? new Set(Array.from(tris, (t) => store.owner[t])) : null);
-    if (tris && changed.size && settings.deviation === 'groups') tris = new Set([...tris, ...trianglesOf(store.owner, changed)]);
+    if (tris && changed.size && settings.deviation === 'fit') tris = new Set([...tris, ...trianglesOf(store.owner, changed)]);
   }
   let first = Infinity;
   let last = -1;
@@ -968,7 +1005,7 @@ function recolor(tris = null) {
   if (tris) for (const t of tris) paint(t);
   else for (let t = 0; t < model.count; t++) paint(t);
   renderer.updateColours(colours, first, last);
-  if (settings.deviation === 'heat') renderer.updateLevels(mesh.levels, first, last);
+  if (settings.deviation === 'deviation') renderer.updateLevels(mesh.levels, first, last);
   if (settings.deviation) legendDirty = true;
   requestRender();
 }
@@ -981,15 +1018,19 @@ function triangleColor(t) {
   const { store } = mesh;
   const id = store.owner[t];
   if (id < 0) return UNPAINTED;
-  if (settings.deviation === 'groups') return VERDICTS[mesh.verdicts.get(id) ?? 'none'].rgb;
-  if (settings.deviation === 'heat' && Number.isNaN(mesh.deviation[t])) return NO_SURFACE;
-  return store.groups.get(id)?.colour ?? UNPAINTED;
+  const group = store.groups.get(id);
+  if (group?.type === 'skip') return SKIP_RGB;
+  if (settings.deviation === 'fit') return VERDICTS[mesh.verdicts.get(id) ?? 'none'].rgb;
+  if (settings.deviation === 'type') return TYPE_RGB[group?.type ?? 'freeform'];
+  if (settings.deviation === 'deviation' && Number.isNaN(mesh.deviation[t])) return NO_SURFACE;
+  return group?.colour ?? UNPAINTED;
 }
 
 // ── groups ────────────────────────────────────────────────────────────────────
 
 function setActive(id) {
-  if (active === id) return;
+  selection = new Set(id === null ? [] : [id]);
+  if (active === id) { edgesDirty = true; refreshPanel(); return; }
   active = id;
   if (id !== null && mesh) mesh.showFlags = false;   // selecting a group ends the flagged-groups outline
   edgesDirty = true;
@@ -1044,6 +1085,7 @@ function groupMenu(id, event) {
     id: type, label: typeLabel(type), checked: group.type === type, onSelect: () => retype(id, type),
   }));
   fitAs.push({ id: 'freeform', label: 'Freeform (NURBS)', checked: !group.type, onSelect: () => retype(id, null) });
+  fitAs.push({ id: 'skip', label: 'Skip (set aside)', checked: group.type === 'skip', onSelect: () => retype(id, 'skip') });
   const canMerge = active !== null && active !== id;
   ui.openMenu([
     { id: 'fit', label: 'Fit as', children: fitAs },
@@ -1161,7 +1203,7 @@ async function knitPayload(current) {
   say(`Fitting ${groups.length} groups…`);
   const surfaces = [];
   for (const group of groups) {
-    if (!group.type) continue;                  // no analytic surface: the knitter makes it facets
+    if (!group.type || group.type === 'skip') continue;   // no surface: facets; skipped: below
     const fit = group.fit?.params ? group.fit : fitRegionAs(group.type, fitTriangles(store.triangles(group.id), synthetic), facets);
     if (fit.params) surfaces.push([group.id, [group.type, fit.params]]);
   }
@@ -1169,12 +1211,30 @@ async function knitPayload(current) {
   // back on the positions, and on every fitted surface (all are anchored by points, never directions).
   const [ox, oy, oz] = current.offset;
   const positions = Float64Array.from(facets.positions, (v, i) => v + (i % 3 === 0 ? ox : i % 3 === 1 ? oy : oz));
-  const labels = Int32Array.from(store.owner);
+  let labels = Int32Array.from(store.owner);
   // Caps the repair added go to the group around them, and onto its surface (caps.js), however they were painted.
-  for (const [t, id] of capOwners(labels, synthetic, model.neighbours)) labels[t] = id;
+  // Skipped triangles go the same way: a run the painted groups surround joins the group around it, its corners
+  // moved onto that surface; a run with nothing painted around it (a stray shell) is dropped.
+  const skipped = Uint8Array.from(labels, (id) => (store.groups.get(id)?.type === 'skip' ? 1 : 0));
+  const anySkip = skipped.includes(1);
+  let caps = anySkip ? Uint8Array.from(skipped, (k, t) => (k || synthetic?.[t] ? 1 : 0)) : synthetic;
+  for (const [t, id] of capOwners(labels, caps, model.neighbours)) labels[t] = id;
+  // `source` maps a payload triangle back to the mesh's when stray ones were dropped (Repair's moves name triangles)
+  let kept = positions, source = null;
+  if (anySkip) {
+    const keep = [];
+    for (let t = 0; t < labels.length; t++) if (!(skipped[t] && store.groups.get(labels[t])?.type === 'skip')) keep.push(t);
+    if (keep.length < labels.length) {
+      kept = new Float64Array(keep.length * 9);
+      keep.forEach((t, i) => kept.set(positions.subarray(t * 9, t * 9 + 9), i * 9));
+      labels = Int32Array.from(keep, (t) => labels[t]);
+      caps = Uint8Array.from(keep, (t) => caps[t]);
+      source = Int32Array.from(keep);
+    }
+  }
   const shiftedSurfaces = surfaces.map(([id, [type, p]]) => [id, [type, shifted(p, current.offset)]]);
-  projectCapVertices(positions, labels, synthetic, new Map(shiftedSurfaces));
-  return { positions, labels, surfaces: shiftedSurfaces };
+  projectCapVertices(kept, labels, caps, new Map(shiftedSurfaces));
+  return { positions: kept, labels, surfaces: shiftedSurfaces, ...(source ? { source } : {}) };
 }
 
 /**
@@ -1315,38 +1375,24 @@ function showDoubts() {
   say(`Outlined: ${[...mesh.flags.keys()].map((id) => mesh.store.name(id)).join(', ')}. Hover a ⚠ row for why; fix, merge or retype them, then export again`);
 }
 
-// ── deviation view ────────────────────────────────────────────────────────────
+// ── workbench: color by, every group's fit, skip, Fix bad areas ──────────────
 
 /**
- * The deviation views (settings.deviation; the toolbar's view switch, D steps through them), measured
- * against the export check's bars: past DOUBT.DEV (1e-3 x the part diagonal) it calls a group wrong (94-100%
- * right on Onshape parts); past PREFLIGHT.DEV (1e-5), right about 65% of the time.
- *
- *   'groups'  WHICH groups: each group in one color, its verdict. Red where the export check flags it (off its
- *             surface, a seam gap, or a narrow arc, which no distance shows) or a triangle is past its bar,
- *             yellow past the soft bar, green on its surface. Hover a group for why.
- *   'heat'    WHERE in them: every corner gets its distance from its own group's surface as a decade level
- *             (log10); the renderer interpolates the level across the triangle and maps it through its HEAT
- *             ramp per pixel, so within a group the map is continuous, and a triangle of another face is a
- *             hot spot that cools to its edge on the group's surface.
- *
- * On a CAD tessellation every vertex lies on its face, so a right group sits at float precision (~1e-7, the
- * ramp's cold end) and a triangle of another face stands out by orders of magnitude. A wrong type that still
- * fits (a plane on a few strips of a cylinder) is on its surface: only the narrow-arc flag can catch it.
+ * Every view measures: each corner's distance off its group's surface, x the part diagonal (a decade level for
+ * the heat map), each group's farthest triangle, and a verdict on the export check's bars. Past DOUBT.DEV (1e-3)
+ * is 'off' (right 94-100% of the time on Onshape parts), past PREFLIGHT.DEV (1e-5) 'maybe' (about 65%), else 'on';
+ * a group the export check or the kernel flags is 'off' too (a narrow arc, a seam gap, a rejected face), and a
+ * skipped group is 'skip'. Color by: 'groups' each its own color, 'type' its surface type, 'fit' the verdict (the
+ * reserved status steps), 'deviation' the renderer's heat ramp, per pixel.
  */
-const DEVIATION_VIEWS = [null, 'groups', 'heat'];
-/** The group view's verdicts: the reserved status colors, always named beside them in the legend. */
 const VERDICTS = {
   off: { rgb: hexRgb('#d03b3b'), label: 'Likely wrong' },
   maybe: { rgb: hexRgb('#fab219'), label: 'Doubtful' },
   on: { rgb: hexRgb('#0ca30c'), label: 'On its surface' },
-  none: { rgb: [0.42, 0.42, 0.42], label: 'No surface (freeform or failed fit)' },
+  none: { rgb: [0.42, 0.42, 0.42], label: 'No surface' },
+  skip: { rgb: SKIP_RGB, label: 'Skipped' },
 };
 const NO_SURFACE = VERDICTS.none.rgb;
-
-function hexRgb(hex) {
-  return [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255);
-}
 // Levels are clamped: an exact zero has no log, and an infinite one would interpolate to NaN on the GPU.
 const LEVEL_RANGE = [-12, 3];
 
@@ -1377,9 +1423,11 @@ function deviationBand(d) {
   return d <= PREFLIGHT.DEV ? 'on' : d <= DOUBT.DEV ? 'maybe' : 'off';
 }
 
+const isSkipGroup = (id) => mesh?.store.groups.get(id)?.type === 'skip';
+
 /**
- * Recompute the verdict of groups `ids` (every group when null) from their triangles' distances and the export
- * check's flags; returns the ids whose verdict changed.
+ * Recompute the verdict of groups `ids` (every group when null) from their triangles' distances and the flags;
+ * returns the ids whose verdict changed.
  */
 function updateVerdicts(ids = null) {
   const { store, deviation, verdicts, groupWorst, flags } = mesh;
@@ -1396,48 +1444,63 @@ function updateVerdicts(ids = null) {
     const w = worst.get(id);
     if (w === undefined) { if (verdicts.delete(id)) changed.add(id); groupWorst.delete(id); continue; }
     groupWorst.set(id, w);
-    const verdict = Number.isNaN(w) ? 'none' : flags.has(id) ? 'off' : deviationBand(w);
+    const verdict = isSkipGroup(id) ? 'skip' : Number.isNaN(w) ? 'none' : flags.has(id) ? 'off' : deviationBand(w);
     if (verdicts.get(id) !== verdict) { verdicts.set(id, verdict); changed.add(id); }
   }
   return changed;
 }
 
-/** D: the next deviation view (groups, heat, off). */
-function cycleDeviation() {
-  setDeviationView(DEVIATION_VIEWS[(DEVIATION_VIEWS.indexOf(settings.deviation) + 1) % DEVIATION_VIEWS.length]);
+/** C: the next color mode. */
+function cycleColorBy() {
+  setColorBy(COLOR_MODES[(COLOR_MODES.findIndex((m) => m.id === settings.deviation) + 1) % COLOR_MODES.length].id);
 }
-
-/** Show the group verdicts, the heat map, or neither. Coming from neither, it also runs the export check. */
-async function setDeviationView(view) {
+function renderColorBy() {
+  document.getElementById('colorby').innerHTML = COLOR_MODES
+    .map((m) => `<button type="button" data-color="${m.id}" aria-pressed="${settings.deviation === m.id}">${m.label}</button>`).join('');
+}
+/** Color the part by groups, type, fit or deviation. Turning to fit also runs the export check, for its flags. */
+function setColorBy(mode) {
   const was = settings.deviation;
-  settings.deviation = view;
-  for (const v of DEVIATION_VIEWS) viewSwitch.querySelector(`[data-view="${v ?? 'off'}"]`).setAttribute('aria-pressed', v === view ? 'true' : 'false');
-  legend.hidden = !view || !mesh;
-  renderer.setHeat(view === 'heat');
+  settings.deviation = mode;
+  renderColorBy();
+  renderer.setHeat(mode === 'deviation');
   if (!mesh) return;
   recolor();
-  if (!view) { say('Group colors'); return; }
   drawLegend();
   showProbe(-1);
-  say(deviationSummary(), hasBad());
-  if (was || stroke || autoRun || !mesh.store.list().length) return;
-  const current = mesh;
-  await new Promise((resolve) => setTimeout(resolve, 50));   // let the view show: the check takes ~1 s per 55k triangles
-  if (mesh !== current || !settings.deviation || stroke || autoRun) return;
-  const doubts = exportDoubts(await knitPayload(current));
-  if (mesh !== current || !settings.deviation || stroke || autoRun) return;
-  current.flags = doubts.groups;
-  recolor();                                       // a flagged group is red in the group view
   refreshPanel();
-  say(deviationSummary(doubts.groups.size), hasBad());
+  if (mode === 'fit' && was !== 'fit') runCheck();
 }
 
-const hasBad = () => [...mesh.verdicts.values()].includes('off');
+/** The export check (knit/preflight.js) on the groups as they are: its flags make narrow arcs and seam gaps 'off'. */
+async function runCheck() {
+  if (!mesh || stroke || autoRun || !mesh.store.list().length) return;
+  const current = mesh;
+  say('Checking the groups…');
+  await new Promise((resolve) => setTimeout(resolve, 30));   // let the message show: about 1 s per 55k triangles
+  if (mesh !== current || stroke || autoRun) return;
+  const doubts = exportDoubts(await knitPayload(current));
+  if (mesh !== current) return;
+  current.flags = doubts.groups;
+  current.verdictFlags = current.flags;
+  recolor();
+  refreshPanel();
+  const c = verdictCounts();
+  say(`Checked: ${c.off} likely wrong, ${c.maybe} doubtful, ${c.on} on their surface${doubts.mesh ? ` · ${doubts.mesh}` : ''}`, c.off > 0);
+}
+
+/** The summary in the top bar: color by fit, list the groups that need a look, worst first. */
+function showNeedsALook() {
+  table.fits = new Set(['off', 'maybe']);
+  table.by = 'none';
+  table.sort = { key: 'fit', dir: 1 };
+  setColorBy('fit');
+}
 
 /** How many groups have each verdict. */
 function verdictCounts() {
-  const counts = { off: 0, maybe: 0, on: 0, none: 0 };
-  for (const v of mesh.verdicts.values()) counts[v]++;
+  const counts = { off: 0, maybe: 0, on: 0, none: 0, skip: 0 };
+  if (mesh) for (const v of mesh.verdicts.values()) counts[v]++;
   return counts;
 }
 
@@ -1448,6 +1511,7 @@ function deviationCounts() {
   for (let t = 0; t < model.count; t++) {
     const id = store.owner[t];
     if (id < 0) { counts.unpainted++; continue; }
+    if (isSkipGroup(id)) continue;
     const band = deviationBand(deviation[t]);
     counts[band]++;
     if (band !== 'on') counts[`${band}Groups`].add(id);
@@ -1455,41 +1519,35 @@ function deviationCounts() {
   return counts;
 }
 
-function deviationSummary(flagged = null) {
-  const groups = (n) => `${n.toLocaleString()} group${n === 1 ? '' : 's'}`;
-  const parts = [];
-  if (settings.deviation === 'groups') {
-    const v = verdictCounts();
-    if (v.off) parts.push(`${groups(v.off)} likely wrong`);
-    if (v.maybe) parts.push(`${groups(v.maybe)} doubtful`);
-    if (!v.off && !v.maybe) parts.push(v.on ? 'every group with a surface is on it' : 'no group has a surface yet');
-    if (v.none) parts.push(`${groups(v.none)} with no surface`);
-    parts.push('Heat map shows where');
-  } else {
-    const c = deviationCounts();
-    if (c.off) parts.push(`${c.off.toLocaleString()} triangles in ${groups(c.offGroups.size)} are past the export check's bar`);
-    if (c.maybe) parts.push(`${c.maybe.toLocaleString()} triangles in ${groups(c.maybeGroups.size)} are doubtful`);
-    if (!c.off && !c.maybe) parts.push(c.on ? 'every painted triangle with a surface is on it' : 'nothing painted has a surface yet');
-    if (c.none) parts.push(`${groups(c.noneGroups.size)} have no surface`);
-  }
-  if (flagged !== null) parts.push(flagged ? `the export check flags ${groups(flagged)} (⚠ in the list)` : 'the export check flags no groups');
-  return parts.join(' · ');
-}
-
-/** A length for the legend: two figures, in exponent form when small. */
-const shortLength = (v) => (v >= 0.01 ? v.toPrecision(2) : v.toExponential(1));
-
-const legendKey = (rgb, label, count) => `<span class="studio-legend__swatch" style="background:rgb(${rgb.map((v) => Math.round(v * 255)).join(',')})"></span>`
+/** A length for the legend and the table: two figures, in exponent form when small. */
+const shortLength = (v) => (!Number.isFinite(v) ? '—' : v < 1e-12 ? '≈0' : v >= 0.01 ? v.toPrecision(2) : v.toExponential(1));
+const legendKey = (rgb, label, count) => `<span class="studio-legend__swatch" style="background:${css(rgb)}"></span>`
   + `<span>${label}</span><span class="studio-legend__value">${count.toLocaleString()}</span>`;
 
-/** Fill the legend in for the view: the verdicts with group counts, or the heat ramp. */
+/** Fill the legend in for the color mode. */
 function drawLegend() {
-  if (settings.deviation === 'heat') { drawHeatLegend(); return; }
-  const v = verdictCounts();
-  legendBody.innerHTML = '<div class="studio-legend__title">Will each group come out right? (groups)</div>'
-    + `<div class="studio-legend__keys">${Object.entries(VERDICTS).map(([k, b]) => legendKey(b.rgb, b.label, v[k])).join('')}`
-    + `${legendKey(UNPAINTED, 'Unpainted (triangles)', mesh.model.count - mesh.store.painted)}</div>`
-    + '<div class="studio-legend__counts">Red: the export check flags it, or it holds a triangle past its bar. Heat map: where.</div>';
+  if (!mesh) return;
+  if (settings.deviation === 'deviation') { drawHeatLegend(); return; }
+  const { store } = mesh;
+  const unpainted = mesh.model.count - store.painted;
+  const row = (mark, label, n) => `<div class="wb-keyrow">${mark}<span>${label}</span><span class="mono">${n.toLocaleString()}</span></div>`;
+  const dot = (rgb) => `<span class="wb-swatch" style="background:${css(rgb)}"></span>`;
+  const unpaintedRow = unpainted ? row(dot(UNPAINTED), 'Unpainted triangles', unpainted) : '';
+  const groups = store.list();
+  if (settings.deviation === 'type') {
+    const c = new Map();
+    for (const g of groups) c.set(g.type ?? 'freeform', (c.get(g.type ?? 'freeform') ?? 0) + 1);
+    legendBody.innerHTML = `<span class="wb-ltitle">Surface type · groups</span>${SURFACE_KINDS.filter((t) => c.has(t))
+      .map((t) => row(typeIcon(t, t === 'skip' ? SKIP_RGB : TYPE_RGB[t], 14), typeLabel(t), c.get(t))).join('')}${unpaintedRow}`;
+  } else if (settings.deviation === 'fit') {
+    const c = verdictCounts();
+    legendBody.innerHTML = `<span class="wb-ltitle">Fit · will it come out right?</span>${['off', 'maybe', 'on', 'none', 'skip']
+      .filter((v) => c[v] || v === 'off' || v === 'maybe' || v === 'on')
+      .map((v) => row(v === 'skip' ? typeIcon('skip', SKIP_RGB, 14) : dot(VERDICTS[v].rgb), VERDICTS[v].label, c[v])).join('')}${unpaintedRow}`
+      + '<span class="wb-lnote">The export check\'s bars. Hover a group for why.</span>';
+  } else {
+    legendBody.innerHTML = `<span class="wb-ltitle">Groups · ${groups.length}</span><span class="wb-lnote">Each face group in its own color, chosen to stand apart from the groups it borders.</span>${unpaintedRow}`;
+  }
   legendDirty = false;
 }
 
@@ -1510,7 +1568,7 @@ function drawHeatLegend() {
       + `<span class="studio-legend__note" style="grid-row:${i + 1}">${notes[level] ?? ''}</span>`;
   }).join('');
   const groups = (set) => `${set.size} group${set.size > 1 ? 's' : ''}`;
-  legendBody.innerHTML = '<div class="studio-legend__title">Distance off the fitted surface</div>'
+  legendBody.innerHTML = '<span class="wb-ltitle">Distance off the fitted surface</span>'
     + `<div class="studio-legend__scale" style="grid-template-rows:repeat(${stops.length}, 17px)">`
     + `<span class="studio-legend__bar" style="background:linear-gradient(to top, ${gradient})"></span>${ticks}</div>`
     + `<div class="studio-legend__keys">${legendKey(NO_SURFACE, 'No surface (freeform or failed fit)', counts.none)}${legendKey(UNPAINTED, 'Unpainted', counts.unpainted)}</div>`
@@ -1519,28 +1577,356 @@ function drawHeatLegend() {
   legendDirty = false;
 }
 
-/** The legend's reading for triangle t under the cursor (-1: none): the group's verdict and why, or the distance there. */
+/** Why group `id` has its verdict, in words. */
+function verdictWhy(id) {
+  const { store } = mesh;
+  const group = store.groups.get(id), verdict = mesh.verdicts.get(id) ?? 'none';
+  if (verdict === 'skip') return skipText(id);
+  const why = mesh.flags.get(id);
+  if (why?.length) return why.join('; ');
+  if (verdict === 'none') {
+    return group?.type ? `the ${typeLabel(group.type).toLowerCase()} fit failed${group.fit?.reason ? `: ${group.fit.reason}` : ''}`
+      : 'freeform: the export fits a B-spline';
+  }
+  const off = shortLength((mesh.groupWorst.get(id) ?? NaN) * 2 * mesh.model.radius);
+  return `${VERDICTS[verdict].label.toLowerCase()}: up to ${off} off its ${typeLabel(group.type).toLowerCase()}`;
+}
+
+/** The legend's reading for triangle t under the cursor (-1: none). */
 function showProbe(t) {
-  if (!mesh || t < 0) { legendProbe.textContent = `Point at a ${settings.deviation === 'groups' ? 'group' : 'face'} for a reading`; return; }
+  if (!mesh || t < 0) { legendProbe.textContent = 'Point at the part for a reading'; return; }
   const id = mesh.store.owner[t];
   if (id < 0) { legendProbe.textContent = 'Here: unpainted'; return; }
   const name = mesh.store.name(id);
-  const diag = 2 * mesh.model.radius;
-  if (settings.deviation === 'groups') {
-    const verdict = mesh.verdicts.get(id) ?? 'none';
-    const why = mesh.flags.get(id);
-    const worst = mesh.groupWorst.get(id);
-    legendProbe.textContent = why ? `${name}: ${why.join('; ')}`
-      : verdict === 'none' ? `${name} has no surface`
-        : `${name}: ${VERDICTS[verdict].label.toLowerCase()}, up to ${shortLength(worst * diag)} off`;
+  if (settings.deviation === 'deviation' && !isSkipGroup(id)) {
+    const d = mesh.deviation[t];
+    legendProbe.textContent = Number.isNaN(d) ? `Here: ${name} has no surface`
+      : `Here: up to ${shortLength(d * 2 * mesh.model.radius)} off ${name} (${d.toExponential(0)} of the part)`;
     return;
   }
-  const d = mesh.deviation[t];
-  legendProbe.textContent = Number.isNaN(d)
-    ? `Here: ${name} has no surface`
-    : `Here: up to ${shortLength(d * diag)} off ${name} (${d.toExponential(0)} of the part)`;
+  legendProbe.textContent = `${name}: ${verdictWhy(id)}`;
 }
 
+/**
+ * Where export sends skipped group `id` (knitPayload): the runs the painted groups surround join the group most
+ * of their border touches; the rest, with nothing painted around them, are dropped.
+ */
+function skipFate(id) {
+  const { store, model, synthetic } = mesh;
+  const caps = Uint8Array.from(store.owner, (o, t) => (isSkipGroup(o) || synthetic?.[t] ? 1 : 0));
+  const into = new Map();
+  for (const [t, g] of capOwners(store.owner, caps, model.neighbours)) if (store.owner[t] === id) into.set(g, (into.get(g) ?? 0) + 1);
+  const healed = [...into.values()].reduce((a, b) => a + b, 0);
+  return { healed, dropped: store.count(id) - healed, into: [...into.keys()] };
+}
+function skipText(id) {
+  const f = skipFate(id), names = f.into.map((g) => mesh.store.name(g)).join(', ');
+  if (f.healed && f.dropped) return `skipped: ${f.healed} triangles heal over into ${names}; ${f.dropped} have nothing painted around them and are dropped`;
+  if (f.healed) return `skipped: export heals it over with ${names}, its corners moved onto that surface`;
+  return `skipped: nothing painted around it, so export drops its ${f.dropped} triangles`;
+}
+
+/** The edges band: group borders and creases, every triangle edge when asked (T), and skipped triangles' edges. */
+function workbenchEdges(model, store) {
+  const ends = bodyEdges(model, store.owner);
+  const P = model.positions, extra = [];
+  for (let t = 0; t < model.count; t++) {
+    if (!settings.triangleEdges && !isSkipGroup(store.owner[t])) continue;
+    for (let k = 0; k < 3; k++) {
+      const nb = model.neighbours[t * 3 + k];
+      if (nb >= 0 && nb < t && (settings.triangleEdges || isSkipGroup(store.owner[nb]))) continue;   // each edge once
+      const a = t * 9 + k * 3, b = t * 9 + ((k + 1) % 3) * 3;
+      extra.push(P[a], P[a + 1], P[a + 2], P[b], P[b + 1], P[b + 2]);
+    }
+  }
+  if (!extra.length) return ends;
+  const all = new Float32Array(ends.length + extra.length);
+  all.set(ends);
+  all.set(extra, ends.length);
+  return all;
+}
+function toggleTriangleEdges() {
+  settings.triangleEdges = !settings.triangleEdges;
+  edgesDirty = true;
+  requestRender();
+  say(settings.triangleEdges ? 'Triangle edges on (T)' : 'Triangle edges off (T)');
+}
+
+// ── selection ──
+
+/** The face-group table's state: sorting, filters, search, arrangement, and the shift-click anchor. */
+const table = { sort: { key: 'name', dir: 1 }, types: new Set(), fits: new Set(), search: '', by: 'none', anchor: null };
+
+/** The Select tool: the group under the cursor. */
+function pickGroup(event) {
+  if (!mesh) return;
+  const point = devicePoint(event);
+  const { centre } = renderer.pick(point.x, point.y, 0);
+  const id = centre >= 0 ? mesh.store.owner[centre] : -1;
+  selectGroup(id >= 0 ? id : null, event);
+}
+/** Pick a group: alone, added (Ctrl), or a run of the table's rows (Shift). */
+function selectGroup(id, event = {}) {
+  if (!mesh) return;
+  if (id === null) { selection = new Set(); active = null; }
+  else if (event.shiftKey && table.anchor !== null) {
+    const rows = visibleRows().map((r) => r.id);
+    const [a, b] = [rows.indexOf(table.anchor), rows.indexOf(id)].sort((x, y) => x - y);
+    if (a >= 0) rows.slice(a, b + 1).forEach((g) => selection.add(g));
+    active = id;
+  } else if (event.ctrlKey || event.metaKey) {
+    if (selection.has(id)) selection.delete(id); else selection.add(id);
+    active = selection.has(id) ? id : [...selection].pop() ?? null;
+  } else {
+    const only = selection.size === 1 && selection.has(id);
+    selection = new Set(only ? [] : [id]);
+    active = only ? null : id;
+  }
+  if (id !== null) table.anchor = id;
+  mesh.showFlags = false;
+  edgesDirty = true;
+  refreshPanel();
+}
+/** Frame groups `ids` in the view. */
+function zoomTo(ids) {
+  if (!mesh) return;
+  const { model, store } = mesh;
+  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  const P = model.positions;
+  for (let t = 0; t < model.count; t++) {
+    if (!ids.has(store.owner[t])) continue;
+    for (let k = 0; k < 9; k++) { const a = k % 3; lo[a] = Math.min(lo[a], P[t * 9 + k]); hi[a] = Math.max(hi[a], P[t * 9 + k]); }
+  }
+  if (lo[0] === Infinity) return;
+  camera.center = lo.map((v, a) => (v + hi[a]) / 2);
+  camera.distance = Math.max(Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) / 2, model.radius * 0.02) * 2.7;
+  requestRender();
+}
+
+// ── Fix bad areas ──
+
+/**
+ * Fit-based fixes, found on demand and applied as one undo step. No retypes by fit residual: picked that way, a
+ * retype went away from the true type 45 times in 152 on 300 Onshape parts, so retyping is the kernel-judged
+ * Repair's job (js/knit, repairInView), which the card also offers.
+ *   re-fill   a triangle off its group's surface goes to a neighbouring group whose fitted surface it lies on
+ *             (the surface scorecard's triage, 2026-09-26: +0.8 to +2.0 found once, never down)
+ *   merge     neighbouring groups of one type that one refitted surface keeps on its surface (PREFLIGHT.DEV, arcs
+ *             of 10 degrees or more): fewer patches, no fit worse; a looser tolerance swallowed real faces
+ *   skip      a small stray shell: a separate piece of the mesh under 1% of it (and 500 triangles)
+ */
+const fixes = { list: null, key: '', busy: false, open: false, unchecked: new Set() };
+const fixKey = () => (mesh ? `${mesh.store.undoStack.length}|${mesh.store.redoStack.length}|${mesh.store.painted}|${mesh.flags.size}` : '');
+const fixesFresh = () => fixes.list !== null && fixes.key === fixKey();
+const AXIAL = new Set(['cylinder', 'cone', 'torus']);
+
+/** The worst distance of triangles `list`'s corners off a surface (model units). */
+function worstOff(type, params, list) {
+  const P = mesh.model.positions;
+  let worst = 0;
+  for (const t of list) {
+    for (let k = 0; k < 3; k++) {
+      const o = t * 9 + k * 3;
+      const d = Math.abs(distNormal(type, params, [P[o], P[o + 1], P[o + 2]])[0]);
+      worst = Number.isNaN(d) ? Infinity : Math.max(worst, d);
+    }
+  }
+  return worst;
+}
+/** The degrees of turn about an axial surface's axis that triangles `list` cover: 360 minus the widest gap. */
+function arcDegrees(type, p, list) {
+  const P = mesh.model.positions;
+  const len = Math.hypot(...p.axis), ax = p.axis.map((v) => v / len);
+  const o = type === 'cylinder' ? p.axisPoint : type === 'cone' ? p.apex : p.center;
+  const seed = Math.abs(ax[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
+  const u = [ax[1] * seed[2] - ax[2] * seed[1], ax[2] * seed[0] - ax[0] * seed[2], ax[0] * seed[1] - ax[1] * seed[0]];
+  const ul = Math.hypot(...u), e1 = u.map((v) => v / ul);
+  const e2 = [ax[1] * e1[2] - ax[2] * e1[1], ax[2] * e1[0] - ax[0] * e1[2], ax[0] * e1[1] - ax[1] * e1[0]];
+  const angles = [];
+  for (const t of list) {
+    for (let k = 0; k < 3; k++) {
+      const i = t * 9 + k * 3, v = [P[i] - o[0], P[i + 1] - o[1], P[i + 2] - o[2]];
+      angles.push(Math.atan2(v[0] * e2[0] + v[1] * e2[1] + v[2] * e2[2], v[0] * e1[0] + v[1] * e1[1] + v[2] * e1[2]));
+    }
+  }
+  angles.sort((a, b) => a - b);
+  let gap = angles[0] + 2 * Math.PI - angles[angles.length - 1];
+  for (let i = 1; i < angles.length; i++) gap = Math.max(gap, angles[i] - angles[i - 1]);
+  return 360 - (gap * 180) / Math.PI;
+}
+
+async function findFixes() {
+  if (!mesh || fixes.busy) return;
+  if (stroke || autoRun) { say('Finish or cancel (Esc) the stroke or auto-paint first', true); return; }
+  const current = mesh, { store, model } = current;
+  fixes.busy = true;
+  fixes.open = true;
+  refreshPanel();
+  try {
+    const { mesh: paintMesh } = await preparePaint();
+    const facets = paintMesh.facets, diag = 2 * model.radius, soft = PREFLIGHT.DEV * diag, n = model.count;
+    const owner = store.owner, P = model.positions, nb = model.neighbours;
+    const yieldUi = () => new Promise((resolve) => setTimeout(resolve, 0));
+    const lists = new Map();
+    for (let t = 0; t < n; t++) if (owner[t] >= 0) (lists.get(owner[t]) ?? lists.set(owner[t], []).get(owner[t])).push(t);
+    const out = [];
+
+    // skip: small stray shells
+    const comp = new Int32Array(n).fill(-1), sizes = [];
+    for (let s = 0; s < n; s++) {
+      if (comp[s] >= 0) continue;
+      const c = sizes.length, stack = [s];
+      comp[s] = c;
+      let size = 0;
+      while (stack.length) {
+        const t = stack.pop();
+        size++;
+        for (let k = 0; k < 3; k++) { const m = nb[t * 3 + k]; if (m >= 0 && comp[m] < 0) { comp[m] = c; stack.push(m); } }
+      }
+      sizes.push(size);
+    }
+    let main = 0;
+    sizes.forEach((size, c) => { if (size > sizes[main]) main = c; });
+    const small = Math.min(500, Math.max(8, n * 0.01));
+    const shells = new Map();
+    for (let t = 0; t < n; t++) {
+      const c = comp[t];
+      if (c === main || sizes[c] > small || isSkipGroup(owner[t])) continue;
+      (shells.get(c) ?? shells.set(c, []).get(c)).push(t);
+    }
+    for (const [c, tris] of shells) {
+      if (tris.length !== sizes[c]) continue;
+      out.push({ id: `shell-${tris[0]}`, kind: 'skip-shell', group: owner[tris[0]], tris,
+        title: `Skip a stray shell of ${tris.length} triangle${tris.length > 1 ? 's' : ''}`,
+        detail: `A separate piece, ${((100 * tris.length) / n).toFixed(2)}% of the mesh. Skipped, export drops it.` });
+    }
+
+    // re-fill: triangles off their group's surface, onto a neighbouring group whose surface they lie on
+    const fitOf = (id) => { const g = store.groups.get(id); return g?.type && g.type !== 'skip' && g.fit?.params ? g.fit : null; };
+    const onSurface = (fit, t) => {
+      for (let k = 0; k < 3; k++) {
+        const o = t * 9 + k * 3;
+        if (!(Math.abs(distNormal(fit.type, fit.params, [P[o], P[o + 1], P[o + 2]])[0]) <= soft)) return false;
+      }
+      return true;
+    };
+    const moved = new Map();
+    for (const [id, tris] of lists) {
+      const verdict = current.verdicts.get(id);
+      if ((verdict !== 'off' && verdict !== 'maybe') || !fitOf(id)) continue;
+      let pending = tris.filter((t) => current.deviation[t] > PREFLIGHT.DEV), changed = true;
+      while (changed && pending.length) {
+        changed = false;
+        pending = pending.filter((t) => {
+          for (let k = 0; k < 3; k++) {
+            const m = nb[t * 3 + k];
+            if (m < 0) continue;
+            const h = moved.get(m) ?? owner[m];
+            if (h < 0 || h === id) continue;
+            const fit = fitOf(h);
+            if (fit && onSurface(fit, t)) { moved.set(t, h); changed = true; return false; }
+          }
+          return true;
+        });
+      }
+    }
+    const pairs = new Map();
+    for (const [t, h] of moved) {
+      const key = `${owner[t]}>${h}`;
+      (pairs.get(key) ?? pairs.set(key, { from: owner[t], to: h, tris: [] }).get(key)).tris.push(t);
+    }
+    for (const m of pairs.values()) {
+      const off = Math.max(...m.tris.map((t) => current.deviation[t])) * diag;
+      out.push({ id: `refill-${m.from}-${m.to}`, kind: 'refill', group: m.from, ...m,
+        title: `Re-fill ${m.tris.length} triangle${m.tris.length > 1 ? 's' : ''} of ${store.name(m.from)} into ${store.name(m.to)}`,
+        detail: `They lie on ${store.name(m.to)}'s ${typeLabel(store.groups.get(m.to).type).toLowerCase()}, up to ${shortLength(off)} off ${store.name(m.from)}'s. Then refit both.` });
+    }
+
+    // merge: neighbouring groups of one type that one refitted surface keeps on its surface
+    const near = new Map();
+    for (let t = 0; t < n; t++) {
+      const a = owner[t];
+      if (a < 0) continue;
+      for (let k = 0; k < 3; k++) {
+        const m = nb[t * 3 + k];
+        const b = m >= 0 ? owner[m] : -1;
+        if (b >= 0 && b !== a) (near.get(a) ?? near.set(a, new Set()).get(a)).add(b);
+      }
+    }
+    // groups on their surface (a narrow arc too: the merge must cover 10 degrees); re-fill sources never are
+    const eligible = (id) => !!fitOf(id) && (current.groupWorst.get(id) ?? Infinity) <= PREFLIGHT.DEV;
+    const used = new Set();
+    let tried = 0;
+    for (const id of [...lists.keys()].sort((a, b) => a - b)) {
+      if (used.has(id) || !eligible(id)) continue;
+      const type = store.groups.get(id).type, cluster = [id];
+      let union = lists.get(id), worst = 0;
+      for (let i = 0; i < cluster.length; i++) {
+        for (const other of near.get(cluster[i]) ?? []) {
+          if (cluster.includes(other) || used.has(other) || !eligible(other) || store.groups.get(other).type !== type) continue;
+          const merged = union.concat(lists.get(other));
+          const fit = fitRegionAs(type, fitTriangles(new Set(merged), current.synthetic), facets);
+          if (++tried % 3 === 0) { say(`Finding fixes: trying merges (${tried})…`); await yieldUi(); if (mesh !== current) return; }
+          if (!fit.params) continue;
+          const w = worstOff(type, fit.params, merged);
+          if (w > soft || (AXIAL.has(type) && arcDegrees(type, fit.params, merged) < DOUBT.ARC)) continue;
+          cluster.push(other);
+          union = merged;
+          worst = w;
+        }
+      }
+      if (cluster.length < 2) continue;
+      cluster.forEach((g) => used.add(g));
+      const into = cluster.reduce((best, g) => (lists.get(g).length > lists.get(best).length ? g : best));
+      out.push({ id: `merge-${[...cluster].sort((a, b) => a - b).join('-')}`, kind: 'merge', group: into, groups: cluster, into,
+        title: `Merge ${cluster.filter((g) => g !== into).map((g) => store.name(g)).join(', ')} into ${store.name(into)}`,
+        detail: `One ${typeLabel(type).toLowerCase()} fits all ${cluster.length} to ${shortLength(worst)}: ${cluster.length} surface patches become 1, no fit worse.` });
+    }
+
+    if (mesh !== current) return;
+    fixes.list = out.sort((a, b) => a.group - b.group);
+    fixes.key = fixKey();
+    fixes.unchecked.clear();
+    say(out.length ? `Found ${out.length} fix${out.length > 1 ? 'es' : ''}` : 'No fit-based fixes found: try Repair with the kernel for groups that still fail');
+  } catch (error) {
+    console.error(error);
+    say(`Finding fixes failed: ${error.message}`, true);
+  } finally {
+    fixes.busy = false;
+    refreshPanel();
+  }
+}
+
+/** Apply fixes `list` as one undo step; merges last, so a re-fill never lands in a group a merge has emptied. */
+function applyFixes(list) {
+  if (!mesh || !list.length) return;
+  const order = [...list].sort((a, b) => (a.kind === 'merge') - (b.kind === 'merge'));
+  editGroups(`Fix: ${list.length} change${list.length > 1 ? 's' : ''}`, (store) => {
+    const touched = new Set();
+    for (const p of order) {
+      if (p.kind === 'skip-shell') {
+        const g = store.create('skip');
+        for (const t of p.tris) { if (store.owner[t] >= 0) touched.add(store.owner[t]); store.assign(t, g.id); }
+        touched.add(g.id);
+      } else if (p.kind === 'refill') {
+        for (const t of p.tris) if (store.owner[t] === p.from) store.assign(t, p.to);
+        touched.add(p.from);
+        touched.add(p.to);
+      } else if (p.kind === 'merge') {
+        for (const g of p.groups) if (g !== p.into) for (const t of store.triangles(g)) store.assign(t, p.into);
+        touched.add(p.into);
+      }
+    }
+    return [...touched];
+  });
+  fixes.list = null;
+  fixes.unchecked.clear();
+  const kinds = { refill: 're-fills', merge: 'merges', 'skip-shell': 'stray shells skipped' };
+  const tally = Object.entries(kinds).map(([k, l]) => [list.filter((p) => p.kind === k).length, l]).filter(([n]) => n);
+  say(`Fixed, as one undo step: ${tally.map(([n, l]) => `${n} ${l}`).join(', ')}`);
+}
+
+renderColorBy();
 /** Fitted surface params moved by `d`: every point-valued param (origin, axisPoint, apex, center). */
 function shifted(p, d) {
   const out = { ...p };
@@ -1727,7 +2113,8 @@ async function repairInView() {
         if (id !== null && current.store.groups.has(id)) setActive(id);
       }
     } else if (data.type === 'move') {
-      applyRepairMove(current, data.move, idOf, made);
+      const m = payload.source ? { ...data.move, changes: data.move.changes.map((v, i) => (i % 2 ? v : payload.source[v])) } : data.move;
+      applyRepairMove(current, m, idOf, made);
       kept++;
     } else if (data.type === 'done') {
       const r = data.repair;
@@ -1829,39 +2216,165 @@ function swatch(type, colour) {
   return `<svg class="os-icon" viewBox="0 0 20 20" aria-hidden="true" style="color: rgb(${rgb})">${ui.iconInner(TYPE_ICONS[type] ?? 'surface')}</svg>`;
 }
 
+/** The groups as table rows: id, name, type, triangles, area, verdict and worst distance (model units). */
+function groupRows() {
+  const { store, model } = mesh;
+  if (!mesh.triArea) {
+    const P = model.positions, area = new Float32Array(model.count);
+    for (let t = 0; t < model.count; t++) {
+      const o = t * 9, ux = P[o + 3] - P[o], uy = P[o + 4] - P[o + 1], uz = P[o + 5] - P[o + 2];
+      const vx = P[o + 6] - P[o], vy = P[o + 7] - P[o + 1], vz = P[o + 8] - P[o + 2];
+      area[t] = Math.hypot(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx) / 2;
+    }
+    mesh.triArea = area;
+  }
+  const rows = new Map();
+  for (const g of store.list()) rows.set(g.id, { id: g.id, group: g, name: store.name(g.id), type: g.type, count: 0, area: 0 });
+  for (let t = 0; t < model.count; t++) { const r = rows.get(store.owner[t]); if (r) { r.count++; r.area += mesh.triArea[t]; } }
+  const diag = 2 * model.radius;
+  for (const r of rows.values()) { r.verdict = mesh.verdicts.get(r.id) ?? 'none'; r.worst = (mesh.groupWorst.get(r.id) ?? NaN) * diag; }
+  return [...rows.values()];
+}
+
+const RANK = { off: 0, maybe: 1, none: 2, on: 3, skip: 4 };
+function sortValue(r, key) {
+  if (key === 'name') return r.id;
+  if (key === 'type') return SURFACE_KINDS.indexOf(r.type ?? 'freeform');
+  if (key === 'count') return r.count;
+  if (key === 'area') return r.area;
+  return RANK[r.verdict] * 1e12 - (Number.isFinite(r.worst) ? r.worst : 0);   // worst first
+}
+/** The table's rows as filtered, searched and sorted. */
+function visibleRows() {
+  if (!mesh) return [];
+  const q = table.search.trim().toLowerCase();
+  const rows = groupRows().filter((r) => (!table.types.size || table.types.has(r.type ?? 'freeform'))
+    && (!table.fits.size || table.fits.has(r.verdict)) && (!q || r.name.toLowerCase().includes(q)));
+  const { key, dir } = table.sort;
+  rows.sort((a, b) => { const x = sortValue(a, key), y = sortValue(b, key); return ((x < y ? -1 : x > y ? 1 : 0) || a.id - b.id) * dir; });
+  return rows;
+}
+
+const ROW_LIMIT = 400;
+const esc = (text) => String(text).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const groupRgb = (r) => (r.type === 'skip' ? SKIP_RGB : settings.deviation === 'type' ? TYPE_RGB[r.type ?? 'freeform']
+  : settings.deviation === 'fit' || settings.deviation === 'deviation' ? VERDICTS[r.verdict].rgb : r.group.colour);
+
+/** The top bar, the status line and the face-group table with its fixes and inspector. */
 function refreshPanel() {
   const hasMesh = !!mesh;
   const store = mesh?.store;
-  const groups = hasMesh ? store.list() : [];
-  section.setTitle(`Face groups (${groups.length})`);
-  const rows = groups.map((group) => ({
-    id: group.id,
-    icon: swatch(group.type, group.colour),
-    label: store.name(group.id),
-    value: store.count(group.id).toLocaleString(),
-    selected: group.id === active,
-    // ⚠: the export check expects this group to come out wrong (exportDoubts); cleared when it changes
-    ...(mesh.flags.has(group.id) ? { value: `⚠ ${store.count(group.id).toLocaleString()}` } : {}),
-    tooltip: [describeGroup(group), ...(mesh.flags.get(group.id) ?? []).map((why) => `⚠ ${why}`)].join('\n'),
-    onClick: () => setActive(group.id === active ? null : group.id),
-    onContextMenu: (row, event) => groupMenu(group.id, event),
-  }));
-  if (hasMesh) {
-    const unpainted = mesh.model.count - store.painted;
-    if (unpainted) rows.push({ id: 'unpainted', icon: swatch('plane', UNPAINTED), label: 'Unpainted', value: unpainted.toLocaleString(), dim: true });
-  }
-  section.setRows(rows);
-  section.setButtonDisabled('delete', active === null);
   toolbar.setDisabled('undo', store?.undoStack.length ? null : 'Nothing to undo');
   toolbar.setDisabled('redo', store?.redoStack.length ? null : 'Nothing to redo');
-  toolbar.setDisabled('export', groups.length ? null : 'Paint at least one face group first');
-  if (hasMesh) {
-    const pct = (100 * store.painted) / mesh.model.count;
-    shell.setStatus(`${store.painted.toLocaleString()} of ${mesh.model.count.toLocaleString()} triangles painted (${pct.toFixed(pct < 10 ? 1 : 0)}%)`);
-  } else {
+  toolbar.setDisabled('export', store?.list().length ? null : 'Paint at least one face group first');
+  const slider = document.getElementById('brush-size');
+  if (slider && Number(slider.value) !== settings.brushPx) { slider.value = settings.brushPx; document.getElementById('brush-px').textContent = `${settings.brushPx}px`; }
+  const summary = document.getElementById('summary');
+  if (!hasMesh) {
     shell.setStatus('');
+    summary.hidden = true;
+    panelEl.innerHTML = '<div class="wb-phead"><div class="wb-ptitle"><h2>Face groups</h2></div><p class="wb-lnote">Open or drop an STL, OBJ or 3MF file.</p></div>';
+    return;
   }
-  shell.hint.textContent = `P: auto-paint · D: next view · Shift: facets · Alt: erase · [ ]: brush ${settings.brushPx}px`;
+  const pct = (100 * store.painted) / mesh.model.count;
+  shell.setStatus(`${store.painted.toLocaleString()} of ${mesh.model.count.toLocaleString()} triangles painted (${pct.toFixed(pct < 10 ? 1 : 0)}%)`);
+  const c = verdictCounts();
+  summary.hidden = !store.list().length;
+  summary.innerHTML = ['off', 'maybe', 'on', 'skip'].filter((v) => v !== 'skip' || c.skip)
+    .map((v) => `<span><span class="wb-dot" style="background:${css(VERDICTS[v].rgb)}"></span>${c[v]} ${VERDICTS[v].label.toLowerCase()}</span>`).join('');
+
+  const all = groupRows();
+  const rows = visibleRows();
+  const typeCounts = new Map();
+  for (const r of all) typeCounts.set(r.type ?? 'freeform', (typeCounts.get(r.type ?? 'freeform') ?? 0) + 1);
+  const picked = [...selection].filter((id) => store.count(id));
+  const fitCell = (r) => (r.verdict === 'skip' ? '<span class="wb-skipped">skipped</span>'
+    : r.verdict === 'none' ? `<span class="wb-dot" style="background:${css(NO_SURFACE)}"></span>none`
+      : `<span class="wb-dot" style="background:${css(VERDICTS[r.verdict].rgb)}"></span>${shortLength(r.worst)}`);
+  const row = (r) => `<tr class="wb-g${r.verdict === 'skip' ? ' wb-g--skip' : ''}" data-group="${r.id}" aria-selected="${selection.has(r.id)}" title="${esc(`${r.name}: ${verdictWhy(r.id)}`)}">
+      <td><span class="wb-nm">${typeIcon(r.type, groupRgb(r))}${esc(r.name)}${mesh.flags.has(r.id) ? ' ⚠' : ''}</span></td>
+      <td>${r.type ?? 'freeform'}</td><td class="wb-num">${r.count.toLocaleString()}</td><td class="wb-num wb-col-area">${shortLength(r.area)}</td><td class="wb-fit">${fitCell(r)}</td></tr>`;
+  let body = '', shown = 0;
+  const take = (list) => { const part = list.slice(0, Math.max(0, ROW_LIMIT - shown)); shown += part.length; return part.map(row).join(''); };
+  if (table.by === 'none') body = take(rows);
+  else {
+    const keyOf = table.by === 'type' ? (r) => r.type ?? 'freeform' : (r) => r.verdict;
+    for (const k of table.by === 'type' ? SURFACE_KINDS : ['off', 'maybe', 'none', 'on', 'skip']) {
+      const part = rows.filter((r) => keyOf(r) === k);
+      if (part.length) body += `<tr class="wb-sec"><td colspan="5">${table.by === 'type' ? typeLabel(k) : VERDICTS[k].label} · ${part.length}</td></tr>${take(part)}`;
+    }
+  }
+  if (rows.length > shown) body += `<tr class="wb-unp"><td colspan="5">${(rows.length - shown).toLocaleString()} more: filter or search to see them</td></tr>`;
+  const unpainted = mesh.model.count - store.painted;
+  if (unpainted) body += `<tr class="wb-unp"><td>Unpainted</td><td></td><td class="wb-num">${unpainted.toLocaleString()}</td><td class="wb-col-area"></td><td></td></tr>`;
+  const arrow = (k) => (table.sort.key === k ? (table.sort.dir > 0 ? ' ▲' : ' ▼') : '');
+  const fitOptions = (current) => SURFACE_KINDS.map((t) => `<option value="${t}" ${current === t ? 'selected' : ''}>${typeLabel(t)}</option>`).join('');
+
+  // the fixes card
+  let card;
+  const fresh = fixesFresh();
+  if (fixes.busy) card = '<div class="wb-fixhead"><span class="wb-t">Fix bad areas</span><span class="wb-c">looking…</span></div>';
+  else if (fresh && fixes.list.length) {
+    const checked = fixes.list.filter((p) => !fixes.unchecked.has(p.id));
+    card = `<button type="button" class="wb-fixhead" data-act="fix-toggle" aria-expanded="${fixes.open}"><span class="wb-t">Fix bad areas</span><span class="wb-c">${fixes.list.length} ready ${fixes.open ? '▾' : '▸'}</span></button>`
+      + (fixes.open ? `<div class="wb-fixlist">${fixes.list.map((p) => `<label class="wb-fix"><input type="checkbox" id="fix-${p.id}" data-fix="${p.id}" ${fixes.unchecked.has(p.id) ? '' : 'checked'}><span>${esc(p.title)}<br><span class="wb-d">${esc(p.detail)}</span></span></label>`).join('')}
+        <div class="wb-irow"><button type="button" class="wb-btn wb-primary wb-small" data-act="fix-apply" ${checked.length ? '' : 'disabled'}>Apply ${checked.length} as one step</button><button type="button" class="wb-btn wb-small" data-act="repair" title="Build the solid and let the kernel judge each change (retypes and merges), each its own undo step; Esc stops">Repair with the kernel</button></div></div>` : '');
+  } else {
+    card = `<div class="wb-fixhead"><span class="wb-t">Fix bad areas</span><span class="wb-c">${fresh ? 'nothing found' : ''}</span></div>`
+      + `<div class="wb-fixlist"><div class="wb-irow"><button type="button" class="wb-btn wb-small" data-act="fix-find" title="Re-fill triangles off their surface into the neighbour they lie on, merge neighbours one surface fits, skip stray shells">Find fixes</button><button type="button" class="wb-btn wb-small" data-act="repair" title="Build the solid and let the kernel judge each change (retypes and merges), each its own undo step; Esc stops">Repair with the kernel</button></div></div>`;
+  }
+
+  // the inspector, or the bar for several groups
+  let below = '';
+  if (picked.length === 1) {
+    const r = all.find((x) => x.id === picked[0]);
+    const fit = r.group.fit;
+    const p = fit?.params;
+    const vec = (v) => v.map((x) => x.toFixed(3)).join(', ');
+    const params = !p ? [] : [
+      ...(p.normal ? [['Normal', vec(p.normal)]] : []),
+      ...(p.axis ? [['Axis', vec(p.axis)]] : p.center ? [['Center', vec(p.center)]] : []),
+      ...(p.radius != null ? [['Radius', shortLength(p.radius)]] : []),
+      ...(p.halfAngle != null ? [['Half-angle', `${((p.halfAngle * 180) / Math.PI).toFixed(2)}°`]] : []),
+      ...(p.majorRadius != null ? [['Radii', `${shortLength(p.majorRadius)}, ${shortLength(p.minorRadius)}`]] : []),
+    ];
+    below = `<div class="wb-inspector">
+      <h3>${typeIcon(r.type, groupRgb(r), 18)}${esc(r.name)}</h3>
+      <dl class="wb-kv"><dt>Fit as</dt><dd><select id="fit-as" aria-label="Fit ${esc(r.name)} as">${fitOptions(r.type ?? 'freeform')}</select></dd>
+        ${params.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('')}
+        <dt>Triangles</dt><dd>${r.count.toLocaleString()} · area ${shortLength(r.area)}</dd>
+        ${Number.isFinite(r.worst) ? `<dt>Off the fit</dt><dd>up to ${shortLength(r.worst)}</dd>` : ''}</dl>
+      <div class="wb-why"><span class="wb-dot" style="background:${css(VERDICTS[r.verdict].rgb)}"></span> ${esc(verdictWhy(r.id))}</div>
+      <div class="wb-irow"><button type="button" class="wb-btn wb-small" data-act="zoom">Zoom to</button>${r.type === 'skip' ? '' : '<button type="button" class="wb-btn wb-small" data-act="refit">Refit</button>'}<button type="button" class="wb-btn wb-small" data-act="delete">Delete</button></div></div>`;
+  } else if (picked.length > 1) {
+    below = `<div class="wb-selbar"><span class="wb-n">${picked.length} selected</span>
+      <button type="button" class="wb-btn wb-small" data-act="merge" title="Merge them into the largest">Merge</button>
+      <select id="sel-fit-as" aria-label="Fit the selected groups as"><option value="">Fit as…</option>${fitOptions(null)}</select>
+      <button type="button" class="wb-btn wb-small" data-act="zoom">Zoom to</button>
+      <button type="button" class="wb-btn wb-small" data-act="delete">Delete</button><button type="button" class="wb-btn wb-small" data-act="clear">Clear</button></div>`;
+  }
+
+  const caret = document.activeElement?.id === 'search' ? document.activeElement.selectionStart : null;
+  const scroll = panelEl.querySelector('.wb-tablewrap')?.scrollTop ?? 0;
+  panelEl.innerHTML = `
+    <div class="wb-phead">
+      <div class="wb-ptitle"><h2>Face groups</h2><span class="wb-count">${all.length.toLocaleString()}</span><span class="wb-spacer"></span>
+        <span class="wb-seg" role="group" aria-label="Arrange">${[['none', 'List'], ['type', 'By type'], ['fit', 'By fit']].map(([k, l]) => `<button type="button" data-by="${k}" aria-pressed="${table.by === k}">${l}</button>`).join('')}</span></div>
+      <input class="wb-search" id="search" type="search" placeholder="Find a group by name" value="${esc(table.search)}" aria-label="Find a group by name">
+      <div class="wb-filters">
+        <div class="wb-frow"><span class="wb-glabel">Type</span>${SURFACE_KINDS.filter((t) => typeCounts.has(t)).map((t) => `<button type="button" class="wb-fchip" data-ftype="${t}" aria-pressed="${table.types.has(t)}">${typeIcon(t, t === 'skip' ? SKIP_RGB : TYPE_RGB[t], 14)}${typeLabel(t)} <b>${typeCounts.get(t)}</b></button>`).join('')}</div>
+        <div class="wb-frow"><span class="wb-glabel">Fit</span>${['off', 'maybe', 'on', 'none', 'skip'].filter((v) => c[v]).map((v) => `<button type="button" class="wb-fchip" data-ffit="${v}" aria-pressed="${table.fits.has(v)}"><span class="wb-dot" style="background:${css(VERDICTS[v].rgb)}"></span>${VERDICTS[v].label} <b>${c[v]}</b></button>`).join('')}</div>
+      </div>
+    </div>
+    <div class="wb-fixcard">${card}</div>
+    ${picked.length > 1 ? below : ''}
+    <div class="wb-tablewrap"><table>
+      <thead><tr>${[['name', 'Group'], ['type', 'Type'], ['count', 'Tris', 'wb-num'], ['area', 'Area', 'wb-num wb-col-area'], ['fit', 'Fit · worst']].map(([k, l, cls]) => `<th class="${cls ?? ''}"><button type="button" data-sort="${k}">${l}${arrow(k)}</button></th>`).join('')}</tr></thead>
+      <tbody>${body || '<tr><td colspan="5" class="wb-lnote">No groups yet: paint, or Auto-paint (P).</td></tr>'}</tbody></table></div>
+    ${picked.length === 1 ? below : ''}`;
+  const wrap = panelEl.querySelector('.wb-tablewrap');
+  if (wrap) wrap.scrollTop = scroll;
+  if (caret !== null) { const s = document.getElementById('search'); s.focus(); s.setSelectionRange(caret, caret); }
 }
 
 function setType(type) {
@@ -1869,8 +2382,78 @@ function setType(type) {
   for (const t of FILL_TYPES) toolbar.setPressed(`type-${t}`, t === type);
   say(type === 'auto' ? 'Fill: the model picks the surface'
     : type === 'freeform' ? 'Freeform fill: grows to creases; the export fits a B-spline'
-      : `Fill as ${typeLabel(type).toLowerCase()}`);
+      : type === 'skip' ? 'Skip: paint what the import mangled; it is left out of fitting and the checks'
+        : `Fill as ${typeLabel(type).toLowerCase()}`);
 }
+
+// the table's controls
+panelEl.addEventListener('click', (event) => {
+  if (!mesh) return;
+  const el = event.target.closest('[data-act],[data-sort],[data-by],[data-ftype],[data-ffit],tr.wb-g');
+  if (!el) return;
+  const d = el.dataset;
+  const picked = [...selection].filter((id) => mesh.store.count(id));
+  if (d.sort) { table.sort = { key: d.sort, dir: table.sort.key === d.sort ? -table.sort.dir : 1 }; refreshPanel(); }
+  else if (d.by) { table.by = d.by; refreshPanel(); }
+  else if (d.ftype) { if (table.types.has(d.ftype)) table.types.delete(d.ftype); else table.types.add(d.ftype); refreshPanel(); }
+  else if (d.ffit) { if (table.fits.has(d.ffit)) table.fits.delete(d.ffit); else table.fits.add(d.ffit); refreshPanel(); }
+  else if (el.matches('tr.wb-g')) selectGroup(Number(d.group), event);
+  else if (d.act === 'fix-find') findFixes();
+  else if (d.act === 'fix-toggle') { fixes.open = !fixes.open; refreshPanel(); }
+  else if (d.act === 'fix-apply') applyFixes(fixes.list.filter((p) => !fixes.unchecked.has(p.id)));
+  else if (d.act === 'repair') repairInView();
+  else if (d.act === 'zoom') zoomTo(new Set(picked));
+  else if (d.act === 'refit') editGroups(`Refit ${mesh.store.name(picked[0])}`, () => picked);
+  else if (d.act === 'delete') {
+    editGroups(`Delete ${picked.length > 1 ? `${picked.length} groups` : mesh.store.name(picked[0])}`, (store) => {
+      for (const id of picked) for (const t of store.triangles(id)) store.assign(t, -1);
+    });
+    selectGroup(null);
+  } else if (d.act === 'merge') {
+    const into = picked.reduce((best, id) => (mesh.store.count(id) > mesh.store.count(best) ? id : best));
+    editGroups(`Merge ${picked.length} groups into ${mesh.store.name(into)}`, (store) => {
+      for (const id of picked) if (id !== into) for (const t of store.triangles(id)) store.assign(t, into);
+      return [into];
+    });
+    selection = new Set([into]);
+    active = into;
+    refreshPanel();
+  } else if (d.act === 'clear') selectGroup(null);
+});
+panelEl.addEventListener('dblclick', (event) => {
+  const tr = event.target.closest('tr.wb-g');
+  if (!tr || !mesh) return;
+  const id = Number(tr.dataset.group);
+  selection = new Set([id]);
+  active = id;
+  edgesDirty = true;
+  refreshPanel();
+  zoomTo(new Set([id]));
+});
+panelEl.addEventListener('contextmenu', (event) => {
+  const tr = event.target.closest('tr.wb-g');
+  if (!tr || !mesh) return;
+  event.preventDefault();
+  groupMenu(Number(tr.dataset.group), event);
+});
+panelEl.addEventListener('change', (event) => {
+  const t = event.target;
+  if (!mesh) return;
+  if (t.matches('[data-fix]')) { if (t.checked) fixes.unchecked.delete(t.dataset.fix); else fixes.unchecked.add(t.dataset.fix); refreshPanel(); }
+  else if (t.id === 'fit-as' || (t.id === 'sel-fit-as' && t.value)) {
+    const picked = [...selection].filter((id) => mesh.store.count(id));
+    const type = t.value === 'freeform' ? null : t.value;
+    editGroups(`Fit ${picked.length > 1 ? `${picked.length} groups` : mesh.store.name(picked[0])} as ${typeLabel(type).toLowerCase()}`, (store) => {
+      for (const id of picked) store.groups.get(id).type = type;
+      return picked;
+    });
+  }
+});
+panelEl.addEventListener('input', (event) => {
+  if (event.target.id !== 'search') return;
+  table.search = event.target.value;
+  refreshPanel();
+});
 
 function fillMenu() {
   const pick = (key, value) => () => {
@@ -1950,7 +2533,7 @@ function setHover(key, triangle = -1) {
 function updateHover(point) {
   const centre = mesh ? renderer.pick(point.x, point.y, 0).centre : -1;
   if (settings.deviation) showProbe(centre);
-  if (!mesh || strokeMode() !== 'fill') { setHover(null); return; }
+  if (!mesh || (strokeMode() !== 'fill' && strokeMode() !== 'select')) { setHover(null); return; }
   if (centre < 0) { setHover(null); return; }
   const id = mesh.store.owner[centre];
   if (id === active && id >= 0) setHover(null);
@@ -1962,8 +2545,8 @@ function drawCursor() {
   const context = overlay.getContext('2d');
   context.clearRect(0, 0, overlay.width, overlay.height);
   const mode = strokeMode();
-  canvas.classList.toggle('studio-canvas--brush', mode !== 'fill');
-  if (!cursor || !mesh || mode === 'fill') return;
+  canvas.classList.toggle('studio-canvas--brush', mode === 'raw' || mode === 'erase');
+  if (!cursor || !mesh || mode === 'fill' || mode === 'select') return;
   const ratio = dpr();
   context.beginPath();
   context.arc(cursor.x * ratio, cursor.y * ratio, settings.brushPx * ratio, 0, 2 * Math.PI);
@@ -1996,7 +2579,8 @@ canvas.addEventListener('pointerdown', (event) => {
   } else if (event.button === 2) {
     orbiting = { x: event.clientX, y: event.clientY, moved: 0 };
   } else if (event.button === 0) {
-    beginStroke(event);
+    if (strokeMode() === 'select') pickGroup(event);
+    else beginStroke(event);
   }
 });
 
@@ -2066,7 +2650,12 @@ window.addEventListener('keydown', (event) => {
     refreshPanel();
     drawCursor();
   } else if (key === 'f' && !mod) zoomFit();
-  else if (key === 'd' && !mod) cycleDeviation();
+  else if (key === 'c' && !mod) cycleColorBy();
+  else if (key === 't' && !mod) toggleTriangleEdges();
+  else if (key === 'v' && !mod) setTool('select');
+  else if (key === 'g' && !mod) setTool('fill');
+  else if (key === 'b' && !mod) setTool('raw');
+  else if (key === 'e' && !mod) setTool('erase');
   else if (key === 'p' && !mod) runAutoPaint();
   else if (!mod && event.key >= '1' && event.key <= String(FILL_TYPES.length)) setType(FILL_TYPES[Number(event.key) - 1]);
   else if (event.key === 'Alt') event.preventDefault();   // keep Alt from reaching a browser menu
@@ -2098,22 +2687,24 @@ function frame(now) {
   if (mesh && settings.deviation && mesh.verdictFlags !== mesh.flags) {
     mesh.verdictFlags = mesh.flags;
     recolor();
+    if (!autoRun) refreshPanel();
   }
   if (mesh?.refitted.size) {
     if (settings.deviation) recolor(trianglesOf(mesh.store.owner, mesh.refitted));
     mesh.refitted.clear();
+    if (!autoRun) refreshPanel();   // auto-paint redraws the panel on its own clock
   }
   if (legendDirty && mesh && settings.deviation && (!autoRun || now - lastEdgeBuild > 500)) drawLegend();
   // While auto-paint runs, edges are rebuilt at most twice a second rather than after every fill.
   if (edgesDirty && mesh && (!autoRun || now - lastEdgeBuild > 500)) {
     lastEdgeBuild = now;
     const { model, store } = mesh;
-    renderer.setBands('edges', bodyEdges(model, store.owner));
-    // The active group's outline; with none active, the groups the export check flagged when shown (showDoubts).
-    const flagged = active === null && mesh.showFlags && mesh.flags.size ? mesh.flags : null;
-    renderer.setBands('active', active !== null && store.count(active)
-      ? outline(model, store.triangles(active), (t) => store.owner[t] === active)
-      : flagged ? outline(model, trianglesOf(store.owner, flagged), (t) => flagged.has(store.owner[t])) : null);
+    renderer.setBands('edges', workbenchEdges(model, store));
+    // The picked groups' outline; with none, the groups the export check flagged when shown (showDoubts).
+    const picked = new Set([...selection].filter((id) => store.count(id)));
+    const flagged = !picked.size && mesh.showFlags && mesh.flags.size ? mesh.flags : null;
+    const ring = picked.size ? picked : flagged;
+    renderer.setBands('active', ring ? outline(model, trianglesOf(store.owner, ring), (t) => ring.has(store.owner[t])) : null);
     if (hoverKey?.startsWith('g')) { const key = hoverKey; hoverKey = null; setHover(key); }
     edgesDirty = false;
     needsRender = true;
