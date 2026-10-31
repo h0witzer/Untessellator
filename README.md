@@ -77,6 +77,13 @@ page has to be served; opening `index.html` directly from disk leaves it blank.
 
    Paint geometry the import mangled as **Skip**: it is left out of fitting and the checks, and the
    export heals it over with the group around it, or drops it if nothing painted borders it.
+
+   If the mesh still has problems after the import's repair, the summary in the top bar says so first
+   ("1 hole · 16 overlapping pieces"), and **Fix bad areas** lists the mesh fixes before the groups' own:
+   close holes (and take off fins and walls stuck to the surface), join pieces that cut through each other
+   into one solid, remove small loose pieces. Click a fix's name to see where; **Apply** does the ticked
+   ones as one undo step, and your groups come through. **Delete** (<kbd>D</kbd>) brushes triangles out of
+   the mesh by hand.
 5. Press **Export STEP**. The solid it builds appears over the mesh, so you can turn it and check it before
    you save; drag the shutter across the view to compare the mesh, on the left, with the STEP, on the right.
    A card says what you got. If it's a fully analytic solid, press **Save STEP**.

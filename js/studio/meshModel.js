@@ -7,6 +7,8 @@
  *
  *   neighbours[t*3+k]  the triangle across edge k (corner k to corner k+1), or -1 for an
  *                      open or non-manifold edge
+ *   openEdges          the open edges (one triangle), each as a corner t*3+k
+ *   nonManifoldEdges   the edges three or more triangles share, each once, as a corner of one of them
  *   facetNormals       one normal per corner, all three the facet's: faceted shading
  *   smoothNormals      area-weighted welded-vertex normals, falling back to the facet
  *                      normal where they differ by more than 60 degrees so a crease stays sharp
@@ -46,7 +48,7 @@ export function buildMeshModel(positions) {
 
   const neighbours = new Int32Array(count * 3).fill(-1);
   const firstOwner = new Map();
-  const nonManifold = new Set();
+  const nonManifold = new Map();   // key -> a corner on the edge
   for (let t = 0; t < count; t++) {
     for (let k = 0; k < 3; k++) {
       const a = weld[t * 3 + k];
@@ -63,7 +65,7 @@ export function buildMeshModel(positions) {
         firstOwner.set(key, -1);
       } else {
         // A third owner: the edge is non-manifold, so nothing is adjacent across it.
-        nonManifold.add(key);
+        nonManifold.set(key, t * 3 + k);
       }
     }
   }
@@ -78,6 +80,12 @@ export function buildMeshModel(positions) {
       }
     }
   }
+
+  // an edge whose first owner was never matched has one triangle: open
+  const open = [];
+  for (const corner of firstOwner.values()) if (corner >= 0) open.push(corner);
+  const openEdges = Int32Array.from(open);
+  const nonManifoldEdges = Int32Array.from(nonManifold.values());
 
   const facetNormals = new Float32Array(count * 9);
   const vertexSums = new Float64Array(vertexCount * 3);
@@ -111,7 +119,7 @@ export function buildMeshModel(positions) {
     }
   }
 
-  return { count, positions: P, centre, radius, neighbours, unitNormals: unit, facetNormals, smoothNormals };
+  return { count, positions: P, centre, radius, neighbours, unitNormals: unit, facetNormals, smoothNormals, openEdges, nonManifoldEdges };
 }
 
 function pushEdge(out, P, t, k) {

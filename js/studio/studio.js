@@ -379,7 +379,26 @@ fileInput.hidden = true;
 document.body.append(fileInput);
 
 const renderer = createRenderer(canvas);
-const camera = new ui.OrbitCamera({ ...ui.STANDARD_VIEWS.Trimetric, distance: 5 });
+/** The camera distance that fits the part (zoomFit): an orthographic half height of about 1.1 radii, a margin round it. */
+const FIT_DISTANCE = 2.7;
+/** The view cube's move back to the part, running beside the kit's turn: [x, y, z, distance] from and to. */
+let fitMove = null;
+/**
+ * The kit's camera, but its standard views (the view cube's faces, edges and corners, and the camera menu's views)
+ * also bring the part back to the middle at its fitted zoom, moving as the view turns. The kit animates the turn
+ * only; frame() runs the move with the same easing.
+ */
+class StudioCamera extends ui.OrbitCamera {
+  animateToView(frame, ms = ui.ANIMATION_MS.long) {
+    const turned = super.animateToView(frame, ms);
+    if (turned && mesh) {
+      const { centre, radius } = mesh.model;
+      fitMove = { from: [...this.center, this.distance], to: [...centre, radius * FIT_DISTANCE], ms, started: null };
+    }
+    return turned;
+  }
+}
+const camera = new StudioCamera({ ...ui.STANDARD_VIEWS.Trimetric, distance: 5 });
 const corner = ui.mountViewCube(shell.stage, {
   camera,
   onZoomFit: () => zoomFit(),
@@ -397,21 +416,22 @@ const corner = ui.mountViewCube(shell.stage, {
 
 // The tool row: the tools, the surface to paint as (each its icon), the brush, auto-paint, the fill options and
 // the report. `toolbar` gives the studio's code its calls (setPressed, setDisabled, get) by each control's data-tb.
-const TOOL_ICONS = { select: 'select', fill: 'bucket', raw: 'brush', erase: 'eraseFill' };
+const TOOL_ICONS = { select: 'select', fill: 'bucket', raw: 'brush', erase: 'eraseFill', delete: 'deleteFace' };
 const toolRow = document.getElementById('tools');
 const typeTip = (type, i) => (type === 'auto' ? `The model picks the surface from the seed (${i + 1})`
   : type === 'freeform' ? `Freeform fill: grows to creases; exported as a B-spline (${i + 1})`
     : type === 'skip' ? `Skip what the import mangled: left out of fitting, auto-paint and the checks; export heals it over with the group around it, or drops a stray shell (${i + 1})`
       : `Fill as ${typeLabel(type).toLowerCase()}; painting into a group retypes it (${i + 1})`);
 toolRow.innerHTML = `
-  <div class="wb-tgroup">${[
+  <div class="wb-tgroup wb-tgroup--tools">${[
     ['select', 'Select', 'Click a face to select its group (V)'],
     ['fill', 'Bucket', 'Fill: each triangle crossed fills its surface into the group (G)'],
     ['raw', 'Brush', 'Facet brush: just the triangles under the brush (B, or hold Shift)'],
     ['erase', 'Erase', 'Back to unpainted (E, or hold Alt)'],
-  ].map(([id, label, tip]) => `<button type="button" class="wb-tool" data-tb="${id}" aria-pressed="${settings.tool === id}" title="${tip}">${ui.iconMarkup(TOOL_ICONS[id], { className: 'wb-ticon' })}${label}</button>`).join('')}</div>
+    ['delete', 'Delete', 'Delete triangles from the mesh: a fin, a wall, a bad spot; Fix bad areas then closes the hole (D)'],
+  ].map(([id, label, tip]) => `<button type="button" class="wb-tool" data-tb="${id}" aria-pressed="${settings.tool === id}" title="${tip}" aria-label="${label}">${ui.iconMarkup(TOOL_ICONS[id], { className: 'wb-ticon' })}<span class="wb-tlabel">${label}</span></button>`).join('')}</div>
   <span class="wb-vsep"></span>
-  <div class="wb-tgroup"><span class="wb-glabel">Paint as</span>${FILL_TYPES.map((type, i) => `${type === 'skip' ? '<span class="wb-vsep wb-vsep--short"></span>' : ''}<button type="button" class="wb-ftype${type === 'skip' ? ' wb-ftype--skip' : ''}" data-tb="type-${type}" aria-pressed="${settings.type === type}" title="${typeTip(type, i)}">${typeIcon(type, type === 'auto' ? null : TYPE_RGB[type])}${type === 'auto' ? 'Auto' : typeLabel(type)}</button>`).join('')}</div>
+  <div class="wb-tgroup"><span class="wb-glabel">Paint as</span>${FILL_TYPES.map((type, i) => `${type === 'skip' ? '<span class="wb-vsep wb-vsep--short"></span>' : ''}<button type="button" class="wb-ftype${type === 'skip' ? ' wb-ftype--skip' : ''}" data-tb="type-${type}" aria-pressed="${settings.type === type}" title="${typeTip(type, i)}" aria-label="${type === 'auto' ? 'Auto' : typeLabel(type)}">${typeIcon(type, type === 'auto' ? null : TYPE_RGB[type])}<span class="wb-tlabel">${type === 'auto' ? 'Auto' : typeLabel(type)}</span></button>`).join('')}</div>
   <span class="wb-vsep"></span>
   <label class="wb-size" for="brush-size">Brush <input type="range" id="brush-size" min="3" max="64" value="${settings.brushPx}"> <span class="mono" id="brush-px">${settings.brushPx}px</span></label>
   <span class="wb-vsep"></span>
@@ -421,7 +441,7 @@ toolRow.addEventListener('click', (event) => {
   const button = event.target.closest('[data-tb]');
   if (!button) return;
   const id = button.dataset.tb;
-  if (['select', 'fill', 'raw', 'erase'].includes(id)) setTool(id);
+  if (['select', 'fill', 'raw', 'erase', 'delete'].includes(id)) setTool(id);
   else if (id.startsWith('type-')) setType(id.slice(5));
   else if (id === 'autopaint') runAutoPaint();
   else if (id === 'fill-options') openFillMenu();
@@ -439,7 +459,8 @@ document.getElementById('open').addEventListener('click', () => fileInput.click(
 document.getElementById('undo').addEventListener('click', () => undo());
 document.getElementById('redo').addEventListener('click', () => redo());
 document.getElementById('export').addEventListener('click', () => exportStep());
-document.getElementById('summary').addEventListener('click', () => showNeedsALook());
+// the summary: to the mesh's first fix while it has any, else the groups that need a look
+document.getElementById('summary').addEventListener('click', () => { const f = mesh && meshFixList(mesh)[0]; if (f) showMeshFix(f.step); else showNeedsALook(); });
 document.getElementById('colorby').addEventListener('click', (event) => {
   const button = event.target.closest('[data-color]');
   if (button) setColorBy(button.dataset.color);
@@ -550,6 +571,7 @@ async function openFile(file) {
       ...(left ? [left] : [])].join(' · '), !!left);
     // The geometry kernel starts loading in a worker now, so the first export doesn't wait for it.
     warmKernel();
+    checkMesh(mesh);   // its fixes (holes, fins, walls, overlapping pieces), in the background
     // Adjacency and curvature take a moment on a big mesh: start now so the first stroke doesn't wait.
     // Seed scores for auto-paint too, so the button starts at once.
     const opened = mesh;
@@ -582,9 +604,9 @@ function repairChanges(r) {
 /** What repairMesh could not fix and the export will meet, or null. */
 function repairLeft(r) {
   const parts = [];
-  if (r.nonmanifold_edges) parts.push(`${r.nonmanifold_edges.toLocaleString()} edges shared by 3 or more triangles (bodies touching)`);
+  if (r.nonmanifold_edges) parts.push(`${plural(r.nonmanifold_edges, 'edge')} shared by 3 or more triangles (bodies touching)`);
   if (r.holes_left) parts.push(`${r.holes_left} hole${r.holes_left > 1 ? 's' : ''} it could not cap`);
-  return parts.length ? `the mesh still has ${parts.join(' and ')}: the export may not be a closed solid` : null;
+  return parts.length ? `the mesh still has ${parts.join(' and ')}: the export may not be a closed solid (Fix bad areas closes it)` : null;
 }
 
 /** The paint tool and its per-mesh preparation, loaded on first need (it brings the ONNX runtime). */
@@ -625,9 +647,9 @@ shell.stage.addEventListener('drop', (event) => {
 function zoomFit() {
   if (!mesh) return;
   const { centre, radius } = mesh.model;
+  fitMove = null;
   camera.center = [...centre];
-  // An orthographic half height of about 1.1 radii leaves a margin round the body.
-  camera.distance = radius * 2.7;
+  camera.distance = radius * FIT_DISTANCE;
   requestRender();
 }
 
@@ -660,7 +682,7 @@ function pan(dx, dy) {
 
 function setTool(tool) {
   settings.tool = tool;
-  for (const id of ['select', 'fill', 'raw', 'erase']) toolbar.setPressed(id, id === tool);
+  for (const id of ['select', 'fill', 'raw', 'erase', 'delete']) toolbar.setPressed(id, id === tool);
   showHeldTool();
   drawCursor();
 }
@@ -670,7 +692,7 @@ const strokeMode = () => (modifiers.alt ? 'erase' : modifiers.shift ? 'raw' : se
 /** While Alt holds the eraser or Shift the brush, that button lights up; the chosen tool keeps an outline meanwhile. */
 function showHeldTool() {
   const held = modifiers.alt ? 'erase' : modifiers.shift ? 'raw' : null;
-  for (const id of ['select', 'fill', 'raw', 'erase']) toolbar.get(id)?.toggleAttribute('data-held', id === held && id !== settings.tool);
+  for (const id of ['select', 'fill', 'raw', 'erase', 'delete']) toolbar.get(id)?.toggleAttribute('data-held', id === held && id !== settings.tool);
   toolRow.classList.toggle('wb-tools--holding', held !== null && held !== settings.tool);
 }
 
@@ -690,7 +712,7 @@ function beginStroke(event) {
     mode, gid: null, last: point, moved: 0, anchor: -1, zone: null, blocked: 0, lastMessage: null,
     started: renderer.pick(point.x, point.y, 0).centre,
     queue: [], queued: new Set(), pumping: false, released: false, cancelled: false, finishing: false,
-    fills: 0, claimed: 0,
+    fills: 0, claimed: 0, doomed: mode === 'delete' ? new Set() : null,
   };
   setHover(null);
   applyBrush(point);
@@ -729,10 +751,26 @@ function applyBrush(point) {
   }
   const { centre, ids } = renderer.pick(point.x, point.y, settings.brushPx * dpr());
   if (!ids.size) return;
+  if (stroke.mode === 'delete') { markDoomed(ids); return; }
   const target = stroke.mode === 'erase' ? -1 : strokeGroup(centre >= 0 ? centre : ids.values().next().value);
   let changed = 0;
   for (const t of ids) if (store.assign(t, target)) changed++;
   if (changed) { flushChanged(); refreshPanel(); }
+}
+
+/** The Delete brush: triangles `ids` turn red, to go when the stroke ends (Esc keeps them). */
+const DOOMED_RGB = hexRgb('#e0453a');
+function markDoomed(ids) {
+  const { colours } = mesh;
+  let first = Infinity, last = -1;
+  for (const t of ids) {
+    if (stroke.doomed.has(t)) continue;
+    stroke.doomed.add(t);
+    for (let k = 0; k < 3; k++) colours.set(DOOMED_RGB, t * 9 + k * 3);
+    first = Math.min(first, t);
+    last = Math.max(last, t);
+  }
+  if (last >= 0) { renderer.updateColours(colours, first, last); requestRender(); }
 }
 
 function moveStroke(point) {
@@ -1131,6 +1169,15 @@ function finishStroke() {
   if (!s || s.finishing) return;
   s.finishing = true;
   const { store } = mesh;
+  if (s.mode === 'delete') {
+    store.cancel();
+    stroke = null;
+    if (s.cancelled || !s.doomed.size) { recolor(s.doomed); if (s.cancelled) say('Delete cancelled'); return; }
+    const n = s.doomed.size;
+    deleteTriangles(s.doomed, `Delete ${plural(n, 'triangle')}`);
+    say(`Deleted ${plural(n, 'triangle')}: Undo puts them back; Repair again closes the hole they leave`);
+    return;
+  }
   if (s.cancelled) {
     store.cancel();
     stroke = null;
@@ -1302,19 +1349,28 @@ function undo() {
   if (!mesh || stroke || autoRun) return;
   leavePreview();
   const label = mesh.store.undo();
-  if (!label) return;
-  afterHistory();
-  say(`Undid: ${label}`);
+  if (label) { afterHistory(); say(`Undid: ${label}`); return; }
+  // past this mesh's first group edit: the mesh edit that made it, undone by putting the mesh before back
+  if (!mesh.before) return;
+  const edited = mesh, was = mesh.before;
+  was.redoMesh = { mesh: edited, mark: was.store.undoStack.length };
+  swapMesh(was);
+  say(`Undid: ${edited.label}`);
 }
 
 function redo() {
   if (!mesh || stroke || autoRun) return;
   leavePreview();
   const label = mesh.store.redo();
-  if (!label) return;
-  afterHistory();
-  say(`Redid: ${label}`);
+  if (label) { afterHistory(); say(`Redid: ${label}`); return; }
+  if (!meshRedo()) return;
+  const next = mesh.redoMesh.mesh;
+  mesh.redoMesh = null;
+  swapMesh(next);
+  say(`Redid: ${next.label}`);
 }
+/** A mesh edit undone, still to redo: only while nothing new has been done to the groups since. */
+const meshRedo = () => !!mesh?.redoMesh && mesh.redoMesh.mark === mesh.store.undoStack.length && !mesh.store.redoStack.length;
 
 function afterHistory() {
   // Group colours are fixed per id, but a restored group needs its triangles recoloured.
@@ -1689,8 +1745,8 @@ function exportDoubts({ positions, labels, surfaces }) {
   }
   const m = pf.mesh;
   const holes = [];
-  if (m.openEdges) holes.push(`${m.openEdges.toLocaleString()} open edges`);
-  if (m.nonmanifoldEdges) holes.push(`${m.nonmanifoldEdges.toLocaleString()} edges shared by 3 or more triangles`);
+  if (m.openEdges) holes.push(plural(m.openEdges, 'open edge'));
+  if (m.nonmanifoldEdges) holes.push(`${plural(m.nonmanifoldEdges, 'edge')} shared by 3 or more triangles`);
   return { groups, mesh: holes.length ? `the mesh has ${holes.join(' and ')}, so the export will not be a closed solid` : null };
 }
 
@@ -1714,6 +1770,10 @@ function offerDoubts({ groups, mesh: meshDoubt }) {
       ...(n ? [
         { label: 'Find fixes', primary: true, detail: 'Looks for re-fills and merges that put these triangles on a surface; review and apply them under Fix bad areas.', onSelect: () => findFixes() },
         { label: 'Fix by hand', detail: 'Outlines them. A group spanning two faces: repaint it with the bucket. A narrow curve: set its type under Fit as, or merge it into its neighbor.', onSelect: () => showDoubts() },
+      ] : []),
+      ...(meshDoubt ? [
+        { label: 'Fix the mesh', primary: !n, detail: 'Closes its holes, takes off fins and walls stuck to it and joins pieces that cut through each other, as one undo step; Fix bad areas lists each.', onSelect: () => applyMeshFixes() },
+        { label: 'Show where', detail: 'Outlines the bad edges in amber and zooms to them; again for the next spot.', onSelect: () => showMeshFix('holes') },
       ] : []),
       { label: 'Export anyway', detail: n ? 'Builds the solid as it is: where these faces fail, you can still save with them as flat facets.' : 'Builds what it can: the file will be an open shell, not a solid.', onSelect: () => exportStep({ checked: true }) },
     ],
@@ -2152,7 +2212,7 @@ async function findFixes() {
     }
     let main = 0;
     sizes.forEach((size, c) => { if (size > sizes[main]) main = c; });
-    const small = Math.min(500, Math.max(8, n * 0.01));
+    const small = SMALL_SHELL(n);
     const shells = new Map();
     for (let t = 0; t < n; t++) {
       const c = comp[t];
@@ -2632,6 +2692,267 @@ function downloadFile(data, filename) {
   setTimeout(() => URL.revokeObjectURL(url), 10_000);
 }
 
+// ── the mesh's health, and its fixes past the import repair's ────────────────
+
+/** Loose pieces this small (triangles, of `n`) are strays: the mesh fixes remove them. */
+const SMALL_SHELL = (n) => Math.min(500, Math.max(8, n * 0.01));
+
+/**
+ * The mesh's health, worked out once per mesh: its open and non-manifold edges as segments (to outline), the spots
+ * they gather in (edges that touch, to zoom to one at a time) and its small loose pieces (all but the largest piece,
+ * at most SMALL_SHELL triangles each).
+ */
+function meshHealth(current) {
+  if (current.health) return current.health;
+  const { model } = current;
+  const P = model.positions, n = model.count;
+  const corners = [...model.openEdges, ...model.nonManifoldEdges];
+  const ends = new Float32Array(corners.length * 6);
+  const key = (o) => `${Math.round(P[o] * 1e5)},${Math.round(P[o + 1] * 1e5)},${Math.round(P[o + 2] * 1e5)}`;
+  const parent = corners.map((_, i) => i);
+  const find = (i) => { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; } return i; };
+  const at = new Map();
+  corners.forEach((corner, i) => {
+    const t = Math.floor(corner / 3), k = corner % 3;
+    const a = t * 9 + k * 3, b = t * 9 + ((k + 1) % 3) * 3;
+    ends.set([P[a], P[a + 1], P[a + 2], P[b], P[b + 1], P[b + 2]], i * 6);
+    for (const o of [a, b]) {
+      const j = at.get(key(o));
+      if (j === undefined) at.set(key(o), i); else parent[find(i)] = find(j);
+    }
+  });
+  const boxes = new Map();
+  corners.forEach((_, i) => {
+    const r = find(i);
+    const box = boxes.get(r) ?? boxes.set(r, { lo: [Infinity, Infinity, Infinity], hi: [-Infinity, -Infinity, -Infinity], edges: 0 }).get(r);
+    box.edges++;
+    for (let k = 0; k < 6; k++) { const a = k % 3; box.lo[a] = Math.min(box.lo[a], ends[i * 6 + k]); box.hi[a] = Math.max(box.hi[a], ends[i * 6 + k]); }
+  });
+  const spots = [...boxes.values()].sort((x, y) => y.edges - x.edges);
+  // pieces: triangles joined through any shared edge, so a fin or a wall glued on along an edge is not loose (the
+  // holes fix judges those) and only a piece that shares no edge with the rest is
+  const tp = Int32Array.from({ length: n }, (_, i) => i);
+  const root = (i) => { while (tp[i] !== i) { tp[i] = tp[tp[i]]; i = tp[i]; } return i; };
+  const firstOn = new Map();
+  for (let t = 0; t < n; t++) {
+    for (let k = 0; k < 3; k++) {
+      const a = key(t * 9 + k * 3), b = key(t * 9 + ((k + 1) % 3) * 3);
+      const e = a < b ? `${a}|${b}` : `${b}|${a}`;
+      const f = firstOn.get(e);
+      if (f === undefined) firstOn.set(e, t); else tp[root(t)] = root(f);
+    }
+  }
+  const index = new Map(), comp = new Int32Array(n), sizes = [];
+  for (let t = 0; t < n; t++) {
+    const r = root(t);
+    let c = index.get(r);
+    if (c === undefined) { c = sizes.length; index.set(r, c); sizes.push(0); }
+    comp[t] = c;
+    sizes[c]++;
+  }
+  let main = 0;
+  sizes.forEach((size, c) => { if (size > sizes[main]) main = c; });
+  const small = new Set();
+  for (let t = 0; t < n; t++) if (comp[t] !== main && sizes[comp[t]] <= SMALL_SHELL(n)) small.add(t);
+  const pieces = new Set([...small].map((t) => comp[t])).size;
+  current.health = { open: model.openEdges.length, nonManifold: model.nonManifoldEdges.length, ends, spots, small, pieces, parts: sizes.length };
+  return current.health;
+}
+
+const plural = (n, one, many = `${one}s`) => `${n.toLocaleString()} ${n === 1 ? one : many}`;
+
+function zoomToSpot(i) {
+  const { spots, open, nonManifold } = meshHealth(mesh);
+  const spot = spots[i];
+  if (!spot) return;
+  const { lo, hi } = spot;
+  fitMove = null;
+  camera.center = lo.map((v, a) => (v + hi[a]) / 2);
+  camera.distance = Math.max(Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) / 2, mesh.model.radius * 0.03) * FIT_DISTANCE;
+  const what = open && nonManifold ? 'open and non-manifold edges' : nonManifold ? 'edges on 3 or more triangles' : 'open edges';
+  say(`Spot ${i + 1} of ${spots.length}, outlined in amber (${what}): Fix bad areas closes it; Delete takes off what it should not`);
+  requestRender();
+}
+
+/**
+ * The mesh fixes (meshFixWorker.js): small loose pieces, then holes with the fins and walls round them, then pieces
+ * that cut through each other, worked out together in the background as a mesh opens and after each edit, so Fix
+ * bad areas can list them and Apply is at once. One worker, made the first time.
+ */
+let fixWorker = null, fixSeq = 0;
+const fixWaiting = new Map();
+const ALL_STEPS = { pieces: true, holes: true, join: true };
+function runMeshFixes(current, steps) {
+  if (!fixWorker) {
+    fixWorker = new Worker(new URL('./meshFixWorker.js', import.meta.url), { type: 'module' });
+    fixWorker.onmessage = ({ data }) => { const done = fixWaiting.get(data.id); fixWaiting.delete(data.id); done?.(data); };
+    fixWorker.onerror = (event) => {
+      for (const done of fixWaiting.values()) done({ error: event.message || 'the mesh fixes could not start' });
+      fixWaiting.clear();
+      fixWorker = null;
+    };
+  }
+  const h = meshHealth(current);
+  const small = h.small.size ? Uint8Array.from({ length: current.model.count }, (_, t) => (h.small.has(t) ? 1 : 0)) : null;
+  const id = ++fixSeq;
+  return new Promise((resolve) => {
+    fixWaiting.set(id, resolve);
+    fixWorker.postMessage({ id, positions: current.geometry.attributes.position.array, small, smallPieces: h.pieces, steps });
+  });
+}
+function checkMesh(current) {
+  if (current.meshFix) return;
+  current.meshFix = runMeshFixes(current, ALL_STEPS).then((r) => { current.meshFixed = r; if (mesh === current) refreshPanel(); return r; });
+}
+
+/** The mesh fixes found for `current`, as Fix bad areas lists them: [{id, step, title, detail}]. */
+function meshFixList(current) {
+  const r = current?.meshFixed;
+  if (!r || r.error) return [];
+  const out = [];
+  const h = r.holes;
+  const sheets = h ? h.walls_removed + h.fins_removed : 0;
+  if (h && (h.filled || sheets)) {
+    out.push({ id: 'mesh-holes', step: 'holes',
+      title: [h.filled ? `Close ${plural(h.filled, 'hole')}` : '', sheets ? `${h.filled ? 'remove' : 'Remove'} ${plural(sheets, 'fin or wall', 'fins and walls')} stuck to the surface` : ''].filter(Boolean).join(', '),
+      detail: h.filled ? 'Each cap is shaped to the surface round it; on export it joins that group, on its surface' : 'Sheets of no thickness on an edge that two other faces share' });
+  }
+  const j = r.join;
+  if (j?.overlap) out.push({ id: 'mesh-join', step: 'join', title: `Join ${plural(j.joined, 'overlapping piece')}`, detail: `They cut through each other; joined, they make ${plural(j.bodies, 'body', 'bodies')}` });
+  if (r.pieces.triangles) out.push({ id: 'mesh-pieces', step: 'pieces', title: `Remove ${plural(r.pieces.removed, 'small loose piece')}`, detail: `${plural(r.pieces.triangles, 'triangle')} apart from the main body` });
+  return out;
+}
+
+/** Apply the mesh fixes ticked in Fix bad areas, as one undo step. */
+async function applyMeshFixes() {
+  if (!mesh || stroke || autoRun) return;
+  const current = mesh;
+  checkMesh(current);
+  const list = meshFixList(current);
+  const ticked = list.filter((f) => !fixes.unchecked.has(f.id));
+  if (!ticked.length) return;
+  const steps = { pieces: false, holes: false, join: false };
+  for (const f of ticked) steps[f.step] = true;
+  const all = list.every((f) => steps[f.step]);
+  busy.start('Fixing the mesh', { onStop: null });
+  progress(ticked.map((f) => f.title).join(' · ') + '…');
+  const r = all ? await current.meshFix : await runMeshFixes(current, steps);
+  busy.end();
+  if (mesh !== current) return;
+  if (r.error) { say(`The mesh fixes failed: ${r.error}`, true); return; }
+  replaceMesh(r.positions, r.src, ticked.length === 1 ? ticked[0].title : `Fix the mesh: ${ticked.map((f) => f.title.toLowerCase()).join('; ')}`);
+  say(`${ticked.map((f) => f.title).join(' · ')}: done (one undo step)`);
+}
+
+/** Show where a mesh fix works: the problem edges (holes), the loose pieces, or the whole part (a join). */
+function showMeshFix(step) {
+  if (!mesh) return;
+  leavePreview();
+  if (step === 'holes') {
+    const { spots } = meshHealth(mesh);
+    if (!spots.length) return;
+    mesh.problemAt = mesh.showProblems ? ((mesh.problemAt ?? 0) + 1) % spots.length : 0;
+    mesh.showProblems = true;
+    edgesDirty = true;
+    zoomToSpot(mesh.problemAt);
+  } else if (step === 'pieces') {
+    const { small } = meshHealth(mesh);
+    const P = mesh.model.positions, lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+    for (const t of small) for (let k = 0; k < 9; k++) { lo[k % 3] = Math.min(lo[k % 3], P[t * 9 + k]); hi[k % 3] = Math.max(hi[k % 3], P[t * 9 + k]); }
+    if (lo[0] === Infinity) return;
+    fitMove = null;
+    camera.center = lo.map((v, a) => (v + hi[a]) / 2);
+    camera.distance = Math.max(Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) / 2, mesh.model.radius * 0.03) * FIT_DISTANCE;
+    say(`The small loose pieces, ${plural(small.size, 'triangle')} in all`);
+    requestRender();
+  } else zoomFit();
+}
+
+/** What is wrong with `current`'s mesh, in a few words for the summary in the top bar, or null. */
+function meshTrouble(current) {
+  const r = current.meshFixed, h = meshHealth(current);
+  if (r && !r.error) {
+    const words = [];
+    if (r.holes?.filled) words.push(plural(r.holes.filled, 'hole'));
+    const sheets = r.holes ? r.holes.walls_removed + r.holes.fins_removed : 0;
+    if (sheets) words.push(plural(sheets, 'fin or wall', 'fins and walls'));
+    if (r.join?.overlap) words.push(plural(r.join.joined, 'overlapping piece'));
+    if (r.pieces.triangles) words.push(plural(r.pieces.removed, 'loose piece'));
+    if (words.length) return words.join(' · ');
+    // nothing left to fix: edges on 3+ triangles now are bodies touching at an edge, each closed; only an open
+    // chain the fixes could not close is still trouble
+    return h.open ? plural(h.open, 'open edge') : null;
+  }
+  return null;                                     // not checked yet: the fixes card says it is checking
+}
+
+/** Take triangles `doomed` out of the mesh. */
+function deleteTriangles(doomed, label) {
+  const { model } = mesh;
+  const keep = [];
+  for (let t = 0; t < model.count; t++) if (!doomed.has(t)) keep.push(t);
+  const P = mesh.geometry.attributes.position.array;
+  const positions = new Float32Array(keep.length * 9);
+  keep.forEach((t, i) => positions.set(P.subarray(t * 9, t * 9 + 9), i * 9));
+  replaceMesh(positions, Int32Array.from(keep), label);
+}
+
+/**
+ * A mesh edit: `positions` the new triangles, `src` each one's triangle in the mesh before (-1: added by the edit,
+ * a cap). The groups come across through src, fits and all; a group left with no triangles goes. One undo step:
+ * undo puts the mesh before back whole, its groups and their history with it (mesh.before, MESH_UNDO deep).
+ */
+const MESH_UNDO = 8;
+function replaceMesh(positions, src, label) {
+  const old = mesh;
+  hideResult();
+  const model = buildMeshModel(positions);
+  const store = new GroupStore(model.count, model.neighbours);
+  for (const [id, g] of old.store.groups) store.groups.set(id, { ...g });
+  store.nextId = old.store.nextId;
+  for (let t = 0; t < model.count; t++) { const id = src[t] >= 0 ? old.store.owner[src[t]] : -1; if (id >= 0) store.assign(t, id); }
+  // the edit's caps join the group round them (caps.js), as auto-paint's do
+  const caps = Uint8Array.from(src, (s) => (s < 0 ? 1 : 0));
+  for (const [t, id] of capOwners(store.owner, caps, model.neighbours)) store.assign(t, id);
+  for (const id of [...store.groups.keys()]) if (!store.count(id)) store.groups.delete(id);
+  store.takeChanged();
+  const next = {
+    model, geometry: { index: null, attributes: { position: { array: positions } } }, name: old.name, store,
+    colours: new Float32Array(model.count * 9), offset: old.offset, repair: old.repair,
+    synthetic: Uint8Array.from(src, (s) => (s < 0 || old.synthetic?.[s] ? 1 : 0)),   // caps, the repair's or the edit's
+    flags: new Map(), showFlags: false,
+    deviation: new Float32Array(model.count).fill(NaN), levels: new Float32Array(model.count * 3).fill(NO_LEVEL),
+    refitted: new Set(), groupWorst: new Map(), verdicts: new Map(), origins: new Map(old.origins),
+    before: old, label,
+  };
+  for (let m = next, depth = 0; m; m = m.before, depth++) if (depth === MESH_UNDO) { m.before = null; break; }
+  old.redoMesh = null;
+  swapMesh(next);
+}
+
+/** Show mesh object `target` (an edit's result, or the mesh before it on undo) in place of the one on show. */
+function swapMesh(target) {
+  mesh = target;
+  active = null;
+  selection = new Set();
+  hoverKey = null;
+  paintPromise = null;
+  prepared = null;
+  fixes.list = null;
+  renderer.setMesh(target.model);
+  renderer.setShading(settings.smooth);
+  renderer.setBands('active', null);
+  renderer.setBands('hover', null);
+  recolor();
+  edgesDirty = true;
+  legendDirty = true;
+  refreshPanel();
+  requestRender();
+  const opened = mesh;
+  setTimeout(() => preparePaint().then(() => edgeScoresFor(opened)).catch(() => {}), 50);
+  checkMesh(target);
+}
+
 // ── panel, toolbar, status ────────────────────────────────────────────────────
 
 const format = (v) => (Math.abs(v) >= 100 ? v.toFixed(1) : v.toPrecision(4));
@@ -2732,8 +3053,8 @@ const groupRgb = (r) => (r.type === 'skip' ? SKIP_RGB : settings.deviation === '
 function refreshPanel() {
   const hasMesh = !!mesh;
   const store = mesh?.store;
-  toolbar.setDisabled('undo', store?.undoStack.length ? null : 'Nothing to undo');
-  toolbar.setDisabled('redo', store?.redoStack.length ? null : 'Nothing to redo');
+  toolbar.setDisabled('undo', store?.undoStack.length || mesh?.before ? null : 'Nothing to undo');
+  toolbar.setDisabled('redo', store?.redoStack.length || meshRedo() ? null : 'Nothing to redo');
   toolbar.setDisabled('export', store?.list().length ? null : 'Paint at least one face group first');
   const slider = document.getElementById('brush-size');
   if (slider && Number(slider.value) !== settings.brushPx) { slider.value = settings.brushPx; document.getElementById('brush-px').textContent = `${settings.brushPx}px`; }
@@ -2747,9 +3068,12 @@ function refreshPanel() {
   const pct = (100 * store.painted) / mesh.model.count;
   shell.setStatus(`${store.painted.toLocaleString()} of ${mesh.model.count.toLocaleString()} triangles painted (${pct.toFixed(pct < 10 ? 1 : 0)}%)`);
   const c = verdictCounts();
-  summary.hidden = !store.list().length;
-  summary.innerHTML = ['off', 'maybe', 'on', 'skip'].filter((v) => v !== 'skip' || c.skip)
-    .map((v) => `<span><span class="wb-dot" style="background:${css(VERDICTS[v].rgb)}"></span>${c[v]} ${VERDICTS[v].label.toLowerCase()}</span>`).join('');
+  // the summary: the mesh's trouble first, while it has any, then the groups' verdicts
+  const trouble = meshTrouble(mesh);
+  summary.hidden = !store.list().length && !trouble;
+  summary.innerHTML = (trouble ? `<span class="wb-sum-mesh"><span class="wb-dot" style="background:${css(VERDICTS.maybe.rgb)}"></span>${trouble}</span>` : '')
+    + (store.list().length ? ['off', 'maybe', 'on', 'skip'].filter((v) => v !== 'skip' || c.skip)
+      .map((v) => `<span><span class="wb-dot" style="background:${css(VERDICTS[v].rgb)}"></span>${c[v]} ${VERDICTS[v].label.toLowerCase()}</span>`).join('') : '');
 
   const all = groupRows();
   const rows = visibleRows();
@@ -2781,10 +3105,19 @@ function refreshPanel() {
   const arrow = (k) => (table.sort.key !== k ? '' : (k === 'fit' ? table.sort.dir < 0 : table.sort.dir > 0) ? ' ▲' : ' ▼');
   const fitOptions = (current) => SURFACE_KINDS.map((t) => `<option value="${t}" ${current === t ? 'selected' : ''}>${typeLabel(t)}</option>`).join('');
 
-  // the fixes card
+  // the fixes card: while the mesh needs fixing, its fixes, ticked (they come first: the groups build on the mesh)
   let card;
   const fresh = fixesFresh();
-  if (fixes.busy) card = '<div class="wb-fixhead"><span class="wb-t">Fix bad areas</span><span class="wb-c">looking…</span></div>';
+  const meshFixes = meshFixList(mesh);
+  const meshPending = !mesh.meshFixed && (meshHealth(mesh).open || meshHealth(mesh).nonManifold || meshHealth(mesh).parts > 1);
+  if (meshFixes.length) {
+    const ticked = meshFixes.filter((f) => !fixes.unchecked.has(f.id));
+    card = `<div class="wb-fixhead"><span class="wb-t">Fix bad areas</span><span class="wb-c">mesh · ${meshFixes.length}</span></div>
+      <div class="wb-fixlist">${meshFixes.map((f) => `<label class="wb-fix"><input type="checkbox" data-fix="${f.id}" ${fixes.unchecked.has(f.id) ? '' : 'checked'}><span><button type="button" class="wb-fixtitle" data-mshow="${f.step}" title="Show where">${esc(f.title)}</button><br><span class="wb-d">${esc(f.detail)}</span></span></label>`).join('')}
+        <div class="wb-irow"><button type="button" class="wb-btn wb-primary wb-small" data-act="mfix-apply" ${ticked.length ? '' : 'disabled'}>Apply ${ticked.length} as one step</button></div>
+        <div class="wb-d">The groups' own fixes come once the mesh is sound.</div></div>`;
+  } else if (meshPending) card = '<div class="wb-fixhead"><span class="wb-t">Fix bad areas</span><span class="wb-c">checking the mesh…</span></div>';
+  else if (fixes.busy) card = '<div class="wb-fixhead"><span class="wb-t">Fix bad areas</span><span class="wb-c">looking…</span></div>';
   else if (fresh && fixes.list.length) {
     const checked = fixes.list.filter((p) => !fixes.unchecked.has(p.id));
     card = `<button type="button" class="wb-fixhead" data-act="fix-toggle" aria-expanded="${fixes.open}"><span class="wb-t">Fix bad areas</span><span class="wb-c">${fixes.list.length} ready ${fixes.open ? '▾' : '▸'}</span></button>`
@@ -2860,9 +3193,10 @@ function setType(type) {
 // the table's controls
 panelEl.addEventListener('click', (event) => {
   if (!mesh) return;
-  const el = event.target.closest('[data-act],[data-sort],[data-by],[data-ftype],[data-ffit],tr.wb-g');
-  if (!el) return;
+  const el = event.target.closest('[data-act],[data-sort],[data-by],[data-ftype],[data-ffit],[data-mshow],tr.wb-g');
+  if (!el || el.disabled) return;
   const d = el.dataset;
+  if (d.mshow) { event.preventDefault(); showMeshFix(d.mshow); return; }   // the row's title: show where, not tick
   const picked = [...selection].filter((id) => mesh.store.count(id));
   if (d.sort) { table.sort = { key: d.sort, dir: table.sort.key === d.sort ? -table.sort.dir : 1 }; refreshPanel(); }
   else if (d.by) { table.by = d.by; refreshPanel(); }
@@ -2870,6 +3204,7 @@ panelEl.addEventListener('click', (event) => {
   else if (d.ffit) { if (table.fits.has(d.ffit)) table.fits.delete(d.ffit); else table.fits.add(d.ffit); refreshPanel(); }
   else if (el.matches('tr.wb-g')) selectGroup(Number(d.group), event);
   else if (d.act === 'fix-find') findFixes();
+  else if (d.act === 'mfix-apply') applyMeshFixes();
   else if (d.act === 'fix-toggle') { fixes.open = !fixes.open; refreshPanel(); }
   else if (d.act === 'fix-apply') applyFixes(fixes.list.filter((p) => !fixes.unchecked.has(p.id)));
   else if (d.act === 'repair') repairInView();
@@ -3018,14 +3353,14 @@ function drawCursor() {
   const context = overlay.getContext('2d');
   context.clearRect(0, 0, overlay.width, overlay.height);
   const mode = strokeMode();
-  canvas.classList.toggle('studio-canvas--brush', !previewing && (mode === 'raw' || mode === 'erase'));   // no circle in a preview
+  canvas.classList.toggle('studio-canvas--brush', !previewing && (mode === 'raw' || mode === 'erase' || mode === 'delete'));   // no circle in a preview
   if (!cursor || !mesh || previewing || mode === 'fill' || mode === 'select') return;
   const ratio = dpr();
   context.beginPath();
   context.arc(cursor.x * ratio, cursor.y * ratio, settings.brushPx * ratio, 0, 2 * Math.PI);
   context.lineWidth = ratio;
   context.setLineDash(mode === 'erase' ? [4 * ratio, 3 * ratio] : []);
-  context.strokeStyle = 'rgba(255, 255, 255, 0.85)';
+  context.strokeStyle = mode === 'delete' ? 'rgba(255, 120, 105, 0.95)' : 'rgba(255, 255, 255, 0.85)';
   context.stroke();
 }
 
@@ -3135,6 +3470,7 @@ window.addEventListener('keydown', (event) => {
   else if (key === 'g' && !mod) setTool('fill');
   else if (key === 'b' && !mod) setTool('raw');
   else if (key === 'e' && !mod) setTool('erase');
+  else if (key === 'd' && !mod) setTool('delete');
   else if (key === 'p' && !mod) runAutoPaint();
   else if (!mod && event.key >= '1' && event.key <= String(FILL_TYPES.length)) setType(FILL_TYPES[Number(event.key) - 1]);
   else if (event.key === 'Alt') event.preventDefault();   // keep Alt from reaching a browser menu
@@ -3150,6 +3486,16 @@ window.addEventListener('blur', () => { modifiers.shift = false; modifiers.alt =
 function frame(now) {
   camera.step(now);
   if (camera.isAnimating()) needsRender = true;
+  if (fitMove) {
+    fitMove.started ??= now;
+    const t = Math.min(1, (now - fitMove.started) / fitMove.ms);
+    const s = t * t * t * (t * (6 * t - 15) + 10);   // smootherstep, the kit's easing for the turn
+    const [x, y, z, distance] = fitMove.from.map((v, i) => v + (fitMove.to[i] - v) * s);
+    camera.center = [x, y, z];
+    camera.distance = distance;
+    needsRender = true;
+    if (t >= 1) fitMove = null;
+  }
   const ratio = dpr();
   const width = Math.max(1, Math.floor(canvas.clientWidth * ratio));
   const height = Math.max(1, Math.floor(canvas.clientHeight * ratio));
@@ -3183,7 +3529,8 @@ function frame(now) {
     const picked = new Set([...selection].filter((id) => store.count(id)));
     const flagged = !picked.size && mesh.showFlags && mesh.flags.size ? mesh.flags : null;
     const ring = picked.size ? picked : flagged;
-    renderer.setBands('active', ring ? outline(model, trianglesOf(store.owner, ring), (t) => ring.has(store.owner[t])) : null);
+    renderer.setBands('active', !picked.size && mesh.showProblems ? meshHealth(mesh).ends
+      : ring ? outline(model, trianglesOf(store.owner, ring), (t) => ring.has(store.owner[t])) : null);
     if (hoverKey?.startsWith('g')) { const key = hoverKey; hoverKey = null; setHover(key); }
     edgesDirty = false;
     needsRender = true;
