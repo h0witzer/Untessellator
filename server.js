@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Minimal development server for the stlToStep studio.
+ * Minimal development server for the Untessellator studio.
  *
  * Usage:
  *   node server.js          # serves the studio on http://localhost:3000
@@ -63,7 +63,7 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, '127.0.0.1', () => {
   const url = `http://localhost:${PORT}/`;
   console.log('');
-  console.log('  stlToStep Studio');
+  console.log('  Untessellator Studio');
   console.log('  ───────────────────────────────────');
   console.log(`  Open in your browser: ${url}`);
   console.log('');

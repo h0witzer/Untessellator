@@ -1,5 +1,5 @@
 {
-  "name": "stltostep",
+  "name": "untessellator",
   "private": true,
   "description": "Turn STL, OBJ and 3MF meshes back into real CAD: exact analytic faces in a closed STEP solid.",
   "license": "MIT",
