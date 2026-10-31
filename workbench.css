@@ -106,6 +106,53 @@ body { background: var(--wb-bg); color: var(--wb-text); font: 14px/1.45 var(--wb
 .wb-readout { position: absolute; left: 12px; bottom: 12px; max-width: min(560px, calc(100% - 24px)); background: rgba(17, 19, 22, 0.88); border: 1px solid var(--wb-line-strong); border-radius: 6px; padding: 7px 10px; font-size: 12.5px; color: var(--wb-muted); pointer-events: none; }
 .wb-readout b { color: var(--wb-text); font-weight: 500; }
 .wb-hints { position: absolute; right: 12px; bottom: 12px; font-size: 11.5px; color: var(--wb-faint); text-align: right; line-height: 1.6; pointer-events: none; }
+/* the progress card and the result card (studio.js busy, showResult), bottom center over the viewport; the hints
+   hide while one shows */
+.wb-busy, .wb-result { position: absolute; left: 50%; bottom: 16px; transform: translateX(-50%); width: min(500px, calc(100% - 32px)); background: rgba(17, 19, 22, 0.95); border: 1px solid var(--wb-line-strong); border-radius: 8px; padding: 10px 12px 12px; display: grid; gap: 8px; box-shadow: 0 8px 28px rgba(0, 0, 0, 0.4); z-index: 3; }
+.wb-busy[hidden], .wb-result[hidden], .wb-hints[hidden], .wb-busy [hidden] { display: none; }
+.wb-busy-head, .wb-rhead { display: flex; align-items: center; gap: 10px; }
+.wb-busy-title, .wb-rtitle { font-weight: 600; flex: 1; min-width: 0; }
+.wb-busy-time { color: var(--wb-muted); font-size: 12px; }
+.wb-busy-head kbd { margin-left: 4px; }
+.wb-busy-bar { height: 6px; border-radius: 3px; background: var(--wb-sunk); border: 1px solid var(--wb-line); overflow: hidden; }
+.wb-busy-bar span { display: block; height: 100%; width: 0; background: var(--wb-accent); border-radius: 3px; transition: width 0.3s ease; }
+/* moving, not filled: the share done is not known. A transform, so it keeps moving while the page computes */
+.wb-busy-bar--moving span { width: 28%; transition: none; animation: wb-busy-slide 1.5s ease-in-out infinite; }
+@keyframes wb-busy-slide { from { transform: translateX(-100%); } to { transform: translateX(360%); } }
+@media (prefers-reduced-motion: reduce) { .wb-busy-bar--moving span { animation: none; width: 100%; opacity: 0.4; } }
+.wb-busy-step { font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wb-busy-note { font-size: 12px; color: var(--wb-faint); }
+.wb-busy-note:empty { display: none; }
+/* the result card sits bottom right, beside the group table, so a group it zooms to stays in view */
+.wb-result { left: auto; right: 12px; bottom: 12px; transform: none; width: min(440px, calc(100% - 24px)); max-height: calc(100% - 200px); overflow: auto; }
+.wb-result--bad { border-color: #8a5a2a; }
+.wb-result--bad .wb-rtitle::before { content: "⚠ "; color: var(--wb-select); }
+.wb-rclose { padding: 2px 7px; }
+.wb-rlead { margin: 0; font-size: 12.5px; color: var(--wb-muted); }
+.wb-rgroups { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 1px; max-height: 112px; overflow: hidden auto; }
+.wb-rgroups button { width: 100%; display: flex; align-items: center; gap: 8px; background: transparent; border: 0; border-radius: 4px; padding: 3px 6px; cursor: pointer; text-align: left; font-size: 12.5px; }
+.wb-rgroups button:hover { background: var(--wb-raised); }
+.wb-rgroups b { font-weight: 500; white-space: nowrap; }
+.wb-rwhy { color: var(--wb-muted); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wb-rmore { color: var(--wb-faint); font-size: 12px; padding: 0 6px; }
+.wb-rsteps { display: grid; gap: 6px; border-top: 1px solid var(--wb-line); padding-top: 9px; }
+.wb-rstep { display: grid; grid-template-columns: 138px minmax(0, 1fr); gap: 10px; align-items: center; font-size: 12px; line-height: 1.35; color: var(--wb-muted); }
+.wb-rstep .wb-btn { width: 100%; color: var(--wb-text); }
+.wb-rstep .wb-btn.wb-primary { color: var(--wb-accent-ink); }
+/* the STEP preview (studio.js enterPreview): the STEP's canvas over the mesh's, clipped at the shutter, the mesh left
+   of it and the STEP right; Color by does not apply to it */
+.wb-view--preview .wb-colorby { display: none; }
+.wb-stepcanvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.wb-stepcanvas[hidden], .wb-shutter[hidden], .wb-shutter-tag[hidden] { display: none; }
+.wb-shutter { position: absolute; top: 0; bottom: 0; width: 0; z-index: 1; }
+.wb-shutter::before { content: ""; position: absolute; top: 0; bottom: 0; left: -1px; width: 2px; background: #f4f6f8; box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.3), 0 0 14px rgba(0, 0, 0, 0.45); pointer-events: none; }
+.wb-shutter-grip { position: absolute; top: 0; bottom: 0; left: -8px; width: 16px; cursor: ew-resize; touch-action: none; }
+.wb-shutter-handle { position: absolute; top: 50%; left: 0; transform: translate(-50%, -50%); width: 38px; height: 38px; border-radius: 50%; background: #f4f6f8; color: #111316; border: 1px solid rgba(0, 0, 0, 0.35); box-shadow: 0 2px 12px rgba(0, 0, 0, 0.5); display: grid; place-items: center; font: 600 12px/1 var(--wb-font); cursor: ew-resize; touch-action: none; user-select: none; }
+.wb-shutter-handle:focus-visible { outline: 2px solid var(--wb-accent); outline-offset: 2px; }
+.wb-shutter-tag { position: absolute; top: 14px; padding: 6px 10px; border-radius: 6px; background: rgba(17, 19, 22, 0.88); border: 1px solid var(--wb-line-strong); font: 600 12.5px/1 var(--wb-font-label); letter-spacing: 0.02em; white-space: nowrap; pointer-events: none; }
+.wb-shutter-tag--mesh { right: 10px; }
+.wb-shutter-tag--step { left: 10px; color: var(--wb-accent); }
+.wb-legend { z-index: 2; }
 .wb-toast { position: absolute; left: 50%; bottom: 56px; transform: translateX(-50%); background: var(--wb-text); color: var(--wb-bg); padding: 8px 14px; border-radius: 6px; font-size: 13px; font-weight: 500; max-width: calc(100% - 32px); pointer-events: none; }
 
 /* face groups */
@@ -185,5 +232,8 @@ div.wb-fixhead { cursor: default; }
   .wb-tablewrap { max-height: 60vh; }
   .wb-legend, .wb-hints, .wb-extra, .wb-tag, .wb-lbl, .wb-col-area { display: none; }
   .wb-colorby { top: auto; bottom: 52px; padding-left: 6px; }
+  .wb-busy, .wb-result { bottom: auto; top: 60px; }
+  .wb-result { left: 12px; right: 12px; width: auto; max-height: calc(100% - 72px); }
+  .wb-rstep { grid-template-columns: minmax(0, 1fr); gap: 4px; }
   .wb-colorby .wb-glabel, .wb-colorby kbd { display: none; }
 }

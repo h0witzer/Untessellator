@@ -207,6 +207,170 @@ const legendProbe = document.createElement('div');
 legendProbe.className = 'wb-probe';
 legend.append(legendBody, legendProbe);
 shell.stage.append(legend);
+
+// The progress card, over the viewport while auto-paint, an export or Repair runs: what it is doing, a bar (filled
+// to the share done where that is known, moving where it is not), the time so far, and Stop. One run at a time.
+const busyEl = document.createElement('div');
+busyEl.className = 'wb-busy';
+busyEl.setAttribute('role', 'status');
+busyEl.hidden = true;
+busyEl.innerHTML = `<div class="wb-busy-head"><span class="wb-busy-title"></span><span class="wb-busy-time mono"></span>
+  <button type="button" class="wb-btn wb-small" data-act="stop">Stop <kbd>Esc</kbd></button></div>
+  <div class="wb-busy-bar"><span></span></div><div class="wb-busy-step"></div><div class="wb-busy-note"></div>`;
+shell.stage.append(busyEl);
+const busy = {
+  onStop: null,
+  started: 0,
+  timer: 0,
+  /** Show the card for a run called `title`; `onStop` is what Stop and Esc do (null: no Stop); `note` a line under the bar. */
+  start(title, { onStop, note = '' }) {
+    hideResult();
+    this.onStop = onStop;
+    busyEl.querySelector('[data-act="stop"]').hidden = !onStop;
+    this.started = performance.now();
+    busyEl.querySelector('.wb-busy-title').textContent = title;
+    busyEl.querySelector('.wb-busy-note').textContent = note;
+    this.step('', null);
+    this.tick();
+    clearInterval(this.timer);
+    this.timer = setInterval(() => this.tick(), 1000);
+    busyEl.hidden = false;
+    shell.hint.hidden = true;
+  },
+  /** What the run is doing now, and the share of it done (0..1), or null when that is not known. */
+  step(text, done = null) {
+    busyEl.querySelector('.wb-busy-step').textContent = text;
+    const bar = busyEl.querySelector('.wb-busy-bar');
+    bar.classList.toggle('wb-busy-bar--moving', done === null);
+    bar.firstElementChild.style.width = done === null ? '' : `${Math.round(100 * Math.min(1, Math.max(0, done)))}%`;
+  },
+  tick() {
+    const s = Math.floor((performance.now() - this.started) / 1000);
+    busyEl.querySelector('.wb-busy-time').textContent = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+  },
+  end() {
+    clearInterval(this.timer);
+    this.onStop = null;
+    busyEl.hidden = true;
+    shell.hint.hidden = !resultEl.hidden;   // a run that ended in a result card leaves the card up
+  },
+};
+busyEl.addEventListener('click', (event) => { if (event.target.closest('[data-act="stop"]')) busy.onStop?.(); });
+/** A run's step, said in both places: the status line and the progress card (which has the run's name above it). */
+const progress = (text, done = null) => {
+  say(text);
+  const step = text.replace(/^(Auto-paint|Repair): /, '');
+  busy.step(step[0].toUpperCase() + step.slice(1), done);
+};
+
+// The result card, in the progress card's place: what an export check, a build or Repair found, the groups it is
+// about (each a link to the group), and what to do next, each step a button with a line on what it does.
+const resultEl = document.createElement('div');
+resultEl.className = 'wb-result';
+resultEl.setAttribute('role', 'dialog');
+resultEl.hidden = true;
+shell.stage.append(resultEl);
+let resultSteps = [];
+/**
+ * Show the result card: `title`, a `lead` sentence, `groups` ([id, why] pairs, worst first) and `steps`
+ * ([{ label, detail, primary?, onSelect }]). `bad` marks it as a problem. A new run or a new mesh closes it.
+ */
+function showResult({ title, lead = '', groups = [], steps = [], bad = false }) {
+  const SHOWN = 6;
+  resultSteps = steps;
+  resultEl.classList.toggle('wb-result--bad', bad);
+  resultEl.setAttribute('aria-label', title);
+  const row = ([id, why]) => {
+    const g = mesh?.store.groups.get(id);
+    if (!g) return '';
+    return `<li><button type="button" data-group="${id}" title="Select and zoom to ${esc(mesh.store.name(id))}">${typeIcon(g.type, g.type === 'skip' ? SKIP_RGB : TYPE_RGB[g.type ?? 'freeform'], 14)}<b>${esc(mesh.store.name(id))}</b><span class="wb-rwhy">${esc(why)}</span></button></li>`;
+  };
+  resultEl.innerHTML = `<div class="wb-rhead"><span class="wb-rtitle">${esc(title)}</span>
+      <button type="button" class="wb-iconbtn wb-rclose" data-act="close" aria-label="Close" title="Close (the ⚠ marks stay in the list)">✕</button></div>
+    ${lead ? `<p class="wb-rlead">${esc(lead)}</p>` : ''}
+    ${groups.length ? `<ul class="wb-rgroups">${groups.slice(0, SHOWN).map(row).join('')}</ul>${groups.length > SHOWN ? `<div class="wb-rmore">and ${groups.length - SHOWN} more, marked ⚠ in the list</div>` : ''}` : ''}
+    ${steps.length ? `<div class="wb-rsteps">${steps.map((s, i) => `<div class="wb-rstep"><button type="button" class="wb-btn wb-small${s.primary ? ' wb-primary' : ''}" data-step="${i}">${esc(s.label)}</button><span>${esc(s.detail)}</span></div>`).join('')}</div>` : ''}`;
+  resultEl.hidden = false;
+  shell.hint.hidden = true;
+}
+/** Close the result card; a STEP preview lasts as long as its card, so the view goes back to the mesh. */
+function hideResult() {
+  resultEl.hidden = true;
+  if (busyEl.hidden) shell.hint.hidden = false;
+  leavePreview();
+}
+
+// The STEP preview: after an export builds, its solid (each face as the kernel tessellates it, colored by its surface
+// type, its edges drawn) is drawn by a second renderer on a canvas over the mesh's, with the same camera, until it is
+// saved or the card is closed. A shutter cuts the two: the input mesh left of it, colored by type too, the STEP right.
+const stepCanvas = document.createElement('canvas');
+stepCanvas.className = 'wb-stepcanvas';
+stepCanvas.hidden = true;
+overlay.before(stepCanvas);
+/** The STEP's renderer: a WebGL context of its own, made at the first preview and kept. */
+let stepRenderer = null;
+const shutter = document.createElement('div');
+shutter.className = 'wb-shutter';
+shutter.hidden = true;
+shutter.innerHTML = `<span class="wb-shutter-tag wb-shutter-tag--mesh">Mesh</span><span class="wb-shutter-tag wb-shutter-tag--step">STEP · not saved yet</span>
+  <div class="wb-shutter-grip" title="Drag to compare the mesh with the STEP"></div>
+  <div class="wb-shutter-handle" role="slider" tabindex="0" aria-label="Shutter between the mesh, left, and the STEP, right" aria-valuemin="0" aria-valuemax="100">◂ ▸</div>`;
+shell.stage.append(shutter);
+/** The shutter's place, as a share of the view's width from the left: the mesh shows left of it. */
+let shutterAt = 0.5;
+function setShutter(at) {
+  shutterAt = Math.min(1, Math.max(0, at));
+  const pct = `${(100 * shutterAt).toFixed(2)}%`;
+  shutter.style.left = pct;
+  stepCanvas.style.clipPath = `inset(0 0 0 ${pct})`;
+  const handle = shutter.querySelector('.wb-shutter-handle');
+  handle.setAttribute('aria-valuenow', String(Math.round(100 * shutterAt)));
+  handle.setAttribute('aria-valuetext', `${Math.round(100 * shutterAt)}% mesh`);
+  // a tag with no room beside the shutter goes, rather than run off the view
+  const width = shell.stage.clientWidth;
+  shutter.querySelector('.wb-shutter-tag--mesh').hidden = shutterAt * width < 70;
+  shutter.querySelector('.wb-shutter-tag--step').hidden = (1 - shutterAt) * width < 170;
+}
+let shutterDrag = null;
+shutter.addEventListener('pointerdown', (event) => {
+  if (event.button !== 0 || !event.target.closest('.wb-shutter-grip, .wb-shutter-handle')) return;
+  event.preventDefault();
+  shutterDrag = event.pointerId;
+  event.target.setPointerCapture(event.pointerId);
+});
+shutter.addEventListener('pointermove', (event) => {
+  if (event.pointerId !== shutterDrag) return;
+  const rect = shell.stage.getBoundingClientRect();
+  setShutter((event.clientX - rect.left) / rect.width);
+});
+const endShutterDrag = (event) => { if (event.pointerId === shutterDrag) shutterDrag = null; };
+shutter.addEventListener('pointerup', endShutterDrag);
+shutter.addEventListener('pointercancel', endShutterDrag);
+shutter.addEventListener('keydown', (event) => {
+  const step = event.shiftKey ? 0.01 : 0.05;
+  const to = { ArrowLeft: shutterAt - step, ArrowRight: shutterAt + step, Home: 0, End: 1 }[event.key];
+  if (to === undefined) return;
+  event.preventDefault();
+  event.stopPropagation();
+  setShutter(to);
+});
+/** The preview on show: { current (the mesh it was built from), types (each face's) }, or null. */
+let previewing = null;
+resultEl.addEventListener('click', (event) => {
+  const el = event.target.closest('[data-act],[data-step],[data-group]');
+  if (!el) return;
+  if (el.dataset.act === 'close') hideResult();
+  else if (el.dataset.group) {
+    const id = Number(el.dataset.group);
+    if (!mesh?.store.groups.has(id)) return;
+    if (!(selection.size === 1 && selection.has(id))) selectGroup(id);   // selectGroup toggles a sole selection off
+    zoomTo(new Set([id]));
+  } else {
+    const step = resultSteps[Number(el.dataset.step)];
+    hideResult();
+    step?.onSelect();
+  }
+});
 const fileInput = document.createElement('input');
 fileInput.type = 'file';
 fileInput.accept = '.stl,.obj,.3mf';
@@ -318,6 +482,7 @@ window.studio = {
   get stroke() { return stroke; },
   get prepared() { return prepared; },
   get autoRun() { return autoRun; },
+  get previewing() { return previewing; },
   settings,
   camera,
 };
@@ -330,7 +495,9 @@ const dpr = () => window.devicePixelRatio || 1;
 
 async function openFile(file) {
   if (stroke || autoRun) { say('Finish or cancel (Esc) the stroke or auto-paint before opening another mesh', true); return; }
-  say(`Opening ${file.name}…`);
+  if (busy.onStop) { say('Stop the export first (Esc), or let it finish', true); return; }
+  busy.start(`Opening ${file.name}`, { onStop: null });
+  progress(`Opening ${file.name}…`);
   try {
     const loaded = await loadModelFile(file);
     const raw = loaded.geometry ?? loaded;
@@ -339,7 +506,7 @@ async function openFile(file) {
     // triangles. Caps the repair added are marked, so painting and fitting can leave them out (caps.js).
     let repair = null, synthetic = null;
     if (settings.repair) {
-      say(`Opening ${file.name}: checking the mesh…`);
+      progress(`Opening ${file.name}: checking the mesh…`);
       await new Promise((resolve) => setTimeout(resolve, 0));   // let the message show: a big mesh takes seconds
       const r = repairMesh(geometry.attributes.position.array);
       repair = r.report;
@@ -380,6 +547,8 @@ async function openFile(file) {
     const left = repair ? repairLeft(repair) : null;
     say([`${file.name}: ${model.count.toLocaleString()} triangles`, ...(fixed.length ? [`repaired: ${fixed.join(', ')}`] : []),
       ...(left ? [left] : [])].join(' · '), !!left);
+    // The geometry kernel starts loading in a worker now, so the first export doesn't wait for it.
+    warmKernel();
     // Adjacency and curvature take a moment on a big mesh: start now so the first stroke doesn't wait.
     // Seed scores for auto-paint too, so the button starts at once.
     const opened = mesh;
@@ -390,6 +559,8 @@ async function openFile(file) {
   } catch (error) {
     console.error(error);
     say(`Could not open ${file.name}: ${error.message}`, true);
+  } finally {
+    busy.end();
   }
 }
 
@@ -730,21 +901,28 @@ function coherenceFor(target) {
  * this works as a first pass or after the user has painted some faces. One undo step; Esc stops
  * and keeps what was painted.
  */
+/** The share of auto-paint's progress bar given to painting; typing and fitting the new groups take the rest. */
+const PAINT_SHARE = 0.8;
+
 async function runAutoPaint() {
   if (!mesh) return;
   if (stroke || autoRun) { say('Finish or cancel (Esc) the stroke or auto-paint first', true); return; }
   const current = mesh;
   const { store } = current;
   const started = performance.now();
-  autoRun = { stop: false };
+  const guard = autoRun = { stop: false };
   toolbar.setPressed('autopaint', true);
   setActive(null);
   setHover(null);
+  busy.start('Auto-painting', {
+    onStop: () => { guard.stop = true; },
+    note: 'Your own groups are left alone. Stop keeps the groups found so far.',
+  });
   let editOpen = false;
   try {
-    say('Auto-paint: preparing…');
+    progress('Auto-paint: preparing…');
     const { tool, mesh: paintMesh } = await preparePaint();
-    say('Auto-paint: scoring seeds…');
+    progress('Auto-paint: scoring seeds…');
     const caps = current.synthetic;
     const order = seedOrder(await coherenceFor(current), paintMesh.facets).filter((t) => !caps?.[t]);   // a cap seeds nothing
     if (autoRun.stop || mesh !== current) return;
@@ -752,6 +930,10 @@ async function runAutoPaint() {
     const refineUrl = await refineUrlFor(current);
     const created = [];
     const uiClock = { panel: 0, yield: performance.now() };
+    // The bar: painting is the first PAINT_SHARE of it, by triangles claimed (autoPaint counts the unpainted,
+    // non-degenerate ones); typing the new groups the rest (on a 37,000-triangle part, 122 s and 28 s).
+    let free0 = 0;
+    for (let t = 0; t < store.owner.length; t++) if (store.owner[t] < 0 && !paintMesh.facets.degenerate[t]) free0++;
     store.begin();
     editOpen = true;
     let lastSeed = -1;                            // autoPaint calls onSegment right after its seed's fill
@@ -799,12 +981,13 @@ async function runAutoPaint() {
         flushChanged();
       },
       shouldStop: () => autoRun.stop || mesh !== current,
-      onProgress: ({ segments, free }) => say(`Auto-paint: ${segments} groups · ${free.toLocaleString()} triangles left (Esc stops)`),
+      onProgress: ({ segments, free }) => progress(`Auto-paint: ${segments} groups · ${free.toLocaleString()} triangles left`,
+        PAINT_SHARE * (free0 ? 1 - free / free0 : 1)),
     });
     // Freeform faces back into one group each (js/freeformMerge.js): auto-paint knows only primitives and
     // carves a B-spline face into many. Only this run's groups, and only on a part made mostly of such
     // faces; the joined groups stay untyped, so the export fits them a B-spline. Part of the undo step.
-    say('Auto-paint: joining freeform pieces…');
+    progress('Auto-paint: joining freeform pieces…', PAINT_SHARE);
     const joined = Int32Array.from(store.owner);
     const { freeform } = tool.freeformMerge(joined, paintMesh.facets, paintMesh.adjacency, { only: new Set(created) });
     for (let t = 0; t < joined.length; t++) if (joined[t] !== store.owner[t]) store.assign(t, joined[t]);
@@ -818,19 +1001,24 @@ async function runAutoPaint() {
     for (const [id, tris] of byGroup) if (!tris.size) byGroup.delete(id);
     // Each finished group's export type (paintCore.typeFinalGroup): untyped groups get one, and a group
     // a simpler or truer primitive fits exactly takes it; freeform groups stay untyped.
-    say('Auto-paint: typing groups…');
+    progress('Auto-paint: typing groups…', PAINT_SHARE);
     // The learned typer decides where it is confident; it needs groups of 3 or more triangles. A model
     // that fails to load leaves every group to typeFinalGroup, as before.
     const learned = new Map();
     const typer = settings.groupTyper ? await tool.groupTyperFor(GROUP_TYPER).catch(() => null) : null;
+    // the bar's typing share: the typer's evidence for each group, then each group's type and fit
+    const typingDone = (from, share, k) => PAINT_SHARE + (1 - PAINT_SHARE) * (from + share * k / Math.max(1, byGroup.size));
     if (typer) {
       const rows = [];
+      let seen = 0;
       for (const [id, tris] of byGroup) {
+        seen++;
         if (freeform.has(id)) continue;
         const f = tool.groupTypeFeatures(tris, paintMesh.facets, paintMesh.adjacency, store.groups.get(id).type);
         if (f) rows.push([id, f]);
         const now = performance.now();
         if (now - uiClock.yield > 40) {
+          busy.step(`Weighing each group's type… ${seen} of ${byGroup.size}`, typingDone(0, 0.5, seen));
           await new Promise((resolve) => setTimeout(resolve, 0));
           uiClock.yield = performance.now();
         }
@@ -848,9 +1036,11 @@ async function runAutoPaint() {
         });
       }
     }
+    let typed = 0;
     for (const [id, tris] of byGroup) {
       const group = store.groups.get(id);
       const origin = current.origins.get(id);
+      typed++;
       if (freeform.has(id)) {
         group.type = null;
         if (origin) origin.typedBy = 'freeform merge';
@@ -868,6 +1058,7 @@ async function runAutoPaint() {
       refit(id, tris);
       const now = performance.now();
       if (now - uiClock.yield > 40) {
+        busy.step(`Typing and fitting groups… ${typed} of ${byGroup.size}`, typer ? typingDone(0.5, 0.5, typed) : typingDone(0, 1, typed));
         await new Promise((resolve) => setTimeout(resolve, 0));
         uiClock.yield = performance.now();
       }
@@ -889,6 +1080,7 @@ async function runAutoPaint() {
     say(`Auto-paint failed: ${error.message}`, true);
   } finally {
     autoRun = null;
+    busy.end();
     toolbar.setPressed('autopaint', false);
     flushChanged();   // groups the commit recolored apart from their neighbors
     edgesDirty = true;
@@ -1004,6 +1196,7 @@ function recolor(tris = null) {
   };
   if (tris) for (const t of tris) paint(t);
   else for (let t = 0; t < model.count; t++) paint(t);
+  if (previewing) return;                         // the preview holds the renderer; leavePreview uploads it all
   renderer.updateColours(colours, first, last);
   if (settings.deviation === 'deviation') renderer.updateLevels(mesh.levels, first, last);
   if (settings.deviation) legendDirty = true;
@@ -1041,6 +1234,7 @@ function setActive(id) {
 function editGroups(label, change) {
   if (!mesh) return;
   if (stroke || autoRun) { say('Finish or cancel (Esc) the stroke or auto-paint first', true); return; }
+  leavePreview();                                 // an edit is made on the groups, so they come back into view
   const { store } = mesh;
   store.begin();
   const touched = change(store) ?? [];
@@ -1097,6 +1291,7 @@ function groupMenu(id, event) {
 
 function undo() {
   if (!mesh || stroke || autoRun) return;
+  leavePreview();
   const label = mesh.store.undo();
   if (!label) return;
   afterHistory();
@@ -1105,6 +1300,7 @@ function undo() {
 
 function redo() {
   if (!mesh || stroke || autoRun) return;
+  leavePreview();
   const label = mesh.store.redo();
   if (!label) return;
   afterHistory();
@@ -1136,25 +1332,32 @@ async function exportStep({ checked = false } = {}) {
   if (!mesh) return;
   if (stroke || autoRun) { say('Finish or cancel (Esc) the stroke or auto-paint first', true); return; }
   const current = mesh;
-  const { store, model, name } = current;
+  const { store, name } = current;
   if (!store.list().length) { say('Paint at least one face group first', true); return; }
   toolbar.setDisabled('export', 'Exporting…');
   current.lastExport = null;                      // this attempt's result replaces any earlier one
+  // Stop (or Esc) ends the worker at once: a running kernel call cannot be interrupted any other way
+  const run = { abort: null };
+  busy.start('Exporting STEP', {
+    onStop: () => run.abort?.(),
+    note: `Most parts take seconds; past ${Math.round(EXPORT_HARD_STOP_S / 60)} minutes the mesh goes out as flat facets instead.`,
+  });
   try {
     const payload = await knitPayload(current);
     // Before the build, the groups that will come out wrong (knit/preflight.js), so they can be fixed now
     // rather than after minutes of building.
     if (!checked) {
-      say('Checking the groups…');
+      progress('Checking the groups…');
       await new Promise((resolve) => setTimeout(resolve, 0));
       const doubts = exportDoubts(payload);
       current.lastCheck = { groups: [...doubts.groups], mesh: doubts.mesh ?? null };   // for the conversion report
-      if (doubts.groups.size || doubts.mesh) { offerDoubts(doubts); return; }
+      if (doubts.groups.size || doubts.mesh) { busy.end(); offerDoubts(doubts); return; }
     }
     let result;
     try {
-      result = await knitInWorker({ ...payload, options: { deadline: EXPORT_DEADLINE_S } }, (text) => say(text), EXPORT_HARD_STOP_S);
+      result = await knitInWorker({ ...payload, options: { deadline: EXPORT_DEADLINE_S } }, progress, EXPORT_HARD_STOP_S, run);
     } catch (error) {
+      if (error.name === 'AbortError') throw error;
       // A single OCCT repair on badly fitting surfaces can run for most of an hour and cannot be
       // interrupted, so the worker is stopped and a fresh one exports the mesh itself. A build that throws
       // can leave the kernel's memory corrupt (its fallback then fails too: "table index is out of bounds"),
@@ -1162,26 +1365,166 @@ async function exportStep({ checked = false } = {}) {
       const timedOut = error.name === 'TimeoutError';
       say(timedOut
         ? `The surfaces took over ${Math.round(EXPORT_HARD_STOP_S / 60)} minutes to join; exporting the mesh as a faceted solid…`
-        : `The solid build failed (${error.message}); exporting the mesh as a faceted solid…`, true);
-      result = await knitInWorker({ ...payload, options: { mode: 'faceted' } }, (text) => say(text));
+        : `The solid build failed (${failureText(error.message)}); exporting the mesh as a faceted solid…`, true);
+      busy.step(timedOut ? 'The surfaces took too long to join: building the mesh as flat facets…' : 'The build failed: building the mesh as flat facets…');
+      result = await knitInWorker({ ...payload, options: { mode: 'faceted' } }, progress, Infinity, run);
       if (timedOut) result.report.timedOut = true;
       else result.report.failed = error.message;
     }
     const { step, report } = result;
     current.lastExport = report;                  // for the conversion report (report.js)
     if (!step) throw new Error('no shape came out of the build');
-    // Faces off their surfaces: the STEP waits while the user sees which groups failed and picks Repair or this
-    // export as it is (a stopped or failed build went out as the mesh itself, with no verdicts to repair from)
-    if (report.tier !== 'analytic' && !report.timedOut && !report.failed) { offerRepair(current, step, report); return; }
-    downloadFile(step, `${name}.stp`);
-    say(exportSummary(`${name}.stp`, report, model.count - store.painted), report.tier !== 'analytic');
+    busy.end();
+    // The solid on show, and the STEP waits for Save: fully analytic, it is ready; with faces off their surfaces,
+    // the card says which groups failed and offers Repair or this export as it is; a stopped or failed build
+    // went out as the mesh itself, with no verdicts to repair from. Without a preview, an analytic one saves now.
+    const shown = enterPreview(current, result);
+    if (report.timedOut || report.failed) offerAfterFacets(current, step, report);
+    else if (report.tier !== 'analytic') offerRepair(current, step, report);
+    else if (shown) offerSave(current, step, report);
+    else saveStep(current, step, report, `${name}.stp`);
   } catch (error) {
+    if (error.name === 'AbortError') { say('Export stopped: nothing was saved'); return; }
     console.error(error);
     current.lastExport ??= { failed: error.message };
-    say(`Export failed: ${error.message}`, true);
+    const why = failureText(error.message);
+    say(`Export failed: ${why}`, true);
+    showResult({
+      title: 'Export failed', bad: true,
+      lead: `${why[0].toUpperCase()}${why.slice(1)}. Nothing was saved. Exporting again usually gets past a one-off kernel failure; if it keeps failing, report it with the flag so the run can be replayed.`,
+      steps: [
+        { label: 'Export again', primary: true, detail: 'Builds the solid from the groups as they are now.', onSelect: () => exportStep({ checked: true }) },
+        { label: 'Report it', detail: 'Downloads a report file and opens a prefilled GitHub issue; nothing is sent until you submit it.', onSelect: () => reportConversion() },
+      ],
+    });
   } finally {
+    busy.end();
     refreshPanel();
   }
+}
+
+/**
+ * A failure in words: OCCT's uncaught WebAssembly exceptions reach the worker as a bare number (an exception
+ * pointer, such as "24"), which says nothing to the user. The report keeps the raw message.
+ */
+const failureText = (message) => (/^\d+$/.test(String(message ?? '').trim()) ? `the geometry kernel crashed, code ${message}` : String(message));
+
+/** A build that ran out of time or failed went out as the mesh: why, what to try, or save it so. */
+function offerAfterFacets(current, step, report) {
+  const file = `${current.name}.stp`;
+  say(`Not saved yet: ${report.timedOut ? 'the surfaces took too long to join' : 'the solid build failed'}, so only the mesh built`, true);
+  showResult({
+    title: 'Not saved yet: only the mesh built', bad: true,
+    lead: report.timedOut
+      ? `Joining the fitted surfaces took over ${Math.round(EXPORT_HARD_STOP_S / 60)} minutes, so the file would hold the mesh as flat facets. That usually means some groups sit badly on their surfaces.`
+      : `The solid build failed (${failureText(report.failed)}), so the file would hold the mesh as flat facets.`,
+    steps: [
+      { label: 'Show likely-wrong groups', primary: true, detail: 'Colors the part by fit: red groups are off their surfaces. Repaint or retype them, then export again.', onSelect: () => showNeedsALook() },
+      { label: 'Repair automatically', detail: 'Builds the solid and tries other types and merges where faces fail, keeping only what helps; each change is an undo step.', onSelect: () => repairInView() },
+      { label: 'Save as flat facets', detail: 'Downloads the mesh as a faceted solid now.', onSelect: () => saveStep(current, step, report, file) },
+    ],
+  });
+}
+
+/** Download an export and say what it holds. */
+function saveStep(current, step, report, file) {
+  downloadFile(step, file);
+  say(exportSummary(file, report, current.model.count - current.store.painted), report.tier !== 'analytic');
+}
+
+/** A fully analytic build, on show: save it, or go back to the groups. */
+function offerSave(current, step, report) {
+  const file = `${current.name}.stp`;
+  const counts = new Map();
+  for (const t of previewing?.types ?? []) counts.set(t, (counts.get(t) ?? 0) + 1);
+  const kinds = SURFACE_KINDS.filter((t) => counts.has(t)).map((t) => `${counts.get(t)} ${typeLabel(t).toLowerCase()}${counts.get(t) === 1 || t === 'freeform' ? '' : 's'}`);
+  say(`Ready to save: ${file}, a closed solid with every face on its fitted surface`);
+  showResult({
+    title: `Ready: ${file}`,
+    lead: `A closed solid, every face on its fitted surface${previewing ? `: ${previewing.types.length} faces (${kinds.join(', ')})` : ''}. Turn it to check it, then save.`,
+    steps: [
+      { label: 'Save STEP', primary: true, detail: `Downloads ${file}.`, onSelect: () => saveStep(current, step, report, file) },
+      { label: 'Back to editing', detail: 'Returns to the painted groups; nothing is saved.', onSelect: () => {} },
+    ],
+  });
+}
+
+/**
+ * Show export `result`'s solid over the mesh, cut by the shutter; false when the worker sent no preview. The mesh
+ * side is colored by type for the while, so a face reads the same color on both sides of the shutter.
+ */
+function enterPreview(current, result) {
+  const p = result.preview;
+  if (!p?.faces || mesh !== current) return false;
+  try {
+    stepRenderer ??= createRenderer(stepCanvas);
+  } catch (error) {
+    console.warn('no STEP preview:', error.message);
+    return false;
+  }
+  const [ox, oy, oz] = current.offset;                // the export went back where the file had it; the view is centred
+  const offset = [ox, oy, oz];
+  const positions = Float32Array.from(p.positions, (v, i) => v - offset[i % 3]);
+  const edges = Float32Array.from(p.edges, (v, i) => v - offset[i % 3]);
+  const count = p.face.length;
+  const { types } = p;
+  const colours = new Float32Array(count * 9);
+  for (let t = 0; t < count; t++) {
+    const rgb = TYPE_RGB[types[p.face[t]]];
+    for (let k = 0; k < 3; k++) colours.set(rgb, t * 9 + k * 3);
+  }
+  stepRenderer.setMesh({ count, positions, facetNormals: p.normals, smoothNormals: p.normals });
+  stepRenderer.updateColours(colours, 0, count - 1);
+  stepRenderer.setBands('edges', edges);
+  // the mesh side, by type: its groups' surfaces in the same palette (recolor leaves the renderer alone meanwhile)
+  const { store, model } = current;
+  const byType = new Float32Array(model.count * 9);
+  for (let t = 0; t < model.count; t++) {
+    const g = store.groups.get(store.owner[t]);
+    const rgb = !g ? UNPAINTED : g.type === 'skip' ? SKIP_RGB : TYPE_RGB[g.type ?? 'freeform'];
+    for (let k = 0; k < 3; k++) byType.set(rgb, t * 9 + k * 3);
+  }
+  setHover(null);
+  renderer.updateColours(byType, 0, model.count - 1);
+  renderer.setHeat(false);
+  renderer.setBands('active', null);
+  previewing = { current, types };
+  // the legend: the solid's faces by type
+  const counts = new Map();
+  for (const t of types) counts.set(t, (counts.get(t) ?? 0) + 1);
+  legendBody.innerHTML = `<span class="wb-ltitle">STEP preview · ${types.length.toLocaleString()} faces</span>`
+    + SURFACE_KINDS.filter((t) => counts.has(t)).map((t) => `<div class="wb-keyrow">${typeIcon(t, TYPE_RGB[t], 14)}<span>${typeLabel(t)}</span><span class="mono">${counts.get(t).toLocaleString()}</span></div>`).join('')
+    + '<span class="wb-lnote">Drag the shutter: the mesh left of it, the STEP right. On the STEP, a dense web of edges is flat facets.</span>';
+  legendProbe.textContent = '';
+  legend.hidden = false;
+  shell.stage.classList.add('wb-view--preview');
+  stepCanvas.hidden = false;
+  shutter.hidden = false;
+  setShutter(0.5);
+  cursor = null;
+  drawCursor();
+  requestRender();
+  return true;
+}
+
+/** Back from the preview to the painted mesh, as it was. */
+function leavePreview() {
+  if (!previewing) return;
+  const { current } = previewing;
+  previewing = null;
+  shell.stage.classList.remove('wb-view--preview');
+  stepCanvas.hidden = true;
+  shutter.hidden = true;
+  shutterDrag = null;
+  if (mesh === current) {
+    const { model } = mesh;
+    renderer.updateColours(mesh.colours, 0, model.count - 1);
+    renderer.updateLevels(mesh.levels, 0, model.count - 1);
+    renderer.setHeat(settings.deviation === 'deviation');
+  }
+  edgesDirty = true;
+  legendDirty = true;
+  requestRender();
 }
 
 /**
@@ -1200,7 +1543,7 @@ async function knitPayload(current) {
     facets = buildFacets(P);
     attachCurvature(P, facets);
   }
-  say(`Fitting ${groups.length} groups…`);
+  progress(`Fitting ${groups.length} groups…`);
   const surfaces = [];
   for (const group of groups) {
     if (!group.type || group.type === 'skip') continue;   // no surface: facets; skipped: below
@@ -1342,20 +1685,30 @@ function exportDoubts({ positions, labels, surfaces }) {
   return { groups, mesh: holes.length ? `the mesh has ${holes.join(' and ')}, so the export will not be a closed solid` : null };
 }
 
-/** Say what the check found, mark the groups in the panel, and offer to show them or export anyway. */
+/** Say what the check found, mark the groups in the panel, and offer fixes, a look at them, or export anyway. */
 function offerDoubts({ groups, mesh: meshDoubt }) {
   mesh.flags = groups;
   mesh.showFlags = false;
   const n = groups.size;
-  const lines = [...groups].slice(0, 3).map(([id, why]) => `${mesh.store.name(id)}: ${why[0]}`);
-  say([...(n ? [`${n} group${n > 1 ? 's' : ''} will likely come out wrong (⚠ in the list)`] : []), ...(meshDoubt ? [meshDoubt] : []),
-    ...lines, ...(n > 3 ? [`and ${n - 3} more`] : [])].join(' · '), true);
+  const them = `${n} group${n > 1 ? 's' : ''}`;
+  say([...(n ? [`${them} will likely come out wrong (⚠ in the list)`] : []), ...(meshDoubt ? [meshDoubt] : [])].join(' · '), true);
   refreshPanel();
-  const button = toolbar.get('export');
-  ui.openMenu([
-    ...(n ? [{ id: 'show', label: `Show the ${n} group${n > 1 ? 's' : ''}`, onSelect: () => showDoubts() }] : []),
-    { id: 'export', label: 'Export anyway', onSelect: () => exportStep({ checked: true }) },
-  ], { anchor: button.parentElement, align: 'right' });
+  showResult({
+    title: n ? `Before exporting: ${them} will likely come out wrong` : 'Before exporting: the mesh is open',
+    bad: true,
+    lead: [
+      ...(n ? [`Each sits badly on its surface, so its face would fail or come out as flat facets. Click one to zoom to it.`] : []),
+      ...(meshDoubt ? [`${meshDoubt[0].toUpperCase()}${meshDoubt.slice(1)}.`] : []),
+    ].join(' '),
+    groups: [...groups].map(([id, why]) => [id, why[0]]),
+    steps: [
+      ...(n ? [
+        { label: 'Find fixes', primary: true, detail: 'Looks for re-fills and merges that put these triangles on a surface; review and apply them under Fix bad areas.', onSelect: () => findFixes() },
+        { label: 'Fix by hand', detail: 'Outlines them. A group spanning two faces: repaint it with the bucket. A narrow curve: set its type under Fit as, or merge it into its neighbor.', onSelect: () => showDoubts() },
+      ] : []),
+      { label: 'Export anyway', detail: n ? 'Builds the solid as it is: where these faces fail, you can still save with them as flat facets.' : 'Builds what it can: the file will be an open shell, not a solid.', onSelect: () => exportStep({ checked: true }) },
+    ],
+  });
 }
 
 /** The triangles whose group is in `ids`. */
@@ -1460,6 +1813,7 @@ function renderColorBy() {
 }
 /** Color the part by groups, type, fit or deviation. Turning to fit also runs the export check, for its flags. */
 function setColorBy(mode) {
+  leavePreview();
   const was = settings.deviation;
   settings.deviation = mode;
   renderColorBy();
@@ -1668,6 +2022,7 @@ function pickGroup(event) {
 /** Pick a group: alone, added (Ctrl), or a run of the table's rows (Shift). */
 function selectGroup(id, event = {}) {
   if (!mesh) return;
+  leavePreview();                                 // a group picked from a card or the table is shown on the mesh
   if (id === null) { selection = new Set(); active = null; }
   else if (event.shiftKey && table.anchor !== null) {
     const rows = visibleRows().map((r) => r.id);
@@ -1758,6 +2113,7 @@ function arcDegrees(type, p, list) {
 async function findFixes() {
   if (!mesh || fixes.busy) return;
   if (stroke || autoRun) { say('Finish or cancel (Esc) the stroke or auto-paint first', true); return; }
+  leavePreview();
   const current = mesh, { store, model } = current;
   fixes.busy = true;
   fixes.open = true;
@@ -1940,29 +2296,64 @@ function shifted(p, d) {
 const EXPORT_DEADLINE_S = 150;
 const EXPORT_HARD_STOP_S = 240;
 
-/** js/knit/worker.js, once per export (the kernel's memory goes with it); rejects with TimeoutError after `limitS`. */
-function knitInWorker(payload, onStatus, limitS = Infinity) {
+/**
+ * The next export's or Repair's worker, its kernel already loading (js/knit/worker.js loads it as it starts, about
+ * 50 MB the first time). Each worker does one build, since a build that throws can leave the kernel's memory
+ * corrupt; a new one warms when a mesh opens and once the last is gone, so one kernel is in memory at a time.
+ */
+let warmWorker = null;
+const KNIT_WORKER = new URL('../knit/worker.js', import.meta.url);
+function warmKernel() {
+  if (warmWorker) return;
+  const worker = new Worker(KNIT_WORKER, { type: 'module' });
+  worker.onerror = () => { worker.terminate(); if (warmWorker === worker) warmWorker = null; };
+  warmWorker = worker;
+}
+/** The warm worker for a build, or a cold one when none is warming. */
+function takeWorker() {
+  const worker = warmWorker ?? new Worker(KNIT_WORKER, { type: 'module' });
+  warmWorker = null;
+  worker.onerror = null;
+  return worker;
+}
+
+/**
+ * A build in a worker (takeWorker); rejects with TimeoutError after `limitS`. onStatus(text, done) gets each step,
+ * with the share done (0..1) where it is known. `run.abort` is set to stop it: the worker goes and the promise
+ * rejects with AbortError.
+ */
+function knitInWorker(payload, onStatus, limitS = Infinity, run = {}) {
   return new Promise((resolve, reject) => {
-    const worker = new Worker(new URL('../knit/worker.js', import.meta.url), { type: 'module' });
-    const timer = Number.isFinite(limitS) ? setTimeout(() => {
-      worker.terminate();
-      const error = new Error(`the solid build took longer than ${limitS} s`);
-      error.name = 'TimeoutError';
+    const worker = takeWorker();
+    let timer = null;
+    const finish = () => { clearTimeout(timer); worker.terminate(); warmKernel(); };   // the next build's kernel loads now
+    if (Number.isFinite(limitS)) {
+      timer = setTimeout(() => {
+        finish();
+        const error = new Error(`the solid build took longer than ${limitS} s`);
+        error.name = 'TimeoutError';
+        reject(error);
+      }, limitS * 1000);
+    }
+    run.abort = () => {
+      finish();
+      const error = new Error('stopped');
+      error.name = 'AbortError';
       reject(error);
-    }, limitS * 1000) : null;
+    };
     worker.onmessage = ({ data }) => {
       if (data.type === 'status') onStatus(data.text);
       else if (data.type === 'progress') {
-        onStatus(data.freeform ? `Fitting freeform surfaces… ${data.freeform} of ${data.of}` : `Building the solid… attempt ${data.builds}`);
+        if (data.freeform) onStatus(`Fitting freeform surfaces… ${data.freeform} of ${data.of}`, data.freeform / data.of);
+        else onStatus(`Building the solid… attempt ${data.builds}`);
       }
       else {
-        clearTimeout(timer);
-        worker.terminate();
+        finish();
         if (data.type === 'done') resolve(data);
         else reject(new Error(data.message));
       }
     };
-    worker.onerror = (event) => { clearTimeout(timer); worker.terminate(); reject(new Error(event.message || 'the export worker failed')); };
+    worker.onerror = (event) => { finish(); reject(new Error(event.message || 'the export worker failed')); };
     worker.postMessage(payload);
   });
 }
@@ -1979,7 +2370,7 @@ function exportSummary(file, report, unpainted) {
     parts.push(report.timedOut
       ? `Exported ${file} as the mesh, a faceted solid: joining the fitted surfaces took too long`
       : report.failed
-        ? `Exported ${file} as the mesh, a faceted solid: the solid build failed (${report.failed})`
+        ? `Exported ${file} as the mesh, a faceted solid: the solid build failed (${failureText(report.failed)})`
         : `Exported ${file}: the surfaces would not join into a solid, so this is the mesh as a faceted solid`);
   } else {
     parts.push(`Exported ${file}, but it is NOT a closed solid` +
@@ -2044,15 +2435,22 @@ function offerRepair(current, step, report) {
   const what = report.tier === 'none' ? 'it is not a closed solid'
     : report.tier === 'faceted' ? 'it is the mesh as flat facets'
       : `${pct(report.facetArea)} of the area is flat facets`;
-  say(`Not saved yet: ${what}${n ? `, from ${groups} the kernel rejected (⚠ in the list)` : ''}. Repair tries other types and merges on them in view; or save it as it is`, true);
-  ui.openMenu([
-    { id: 'repair', label: n ? `Repair the ${groups}` : 'Repair the groups', onSelect: () => repairInView() },
-    ...(n ? [{ id: 'show', label: `Show the ${groups}`, onSelect: () => showDoubts() }] : []),
-    { id: 'save', label: report.tier === 'none' ? 'Save it anyway (not a closed solid)' : 'Save it as it is', onSelect: () => {
-      downloadFile(step, file);
-      say(exportSummary(file, report, current.model.count - current.store.painted), true);
-    } },
-  ], { anchor: toolbar.get('export').parentElement, align: 'right' });
+  say(`Not saved yet: ${what}${n ? `, from ${groups} the kernel rejected (⚠ in the list)` : ''}`, true);
+  const lead = report.tier === 'none'
+    ? `The faces would not close into a solid${report.free_edges ? ` (${report.free_edges.toLocaleString()} open edges)` : ''}.`
+    : report.tier === 'faceted' ? 'The fitted surfaces would not join, so the file would hold the mesh as flat facets throughout.'
+      : `The solid closes, but ${pct(report.facetArea)} of its area would go out as flat facets where faces would not join.`;
+  showResult({
+    title: n ? `Not saved yet: ${groups} would not build` : `Not saved yet: ${what}`,
+    bad: true,
+    lead: `${lead}${n ? ' The kernel rejected these groups; click one to zoom to it.' : ''}`,
+    groups: [...flags].map(([id, why]) => [id, why.join('; ')]),
+    steps: [
+      { label: 'Repair automatically', primary: true, detail: 'Tries other surface types and merges on the failing groups, keeping only what makes the solid better; each change is an undo step. Then export again.', onSelect: () => repairInView() },
+      ...(n ? [{ label: 'Fix by hand', detail: 'Outlines them: repaint a group that spans two faces, change its type under Fit as, or merge it into a neighbor. Then export again.', onSelect: () => showDoubts() }] : []),
+      { label: report.tier === 'none' ? 'Save anyway' : 'Save as it is', detail: report.tier === 'none' ? 'Downloads it now; it will not be a closed solid.' : 'Downloads it now, with those areas as flat facets.', onSelect: () => saveStep(current, step, report, file) },
+    ],
+  });
 }
 
 /**
@@ -2078,7 +2476,7 @@ async function repairInView() {
   const known = new Set(payload.labels);         // the groups as sent; any other label is a freeform piece
   const made = new Map();                        // freeform pieces the repair made groups of: label -> id
   const idOf = (label) => (known.has(label) ? label : made.get(label) ?? null);
-  const worker = new Worker(new URL('../knit/worker.js', import.meta.url), { type: 'module' });
+  const worker = takeWorker();
   const started = performance.now();
   let kept = 0;
   let ended = false;
@@ -2086,31 +2484,38 @@ async function repairInView() {
     if (ended) return;
     ended = true;
     worker.terminate();
+    warmKernel();                                 // the next build's kernel loads now
     autoRun = null;
     current.lastRepair = { ok: !!result?.ok, kept, stopped: !result, secs: Math.round((performance.now() - started) / 100) / 10,
                            moves: result?.moves ?? null };        // for the conversion report
     if (result) { current.flags = kernelFlags(result.problems, idOf, current.store); current.showFlags = false; }
+    busy.end();
     setActive(null);
     refreshPanel();
     say(text, bad);
+    if (result && mesh === current) offerAfterRepair(current, result.ok);
   };
   const changes = () => `${kept} change${kept === 1 ? '' : 's'}${kept ? ' (each an undo step)' : ''}`;
   // auto-paint's guard: no strokes, edits or exports while it runs; Esc, which sets stop, ends it at once
-  autoRun = {
+  const guard = autoRun = {
     what: 'Repairing the groups',
     get stop() { return ended; },
     set stop(value) { if (value) end(`Repair stopped: kept ${changes()}`, false); },
   };
+  busy.start('Repairing the groups', {
+    onStop: () => { guard.stop = true; },
+    note: 'Each change it keeps lands now as its own undo step; Stop keeps the changes made so far.',
+  });
   toolbar.setDisabled('export', 'Repairing the groups (Esc stops it)');
   worker.onmessage = ({ data }) => {
     if (ended) return;
     if (mesh !== current) { end('Repair stopped: another mesh was opened', true); return; }
-    if (data.type === 'status') say(`Repair: ${data.text}`);
+    if (data.type === 'status') progress(`Repair: ${data.text}`);
     else if (data.type === 'progress') {
-      if (data.freeform) say(`Repair: fitting freeform surfaces… ${data.freeform} of ${data.of}`);
+      if (data.freeform) progress(`Repair: fitting freeform surfaces… ${data.freeform} of ${data.of}`, data.freeform / data.of);
       else if (data.trying) {
         const move = repairMoveText(current, data.trying, idOf);
-        say(`Repair: trying ${data.trying.move === 'retype' ? move : `to ${move}`}… (${kept} kept so far)`);
+        progress(`Repair: trying ${data.trying.move === 'retype' ? move : `to ${move}`}… (${kept} kept so far)`);
         const id = data.trying.group !== undefined ? idOf(data.trying.group) : null;
         if (id !== null && current.store.groups.has(id)) setActive(id);
       }
@@ -2128,8 +2533,32 @@ async function repairInView() {
     } else end(`Repair failed: ${data.message}`, true);
   };
   worker.onerror = (event) => end(`Repair failed: ${event.message || 'the worker stopped'}`, true);
-  say('Repair: building the solid to find what fails…');
+  progress('Repair: building the solid to find what fails…');
   worker.postMessage({ ...payload, repair: true });
+}
+
+/** After a finished Repair: export now, or what still fails and how to fix it by hand. */
+function offerAfterRepair(current, ok) {
+  const left = [...current.flags].map(([id, why]) => [id, why.join('; ')]);
+  const n = left.length;
+  if (ok) {
+    showResult({
+      title: 'Repaired: every face now builds',
+      lead: 'The groups build a closed solid with every face on its surface. Export to save it.',
+      steps: [{ label: 'Export STEP', primary: true, detail: 'Builds the solid again from the groups as they are now and downloads it.', onSelect: () => exportStep({ checked: true }) }],
+    });
+    return;
+  }
+  showResult({
+    title: n ? `Repair helped where it could: ${n} group${n === 1 ? '' : 's'} still fail` : 'Repair could not close the solid',
+    bad: true,
+    lead: n ? 'No other type or merge it tried made these faces build. Click one to zoom to it.' : 'No change it tried made the solid close.',
+    groups: left,
+    steps: [
+      ...(n ? [{ label: 'Fix by hand', primary: true, detail: 'Outlines them: repaint a group that spans two faces, change its type under Fit as, or merge it into a neighbor.', onSelect: () => showDoubts() }] : []),
+      { label: 'Export anyway', detail: 'Builds the solid as it is; where faces still fail, you can save with them as flat facets.', onSelect: () => exportStep({ checked: true }) },
+    ],
+  });
 }
 
 /** A repair move in words, as its undo step is named: "Cone 12 as a cylinder", "merge Plane 4 into its neighbors". */
@@ -2538,6 +2967,7 @@ function openFillMenu() {
 // ── hover and cursor ──────────────────────────────────────────────────────────
 
 function setHover(key, triangle = -1) {
+  if (previewing) key = null;                     // the preview's triangles are not the mesh's
   if (key === hoverKey) return;
   hoverKey = key;
   let ends = null;
@@ -2555,6 +2985,7 @@ function setHover(key, triangle = -1) {
 }
 
 function updateHover(point) {
+  if (previewing) return;
   const centre = mesh ? renderer.pick(point.x, point.y, 0).centre : -1;
   if (settings.deviation) showProbe(centre);
   if (!mesh || (strokeMode() !== 'fill' && strokeMode() !== 'select')) { setHover(null); return; }
@@ -2570,7 +3001,7 @@ function drawCursor() {
   context.clearRect(0, 0, overlay.width, overlay.height);
   const mode = strokeMode();
   canvas.classList.toggle('studio-canvas--brush', mode === 'raw' || mode === 'erase');
-  if (!cursor || !mesh || mode === 'fill' || mode === 'select') return;
+  if (!cursor || !mesh || previewing || mode === 'fill' || mode === 'select') return;
   const ratio = dpr();
   context.beginPath();
   context.arc(cursor.x * ratio, cursor.y * ratio, settings.brushPx * ratio, 0, 2 * Math.PI);
@@ -2603,7 +3034,8 @@ canvas.addEventListener('pointerdown', (event) => {
   } else if (event.button === 2) {
     orbiting = { x: event.clientX, y: event.clientY, moved: 0 };
   } else if (event.button === 0) {
-    if (strokeMode() === 'select') pickGroup(event);
+    if (previewing) say('This is the STEP preview: save it from the card, or go back to editing (Esc) to paint');
+    else if (strokeMode() === 'select') pickGroup(event);
     else beginStroke(event);
   }
 });
@@ -2636,7 +3068,7 @@ canvas.addEventListener('pointerup', (event) => {
     const press = orbiting;
     orbiting = null;
     // A right button released where it went down is a click: the menu for what is there.
-    if (press.moved <= 4 && mesh) {
+    if (press.moved <= 4 && mesh && !previewing) {
       const point = devicePoint(event);
       const { centre } = renderer.pick(point.x, point.y, 0);
       if (centre >= 0 && mesh.store.owner[centre] >= 0) groupMenu(mesh.store.owner[centre], event);
@@ -2666,7 +3098,12 @@ window.addEventListener('keydown', (event) => {
   if (mod && key === 'z') { event.preventDefault(); if (event.shiftKey) redo(); else undo(); }
   else if (mod && key === 'y') { event.preventDefault(); redo(); }
   else if (mod && key === 'o') { event.preventDefault(); fileInput.click(); }
-  else if (event.key === 'Escape') { if (autoRun) autoRun.stop = true; else cancelStroke(); }
+  else if (event.key === 'Escape') {
+    if (autoRun) autoRun.stop = true;
+    else if (busy.onStop) busy.onStop();
+    else if (previewing) hideResult();
+    else cancelStroke();
+  }
   else if (event.key === ' ') { event.preventDefault(); setActive(null); }
   else if ((event.key === 'Delete' || event.key === 'Backspace') && active !== null) deleteGroup(active);
   else if (event.key === '[' || event.key === ']') {
@@ -2708,19 +3145,19 @@ function frame(now) {
   }
   // The deviation views: a new set of flags (the export check's, or a Repair's kernel rejections) changes
   // verdicts; groups refit since the last frame are recolored in one pass over the mesh.
-  if (mesh && settings.deviation && mesh.verdictFlags !== mesh.flags) {
+  if (mesh && !previewing && settings.deviation && mesh.verdictFlags !== mesh.flags) {
     mesh.verdictFlags = mesh.flags;
     recolor();
     if (!autoRun) refreshPanel();
   }
-  if (mesh?.refitted.size) {
+  if (mesh?.refitted.size && !previewing) {
     if (settings.deviation) recolor(trianglesOf(mesh.store.owner, mesh.refitted));
     mesh.refitted.clear();
     if (!autoRun) refreshPanel();   // auto-paint redraws the panel on its own clock
   }
-  if (legendDirty && mesh && settings.deviation && (!autoRun || now - lastEdgeBuild > 500)) drawLegend();
+  if (legendDirty && mesh && !previewing && settings.deviation && (!autoRun || now - lastEdgeBuild > 500)) drawLegend();
   // While auto-paint runs, edges are rebuilt at most twice a second rather than after every fill.
-  if (edgesDirty && mesh && (!autoRun || now - lastEdgeBuild > 500)) {
+  if (edgesDirty && mesh && !previewing && (!autoRun || now - lastEdgeBuild > 500)) {
     lastEdgeBuild = now;
     const { model, store } = mesh;
     renderer.setBands('edges', workbenchEdges(model, store));
@@ -2743,12 +3180,18 @@ function frame(now) {
     const projection = settings.perspective
       ? ui.perspective(FOV, width / height, Math.max(camera.distance * 1e-3, camera.distance - 2 * reach), camera.distance + 2 * reach)
       : ui.orthographic(halfHeight(), width / height, camera.distance - 2 * reach, camera.distance + 2 * reach);
-    renderer.draw({
+    const look = {
       view, projection, width, height, ratio,
       occlusionPercent: settings.occlusion ? ui.LIGHTING.occlusion.percent : 0,
       occlusionRadius: radius * 0.06,
       edges: settings.edges,
-    });
+    };
+    renderer.draw(look);
+    // the STEP preview, through the same camera; the shutter clips its canvas
+    if (previewing) {
+      if (stepCanvas.width !== width || stepCanvas.height !== height) { stepCanvas.width = width; stepCanvas.height = height; }
+      stepRenderer.draw(look);
+    }
     corner.update();
     // captureView: the canvas is read now, in the task that drew it, before the browser presents and clears it
     if (viewCapture) {

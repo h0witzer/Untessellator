@@ -77,8 +77,11 @@ page has to be served; opening `index.html` directly from disk leaves it blank.
 
    Paint geometry the import mangled as **Skip**: it is left out of fitting and the checks, and the
    export heals it over with the group around it, or drops it if nothing painted borders it.
-5. Press **Export STEP**. The report says what you got: a fully analytic solid, or which regions
-   fell back to flat facets and why.
+5. Press **Export STEP**. The solid it builds appears over the mesh, so you can turn it and check it before
+   you save; drag the shutter across the view to compare the mesh, on the left, with the STEP, on the right.
+   A card says what you got. If it's a fully analytic solid, press **Save STEP**.
+   If not, the card lists the groups that failed and why, and offers **Repair automatically**, fixing them
+   by hand, or saving the file with those areas as flat facets.
 
 The first export downloads the OpenCASCADE WebAssembly build. It's large, and the browser caches it
 afterwards.
