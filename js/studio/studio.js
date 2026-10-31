@@ -61,7 +61,8 @@ const EDGE_WALL_TYPES = ['cylinder', 'cone', 'sphere', 'torus'];
 import { buildMeshModel, bodyEdges, outline } from './meshModel.js';
 import { createRenderer } from './renderer.js';
 import { GroupStore, typeLabel } from './groups.js';
-import { conversionNumbers, reportUrl } from './report.js';
+import { conversionNumbers, reportUrl, reportJson, placeGroups, binaryStl, fingerprint } from './report.js';
+import { zipSync, strToU8 } from 'fflate';
 
 const UNPAINTED = [0.74, 0.74, 0.74];
 const FOV = ui.LIGHTING.fieldOfViewDegrees;
@@ -278,7 +279,9 @@ async function openFile(file) {
     for (let i = 0; i < colours.length; i += 3) colours.set(UNPAINTED, i);
     mesh = { model, geometry, name: file.name.replace(/\.[^.]+$/, ''), store: new GroupStore(model.count), colours,
              offset: loaded.offset ?? [0, 0, 0],   // the loader centred the mesh; the export moves it back
-             repair, synthetic, flags: new Map(), showFlags: false };
+             repair, synthetic, flags: new Map(), showFlags: false,
+             // how each group came to be, for the conversion report (report.js): group id -> origin
+             origins: new Map() };
     active = null;
     hoverKey = null;
     paintPromise = null;
@@ -441,6 +444,8 @@ function strokeGroup(t) {
     const { store } = mesh;
     const owner = store.owner[t];
     stroke.gid = owner >= 0 ? owner : store.create(groupTypeFor(settings.type)).id;
+    if (owner < 0) mesh.origins.set(stroke.gid, { by: 'stroke', tool: stroke.mode, declared: settings.type, seed: t });
+    else if (mesh.origins.has(owner)) mesh.origins.get(owner).edited = true;
     stroke.anchor = t;
     setActive(stroke.gid);
   }
@@ -668,18 +673,24 @@ async function runAutoPaint() {
     const uiClock = { panel: 0, yield: performance.now() };
     store.begin();
     editOpen = true;
+    let lastSeed = -1;                            // autoPaint calls onSegment right after its seed's fill
     const result = await autoPaint({
       facets: paintMesh.facets,
       order,
       owner: store.owner,
-      fill: (seed, taken) => tool.paintAt(seed, paintMesh, {
-        method: settings.autoMethod, type: 'auto', modelUrl: settings.model, taken, extended, reportFit: false,
-        grow: { ...growOptions(), ...(settings.autoTangent ? { tangent: AUTO_TANGENT } : {}) }, refineUrl,
-      }),
+      fill: (seed, taken) => {
+        lastSeed = seed;
+        return tool.paintAt(seed, paintMesh, {
+          method: settings.autoMethod, type: 'auto', modelUrl: settings.model, taken, extended, reportFit: false,
+          grow: { ...growOptions(), ...(settings.autoTangent ? { tangent: AUTO_TANGENT } : {}) }, refineUrl,
+        });
+      },
       onSegment: async (claim, out) => {
         const group = store.create(out.fitter ?? null);
         for (const t of claim) store.assign(t, group.id);
         created.push(group.id);
+        current.origins.set(group.id, { by: 'auto-paint', seed: lastSeed, predicted: out.predicted ?? null,
+          confidence: out.confidence ?? null, fill: out.fitter ?? null, claimed: claim.size });
         flushChanged();
         // On a clock, not per group: the panel holds a row per group and a yield costs a timer
         // tick, and a low-poly mesh makes thousands of groups.
@@ -748,16 +759,30 @@ async function runAutoPaint() {
         const X = new Float32Array(rows.length * width);
         rows.forEach(([, f], i) => X.set(f.features, i * width));
         const probs = await typer.run(X, rows.length);
-        rows.forEach(([id, f], i) => learned.set(id, tool.decideGroupType(probs.subarray(i * k, i * k + k), f.rule, typer.threshold).type));
+        rows.forEach(([id, f], i) => {
+          const d = tool.decideGroupType(probs.subarray(i * k, i * k + k), f.rule, typer.threshold);
+          learned.set(id, d.type);
+          const origin = current.origins.get(id);
+          if (origin) origin.typer = { by: d.by, p: Math.round(d.p * 1000) / 1000 };
+        });
       }
     }
     for (const [id, tris] of byGroup) {
       const group = store.groups.get(id);
-      if (freeform.has(id)) { group.type = null; refit(id, tris); continue; }
-      if (learned.has(id)) group.type = learned.get(id);
-      else {
+      const origin = current.origins.get(id);
+      if (freeform.has(id)) {
+        group.type = null;
+        if (origin) origin.typedBy = 'freeform merge';
+        refit(id, tris);
+        continue;
+      }
+      if (learned.has(id)) {
+        group.type = learned.get(id);
+        if (origin) origin.typedBy = origin.typer?.by === 'model' ? 'group typer' : 'typer rule';
+      } else {
         const typed = tool.typeFinalGroup(tris, paintMesh.facets, group.type);
         if (typed.changed) group.type = typed.type;
+        if (origin) origin.typedBy = typed.changed ? 'exact rule' : 'fill';
       }
       refit(id, tris);
       const now = performance.now();
@@ -989,42 +1014,19 @@ async function exportStep({ checked = false } = {}) {
   if (!mesh) return;
   if (stroke || autoRun) { say('Finish or cancel (Esc) the stroke or auto-paint first', true); return; }
   const current = mesh;
-  const { store, model, geometry, name, synthetic } = current;
-  const groups = store.list();
-  if (!groups.length) { say('Paint at least one face group first', true); return; }
+  const { store, model, name } = current;
+  if (!store.list().length) { say('Paint at least one face group first', true); return; }
   toolbar.setDisabled('export', 'Exporting…');
+  current.lastExport = null;                      // this attempt's result replaces any earlier one
   try {
-    let facets = prepared?.mesh?.facets;
-    if (!facets) {
-      const [{ buildFacets }, { attachCurvature }] = await Promise.all([import('../meshCore.js'), import('../curvature.js')]);
-      const geo = geometry.index ? geometry.toNonIndexed() : geometry;
-      const P = Float64Array.from(geo.attributes.position.array);
-      facets = buildFacets(P);
-      attachCurvature(P, facets);
-    }
-    say(`Fitting ${groups.length} groups…`);
-    const surfaces = [];
-    for (const group of groups) {
-      if (!group.type) continue;                  // no analytic surface: the knitter makes it facets
-      const fit = group.fit?.params ? group.fit : fitRegionAs(group.type, fitTriangles(store.triangles(group.id), synthetic), facets);
-      if (fit.params) surfaces.push([group.id, [group.type, fit.params]]);
-    }
-    // The STEP goes where the file's mesh was: the loader centred it for the view, so the centre goes
-    // back on the positions, and on every fitted surface (all are anchored by points, never directions).
-    const [ox, oy, oz] = mesh.offset;
-    const positions = Float64Array.from(facets.positions, (v, i) => v + (i % 3 === 0 ? ox : i % 3 === 1 ? oy : oz));
-    const labels = Int32Array.from(store.owner);
-    // Caps the repair added go to the group around them, and onto its surface (caps.js), however they were painted.
-    for (const [t, id] of capOwners(labels, synthetic, model.neighbours)) labels[t] = id;
-    const shiftedSurfaces = surfaces.map(([id, [type, p]]) => [id, [type, shifted(p, mesh.offset)]]);
-    projectCapVertices(positions, labels, synthetic, new Map(shiftedSurfaces));
-    const payload = { positions, labels, surfaces: shiftedSurfaces };
+    const payload = await knitPayload(current);
     // Before the build, the groups that will come out wrong (knit/preflight.js), so they can be fixed now
     // rather than after minutes of building.
     if (!checked) {
       say('Checking the groups…');
       await new Promise((resolve) => setTimeout(resolve, 0));
       const doubts = exportDoubts(payload);
+      current.lastCheck = { groups: [...doubts.groups], mesh: doubts.mesh ?? null };   // for the conversion report
       if (doubts.groups.size || doubts.mesh) { offerDoubts(doubts); return; }
     }
     let result;
@@ -1046,7 +1048,7 @@ async function exportStep({ checked = false } = {}) {
     const { step, report } = result;
     current.lastExport = report;                  // for the conversion report (report.js)
     if (!step) throw new Error('no shape came out of the build');
-    downloadStep(step, `${name}.stp`);
+    downloadFile(step, `${name}.stp`);
     say(exportSummary(`${name}.stp`, report, model.count - store.painted), report.tier !== 'analytic');
   } catch (error) {
     console.error(error);
@@ -1058,24 +1060,112 @@ async function exportStep({ checked = false } = {}) {
 }
 
 /**
- * The Report button: this run's numbers (report.js) in a new tab, as a prefilled GitHub issue the user reads,
- * adds to, and submits or not. Nothing is sent from here.
+ * What the knitter is given for `current`: positions back where the file had them, a group per triangle, and
+ * each typed group's fitted surface. The export builds from it, and the conversion report carries it, so a
+ * reported run can be rebuilt exactly (test/reportReplay.mjs).
+ */
+async function knitPayload(current) {
+  const { store, model, geometry, synthetic } = current;
+  const groups = store.list();
+  let facets = current === mesh ? prepared?.mesh?.facets : null;
+  if (!facets) {
+    const [{ buildFacets }, { attachCurvature }] = await Promise.all([import('../meshCore.js'), import('../curvature.js')]);
+    const geo = geometry.index ? geometry.toNonIndexed() : geometry;
+    const P = Float64Array.from(geo.attributes.position.array);
+    facets = buildFacets(P);
+    attachCurvature(P, facets);
+  }
+  say(`Fitting ${groups.length} groups…`);
+  const surfaces = [];
+  for (const group of groups) {
+    if (!group.type) continue;                  // no analytic surface: the knitter makes it facets
+    const fit = group.fit?.params ? group.fit : fitRegionAs(group.type, fitTriangles(store.triangles(group.id), synthetic), facets);
+    if (fit.params) surfaces.push([group.id, [group.type, fit.params]]);
+  }
+  // The STEP goes where the file's mesh was: the loader centred it for the view, so the centre goes
+  // back on the positions, and on every fitted surface (all are anchored by points, never directions).
+  const [ox, oy, oz] = current.offset;
+  const positions = Float64Array.from(facets.positions, (v, i) => v + (i % 3 === 0 ? ox : i % 3 === 1 ? oy : oz));
+  const labels = Int32Array.from(store.owner);
+  // Caps the repair added go to the group around them, and onto its surface (caps.js), however they were painted.
+  for (const [t, id] of capOwners(labels, synthetic, model.neighbours)) labels[t] = id;
+  const shiftedSurfaces = surfaces.map(([id, [type, p]]) => [id, [type, shifted(p, current.offset)]]);
+  projectCapVertices(positions, labels, synthetic, new Map(shiftedSurfaces));
+  return { positions, labels, surfaces: shiftedSurfaces };
+}
+
+/**
+ * The Report button: what goes in the report file is the user's choice, since the picture and the mesh show
+ * the part. Without a mesh open there is no file, only the issue.
  */
 function reportConversion() {
-  const { store } = mesh ?? {};
-  const groups = store ? store.list().map((g) => ({ type: g.type, count: store.count(g.id) })) : [];
+  if (!mesh) { sendReport(); return; }
+  ui.openMenu([
+    { id: 'groups', label: 'Report the face groups and results', onSelect: () => sendReport() },
+    { id: 'picture', label: '…and a picture of the view', onSelect: () => sendReport({ picture: true }) },
+    { id: 'mesh', label: '…and the picture and the mesh (only if you may share it)', onSelect: () => sendReport({ picture: true, withMesh: true }) },
+  ], { anchor: toolbar.get('report').parentElement, align: 'right' });
+}
+
+/**
+ * Download the report file (report.js) and open the prefilled GitHub issue it goes into. Nothing is sent
+ * from here: the user drags the file into the issue, checks it, and submits it or not.
+ */
+async function sendReport({ picture = false, withMesh = false } = {}) {
+  if (stroke || autoRun) { say('Finish or cancel (Esc) the stroke or auto-paint first', true); return; }
+  const current = mesh;
+  const { store } = current ?? {};
+  const modelLabel = MODELS.find((m) => m.url === settings.model)?.label ?? settings.model;
   const numbers = conversionNumbers({
-    triangles: mesh?.model.count ?? 0,
-    repaired: mesh?.repair ? repairChanges(mesh.repair) : [],
-    model: MODELS.find((m) => m.url === settings.model)?.label ?? settings.model,
+    triangles: current?.model.count ?? 0,
+    repaired: current?.repair ? repairChanges(current.repair) : [],
+    model: modelLabel,
     settings,
-    autoPaint: mesh?.autoPaint ?? null,
-    groups,
+    autoPaint: current?.autoPaint ?? null,
+    groups: store ? store.list().map((g) => ({ type: g.type, count: store.count(g.id) })) : [],
     painted: store?.painted ?? 0,
-    exported: mesh?.lastExport ?? null,
+    check: current?.lastCheck ?? null,
+    exported: current?.lastExport ?? null,
   });
-  window.open(reportUrl(numbers, { tier: mesh?.lastExport?.tier, groups: groups.length }), '_blank', 'noopener');
-  say('Opened a conversion report on GitHub: check the numbers, add what went wrong, then submit it');
+  const issue =(extra = '') => reportUrl(numbers + extra, { tier: current?.lastExport?.tier, groups: store?.list().length ?? 0 });
+  if (!current) {
+    window.open(issue(), '_blank', 'noopener');
+    say('Opened a conversion report on GitHub');
+    return;
+  }
+  try {
+    say('Building the report…');
+    // The knitter's input exactly as an export would send it, so a reported run can be rebuilt.
+    const payload = await knitPayload(current);
+    const json = reportJson({
+      page: location.href.split(/[?#]/)[0], settings, model: modelLabel, triangles: current.model.count,
+      repair: current.repair, fingerprint: await fingerprint(current.geometry.attributes.position.array),
+      includesMesh: withMesh, autoPaint: current.autoPaint, groups: store.list(),
+      placed: placeGroups(payload.positions, payload.labels), origins: current.origins,
+      check: current.lastCheck, exported: current.lastExport,
+    });
+    const files = {
+      'report.json': strToU8(JSON.stringify(json, null, 1)),
+      'part.fid': new Uint8Array(payload.labels.buffer),
+      'part.fits.json': strToU8(JSON.stringify({ faces: payload.surfaces.map(([id, [type, params]]) => ({ id, type, params })) })),
+    };
+    if (picture) files['view.png'] = await captureView();
+    if (withMesh) files['part.stl'] = binaryStl(payload.positions);
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const file = `stlToStep-report-${stamp}.zip`;
+    downloadFile(zipSync(files, { level: 6 }), file);
+    window.open(issue(`\nreport file: ${file}`), '_blank', 'noopener');
+    say(`Downloaded ${file}: drag it into the GitHub issue that just opened, check the numbers, then submit it`);
+  } catch (error) {
+    console.error(error);
+    say(`The report failed: ${error.message}`, true);
+  }
+}
+
+/** The viewport as a PNG: resolved by the next frame, right after it draws (the drawing buffer is not kept). */
+let viewCapture = null;
+function captureView() {
+  return new Promise((resolve) => { viewCapture = resolve; requestRender(); });
 }
 
 /**
@@ -1205,8 +1295,8 @@ function exportSummary(file, report, unpainted) {
   return parts.join(' · ');
 }
 
-function downloadStep(text, filename) {
-  const url = URL.createObjectURL(new Blob([text], { type: 'application/octet-stream' }));
+function downloadFile(data, filename) {
+  const url = URL.createObjectURL(new Blob([data], { type: 'application/octet-stream' }));
   const a = document.createElement('a');
   a.href = url;
   a.download = filename;
@@ -1533,6 +1623,12 @@ function frame(now) {
       edges: settings.edges,
     });
     corner.update();
+    // captureView: the canvas is read now, in the task that drew it, before the browser presents and clears it
+    if (viewCapture) {
+      const done = viewCapture;
+      viewCapture = null;
+      canvas.toBlob((blob) => blob.arrayBuffer().then((buffer) => done(new Uint8Array(buffer))), 'image/png');
+    }
   }
   requestAnimationFrame(frame);
 }

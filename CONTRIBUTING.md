@@ -97,7 +97,7 @@ out. The report says which tier it reached.
 
 | Path | What it is |
 |---|---|
-| `index.html`, `js/studio/` | The studio: paint face groups on a mesh, export a STEP solid. `js/studio/report.js` builds the Report button's prefilled issue |
+| `index.html`, `js/studio/` | The studio: paint face groups on a mesh, export a STEP solid. `js/studio/report.js` builds the Report button's report file and prefilled issue |
 | `js/paintCore.js`, `js/paintTool.js` | One click becomes one face group. `paintCore` has no model runtime and runs the same in Node and in the browser, so the harnesses measure what ships |
 | `js/autoPaint.js` | Paints a whole part, best seed first |
 | `js/regionGrow.js`, `js/edgeWall.js`, `js/cutFill.js`, `js/mergeRegions.js`, `js/freeformMerge.js` | Growth, learned face boundaries, min-cut fills, crumb merging, freeform grouping |
@@ -194,8 +194,11 @@ them. The 300-part Onshape set (ABC's own Onshape exports) is the real-exporter 
 load. Compare builder changes with `--budget 100000` and a few workers.
 
 **Real parts come in as conversion reports.** The studio's flag button opens an issue labelled
-`conversion report` with the run's numbers. Triage those, and turn each shareable mesh that fails into
-a fixture with a test that measures the fix.
+`conversion report`, with a report file attached by the user. `node test/reportReplay.mjs <report.zip>`
+reads one. It prints every group that went wrong and the step it went wrong at: the model's seed and
+prediction, the typing, the fit, the export check, or the kernel and repair loop. When the mesh is
+included, it rebuilds the export locally. Turn each shareable mesh that fails into a fixture, with a
+test that measures the fix.
 
 **Known friction:** the scripts default to `D:/abc-data/...` paths, and the bakes take hours of CPU.
 Ask Derek for the prepared eval sets rather than rebuilding them, and don't publish them. Making the

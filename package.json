@@ -11,6 +11,7 @@
     "onnxruntime-node": "^1.29.0"
   },
   "devDependencies": {
-    "opencascade.js": "2.0.0-beta.b5ff984"
+    "opencascade.js": "2.0.0-beta.b5ff984",
+    "fflate": "0.8.2"
   }
 }

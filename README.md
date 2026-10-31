@@ -107,15 +107,26 @@ mesh ─► repair ─► paint face groups ─► fit + type each group ─► 
 ## Tell us how it did
 
 The trained models ship with the studio and run in your browser, so we only learn how they do on
-real parts if you tell us. After a conversion, press the **flag** button next to Export STEP. It opens
-a GitHub issue with that run's numbers already filled in:
+real parts if you tell us. After a conversion, press the **flag** button next to Export STEP and
+choose what goes in. It does two things:
 
-- the model and fill settings that ran
-- how many face groups auto-paint made, and of which types
-- which tier the export reached, and how long it took
+1. **Downloads a report file** (`stlToStep-report-….zip`). It records every face group:
+   - where the group is and how big it is
+   - how it was made: the auto-paint seed, what the model predicted and how confident it was, and
+     what decided its final type
+   - how well its surface fits
+   - what the export check flagged
+   - what the export did with it: the kernel's verdict on that face, repair attempts, and whether it
+     was retyped or went out as facets
 
-You add what went wrong, plus a screenshot. Attach the mesh only if you're allowed to share it.
-Nothing is sent until you press Submit, and good results help as much as bad ones.
+   It also holds the groups and surfaces exactly as the export received them. A picture of the view
+   and the mesh go in only if you choose them; with the mesh, we can rebuild your export exactly.
+2. **Opens a GitHub issue** with a summary already filled in. Drag the report file into it, say what
+   went wrong, and submit.
+
+Nothing is sent until you press Submit, and good results help as much as bad ones. The report file
+describes your part's faces (their positions, axes and radii) even without the mesh, so only attach
+it where you're comfortable sharing that.
 
 ## How good is it?
 

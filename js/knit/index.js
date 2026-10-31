@@ -185,7 +185,35 @@ export function knitSolid(oc, { positions, labels, surfaces }, { loop = true, fa
     nonmanifold_edges: sc.nonmanifold_edges ?? null, shells: sc.shells ?? null,
     groups: new Set(mesh.F).size, bodies: mesh.nBodies, triangles: mesh.T.length,
     secs: Math.round((performance.now() - t0) / 100) / 10, info,
+    faces: faceOutcomes(labels, surfaces, state, out),
   };
   return { solid: sc.solid ?? out.shape, report };
   }
+}
+
+/**
+ * What became of each painted group, for the studio's conversion report (js/studio/report.js): the kernel's
+ * complaints about each patch in the best analytic build, by kind (missing, invalid, orient, area, open);
+ * the repair loop's moves; the groups it absorbed into neighbours or that ended on another surface type
+ * (repair or shared axes); each group's final surface type; and the groups the facet tier built as facets
+ * ('all' when the result is the mesh itself). Group ids are the labels the knitter was given; a freeform
+ * group split into pieces adds labels above them.
+ */
+function faceOutcomes(labels, surfaces, state, out) {
+  const ids = (s) => [...s].sort((a, b) => a - b);
+  const faces = {
+    problems: {}, moves: state?.moves ?? [], absorbed: [], retyped: [], final: [],
+    demoted: (out.bestTier ?? out.tier) === 'faceted' ? 'all' : ids(out.demoted ?? []),
+  };
+  if (!state) return faces;
+  for (const [k, v] of Object.entries(state.problems ?? {})) if (v.size) faces.problems[k] = ids(v);
+  const after = new Set(state.labels);
+  faces.absorbed = ids(new Set([...labels].filter((g) => g >= 0 && !after.has(g))));
+  const before = surfaces instanceof Map ? surfaces : new Map(Object.entries(surfaces).map(([k, v]) => [Number(k), v]));
+  for (const [g, s] of [...state.surfaces].sort((a, b) => a[0] - b[0])) {
+    faces.final.push([g, s[0]]);
+    const was = before.get(g)?.[0];
+    if (was && was !== s[0]) faces.retyped.push([g, was, s[0]]);
+  }
+  return faces;
 }

@@ -140,6 +140,8 @@ export function buildRepaired(oc, mesh, surfaces, { fitCandidates = null, maxBui
 
   let best = build(Int32Array.from(mesh.F), new Map(surfaces), true);
   let builds = 1;
+  // every move tried and whether it was kept, for the conversion report (knitSolid's report.faces)
+  const moves = [];
   onProgress?.({ builds, ok: !!best.g[0] });
   log.problems_before = Object.values(best.probs).reduce((s, v) => s + v.size, 0);
   const cands = new Map(), tried = new Set();
@@ -164,7 +166,9 @@ export function buildRepaired(oc, mesh, surfaces, { fitCandidates = null, maxBui
       const trial = build(lab, sf);
       builds++;
       bump(log, 'sliver_absorb_tried');
-      if (trial && !better(best.g, trial.g)) { best = trial; bump(log, 'slivers_absorbed', slivers.length); }
+      const kept = !!trial && !better(best.g, trial.g);
+      if (kept) { best = trial; bump(log, 'slivers_absorbed', slivers.length); }
+      moves.push({ move: 'absorb_slivers', groups: slivers, kept });
     }
     for (const g of slivers) tried.add(`absorb|${g}`);
   }
@@ -205,7 +209,8 @@ export function buildRepaired(oc, mesh, surfaces, { fitCandidates = null, maxBui
       if (!absorbGroup(mesh, lab, sf, move[1], big ? LOOP.ABSORB_TOL * mesh.diag : null)) continue;
       if (!lab.includes(move[1])) sf.delete(move[1]);     // fully absorbed; stranded facets keep it
     }
-    attempt(lab, sf, move[0]);
+    const kept = attempt(lab, sf, move[0]);
+    moves.push(move[0] === 'retype' ? { move: 'retype', group: move[1], to: move[3].type, kept } : { move: 'absorb', group: move[1], kept });
   }
   const info = { ...best.info };
   for (const [k, v] of Object.entries(log)) info[`repair_${k}`] = v;
@@ -213,7 +218,7 @@ export function buildRepaired(oc, mesh, surfaces, { fitCandidates = null, maxBui
   info.repair_problems_after = Object.values(best.probs).reduce((s, v) => s + v.size, 0);
   for (const [k, v] of Object.entries(best.probs)) if (v.size) info[`repair_left_${k}`] = v.size;
   info.repair_secs = Math.round((now() - t0) * 10) / 10;
-  return { shape: best.shape, info, state: { labels: best.labels, surfaces: best.surfs, problems: best.probs, ok: !!best.g[0], g: best.g, sc: best.sc } };
+  return { shape: best.shape, info, state: { labels: best.labels, surfaces: best.surfs, problems: best.probs, ok: !!best.g[0], g: best.g, sc: best.sc, moves } };
 }
 
 export const FALLBACK = { ROUNDS: 3, MAX_FACETS: 6000 };
@@ -274,7 +279,7 @@ export function facetFallback(oc, mesh, shape, state, info = {}, deadline = Infi
       bump(info, 'fallback_exception');
       return null;
     }
-    if (better(r.g, best.g)) best = { g: r.g, shape: r.shape, sc: r.sc, tier, n, area };
+    if (better(r.g, best.g)) best = { g: r.g, shape: r.shape, sc: r.sc, tier, n, area, demote: new Set(demote) };
     return r;
   };
   const demote = new Set();
@@ -300,5 +305,5 @@ export function facetFallback(oc, mesh, shape, state, info = {}, deadline = Infi
   }
   info.fallback_secs = Math.round((now() - t0) * 10) / 10;
   return { shape: best.shape, sc: best.sc, tier: best.g[0] ? best.tier : 'none', bestTier: best.tier,
-           facetTris: best.n, facetArea: Math.round(best.area * 1e4) / 1e4 };
+           facetTris: best.n, facetArea: Math.round(best.area * 1e4) / 1e4, demoted: [...(best.demote ?? [])] };
 }

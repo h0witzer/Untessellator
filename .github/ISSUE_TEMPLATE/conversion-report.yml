@@ -54,5 +54,8 @@ body:
   - type: textarea
     id: files
     attributes:
-      label: Screenshots and the mesh
-      description: Drop screenshots here. Attach the mesh (zipped) only if you're allowed to share it; this repository is public.
+      label: The report file, and screenshots
+      description: >-
+        Drag in the stlToStep-report .zip the Report button downloaded. It holds every face group, its
+        fitted surface and what the export did with it, so we can see exactly which faces failed and why.
+        It holds the mesh only if you chose that; this repository is public. Screenshots help too.
