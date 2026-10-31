@@ -95,6 +95,9 @@ mesh ─► repair ─► paint face groups ─► fit + type each group ─► 
   exports, and most functional parts from Printables, MakerWorld or Thingiverse.
 - **Scans, sculpts and decimated meshes** give mostly B-spline and faceted faces. Scan-to-CAD is a
   long-term goal.
+- **Many exports still fall back to facets.** Dense exports from CAD systems usually come out fully
+  analytic. Coarser meshes often don't, and a part can come out as a valid closed solid with every
+  face a facet. The export report says which you got.
 - **You get faces, not a feature history.** There are no sketches or timeline yet.
 - **Large meshes are slow.** Parts with tens of thousands of triangles can take minutes to paint and
   export.
