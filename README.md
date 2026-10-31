@@ -15,6 +15,9 @@ It runs in your browser: nothing is uploaded, there's no per-conversion fee, and
 **See what it recovers: <https://h0witzer.github.io/Untessellator-Gallery/>**. Every part in the gallery
 was checked face by face against its original CAD file: the same faces, of the same types, each within 1 µm.
 
+**Support it: <https://ko-fi.com/derekvanallen>**. Untessellator is free to use. If it saves you time, a tip
+on Ko-fi helps keep the work going.
+
 Untessellator was called stlToStep until October 2026. Links to the old repository redirect here.
 
 Inspired by [CNCKitchen's stlTexturizer](https://github.com/CNCKitchen/stlTexturizer), which this

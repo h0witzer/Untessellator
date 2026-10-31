@@ -40,7 +40,7 @@ body { background: var(--wb-bg); color: var(--wb-text); font: 14px/1.45 var(--wb
 .wb-brand { font: 600 15px/1 var(--wb-font-label); letter-spacing: 0.02em; white-space: nowrap; }
 .wb-file { color: var(--wb-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .wb-file b { color: var(--wb-text); font-weight: 500; }
-.wb-iconbtn { border: 1px solid transparent; background: transparent; border-radius: 5px; padding: 5px 8px; cursor: pointer; color: var(--wb-muted); white-space: nowrap; }
+.wb-iconbtn { border: 1px solid transparent; background: transparent; border-radius: 5px; padding: 5px 8px; cursor: pointer; color: var(--wb-muted); white-space: nowrap; text-decoration: none; }
 .wb-iconbtn:hover:not([disabled]) { background: var(--wb-raised); color: var(--wb-text); }
 .wb-iconbtn[disabled] { opacity: 0.35; cursor: default; }
 .wb-iconbtn .wb-ticon { width: 18px; height: 18px; vertical-align: -4px; }
