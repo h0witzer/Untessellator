@@ -1,8 +1,15 @@
 {
+  "name": "stltostep",
+  "private": true,
+  "description": "Turn STL, OBJ and 3MF meshes back into real CAD: exact analytic faces in a closed STEP solid.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
   "dependencies": {
     "onnxruntime-node": "^1.29.0"
   },
-  "type": "module",
   "devDependencies": {
     "opencascade.js": "2.0.0-beta.b5ff984"
   }
