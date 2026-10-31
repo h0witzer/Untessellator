@@ -76,6 +76,8 @@ body { background: var(--wb-bg); color: var(--wb-text); font: 14px/1.45 var(--wb
 .wb-ftype[aria-pressed="true"] .wb-ticon { filter: drop-shadow(0 0 0.5px rgba(0, 0, 0, 0.6)); }
 .wb-ftype--skip:not([aria-pressed="true"]) { border-style: dashed; }
 .wb-skipped { color: var(--wb-faint); font-family: var(--wb-font); font-style: italic; }
+/* the Fit column's word for a group a flag made red (studio.js flagCause): rejected, facets, narrow arc, seam gap */
+.wb-cause { color: #f08a8a; font-family: var(--wb-font); }
 .wb tbody tr.wb-g--skip td { color: var(--wb-muted); }
 .wb-size { display: flex; align-items: center; gap: 8px; color: var(--wb-muted); font-size: 12.5px; flex: none; }
 .wb-size input { width: 60px; accent-color: var(--wb-accent); }

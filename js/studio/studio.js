@@ -2000,6 +2000,8 @@ const KERNEL_PROBLEMS = {
   orient: 'its face runs the wrong way against a neighbor',
   area: 'its face came out a quarter or more off the area of its triangles',
   open: 'it leaves a gap in the solid',
+  // not the knitter's: offerRepair's, for a group the facet tier built as facets (report.faces.demoted)
+  facets: 'it went out as flat facets',
 };
 
 /** Map group -> reasons from the knitter's problems ({kind: [label]}), each label first through `idOf` (null: skip). */
@@ -2029,7 +2031,7 @@ function offerRepair(current, step, report) {
   if (Array.isArray(faces.demoted)) {
     for (const id of new Set(faces.demoted.map(idOf))) {
       if (!current.store.groups.has(id)) continue;
-      (flags.get(id) ?? flags.set(id, []).get(id)).push('it went out as flat facets');
+      (flags.get(id) ?? flags.set(id, []).get(id)).push(KERNEL_PROBLEMS.facets);
     }
   }
   current.flags = flags;
@@ -2232,8 +2234,28 @@ function groupRows() {
   for (const g of store.list()) rows.set(g.id, { id: g.id, group: g, name: store.name(g.id), type: g.type, count: 0, area: 0 });
   for (let t = 0; t < model.count; t++) { const r = rows.get(store.owner[t]); if (r) { r.count++; r.area += mesh.triArea[t]; } }
   const diag = 2 * model.radius;
-  for (const r of rows.values()) { r.verdict = mesh.verdicts.get(r.id) ?? 'none'; r.worst = (mesh.groupWorst.get(r.id) ?? NaN) * diag; }
+  for (const r of rows.values()) {
+    r.verdict = mesh.verdicts.get(r.id) ?? 'none';
+    r.worst = (mesh.groupWorst.get(r.id) ?? NaN) * diag;
+    r.cause = flagCause(r.id);
+  }
   return [...rows.values()];
+}
+
+/**
+ * Why a flag, not the distance, makes group `id` likely wrong, in a word for the Fit column: 'facets' or
+ * 'rejected' (the kernel: KERNEL_PROBLEMS), 'narrow arc' or 'seam gap' (the export check); null when its distance is
+ * past the bar anyway, or it has no flag. Without it a rejected group reads red beside a worst of ≈0.
+ */
+function flagCause(id) {
+  const why = mesh.flags.get(id);
+  if (!why?.length || (mesh.groupWorst.get(id) ?? 0) > DOUBT.DEV) return null;
+  if (why.includes(KERNEL_PROBLEMS.facets)) return 'facets';
+  const kernel = new Set(Object.values(KERNEL_PROBLEMS));
+  if (why.some((w) => kernel.has(w))) return 'rejected';
+  if (why.some((w) => w.startsWith('it covers only'))) return 'narrow arc';
+  if (why.some((w) => w.startsWith('its border runs'))) return 'seam gap';
+  return 'flagged';
 }
 
 const RANK = { off: 0, maybe: 1, none: 2, on: 3, skip: 4 };
@@ -2290,7 +2312,9 @@ function refreshPanel() {
   const picked = [...selection].filter((id) => store.count(id));
   const fitCell = (r) => (r.verdict === 'skip' ? '<span class="wb-skipped">skipped</span>'
     : r.verdict === 'none' ? `<span class="wb-dot" style="background:${css(NO_SURFACE)}"></span>none`
-      : `<span class="wb-dot" style="background:${css(VERDICTS[r.verdict].rgb)}"></span>${shortLength(r.worst)}`);
+      // red for a flag, not the distance: say which, rather than a worst of ≈0 beside the red
+      : r.verdict === 'off' && r.cause ? `<span class="wb-dot" style="background:${css(VERDICTS.off.rgb)}"></span><span class="wb-cause">${r.cause}</span>`
+        : `<span class="wb-dot" style="background:${css(VERDICTS[r.verdict].rgb)}"></span>${shortLength(r.worst)}`);
   const row = (r) => `<tr class="wb-g${r.verdict === 'skip' ? ' wb-g--skip' : ''}" data-group="${r.id}" aria-selected="${selection.has(r.id)}" title="${esc(`${r.name}: ${verdictWhy(r.id)}`)}">
       <td><span class="wb-nm">${typeIcon(r.type, groupRgb(r))}${esc(r.name)}${mesh.flags.has(r.id) ? ' ⚠' : ''}</span></td>
       <td>${r.type ?? 'freeform'}</td><td class="wb-num">${r.count.toLocaleString()}</td><td class="wb-num wb-col-area">${shortLength(r.area)}</td><td class="wb-fit">${fitCell(r)}</td></tr>`;
