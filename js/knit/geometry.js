@@ -394,7 +394,10 @@ function profileContact(A, B, tol) {
  * The contact locus of two exactly tangent surfaces: {line: {o, d}} or {circle: {c, n, r}}, or null when
  * they are not tangent (or not a case above).
  */
+const ANALYTIC = new Set(['plane', 'cylinder', 'cone', 'sphere', 'torus']);
+
 export function tangentLocus([k1, p1], [k2, p2], scaleLen) {
+  if (!ANALYTIC.has(k1) || !ANALYTIC.has(k2) || !p1 || !p2) return null;   // a B-spline has no contact locus here
   const tol = TANGENT_TOL * scaleLen;
   // coaxial surfaces of revolution
   for (const [ka, pa] of [[k1, p1], [k2, p2]]) {

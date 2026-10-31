@@ -159,6 +159,43 @@ for (const stem of stems) {
       }
     }
   }
+  // part-wide design intent: equal sizes (any two groups, not only neighbours) and planes through an axis
+  const VAL = { cylinder: (q) => q.radius, cone: (q) => q.halfAngle, torus: (q) => q.minorRadius };
+  const glist = [...surfaces.keys()].filter((g) => major.has(g));
+  for (let i = 0; i < glist.length; i++) for (let j = i + 1; j < glist.length; j++) {
+    const g1 = glist[i], g2 = glist[j];
+    const f1 = major.get(g1)[0], f2 = major.get(g2)[0];
+    if (f1 === f2) continue;
+    const t1 = trueSurf(f1), t2 = trueSurf(f2);
+    if (!t1 || !t2) continue;
+    const s1 = surfaces.get(g1), s2 = surfaces.get(g2), a1 = after.get(g1), a2 = after.get(g2);
+    if (t1[0] === t2[0] && VAL[t1[0]] && s1[0] === t1[0] && s2[0] === t2[0] && a1[0] === t1[0] && a2[0] === t2[0]) {
+      const key = `equal_${t1[0]}`, V = VAL[t1[0]];
+      const tv1 = V(t1[1]), tv2 = V(t2[1]), tol = t1[0] === 'cone' ? 1e-7 : 1e-6 * Math.max(Math.abs(tv1), 1e-300);
+      const same = (x, y, rel) => Math.abs(x - y) <= rel * Math.max(Math.abs(x), 1e-300);
+      if (Math.abs(tv1 - tv2) <= tol) {
+        tot.pairsTrue[key] = (tot.pairsTrue[key] ?? 0) + 1;
+        if (same(V(s1[1]), V(s2[1]), 1e-12)) tot.exactBefore[key] = (tot.exactBefore[key] ?? 0) + 1;
+        if (same(V(a1[1]), V(a2[1]), 1e-12)) tot.exactAfter[key] = (tot.exactAfter[key] ?? 0) + 1;
+      } else if (!same(tv1, tv2, 1e-4) && same(V(a1[1]), V(a2[1]), 1e-12) && !same(V(s1[1]), V(s2[1]), 1e-12)) {
+        tot.falseValue = (tot.falseValue ?? 0) + 1;
+      }
+    }
+    // a plane through an axis
+    const pa = t1[0] === 'plane' && AXIAL.has(t2[0]) ? [g1, g2, t1, t2] : t2[0] === 'plane' && AXIAL.has(t1[0]) ? [g2, g1, t2, t1] : null;
+    if (pa) {
+      const [gp, ga, tp, ta] = pa;
+      const through = (P, A) => { const n = unit(P[1].normal), [o, d] = lineOf(A[0], A[1]); return Math.abs(dot(n, d)) < 1e-9 && Math.abs(dot(sub(o, P[1].origin), n)) <= 1e-9 * diag; };
+      if (surfaces.get(gp)[0] === 'plane' && AXIAL.has(surfaces.get(ga)[0]) && after.get(gp)[0] === 'plane' && AXIAL.has(after.get(ga)[0])) {
+        const n = unit(tp[1].normal), [o, d] = lineOf(ta[0], ta[1]);
+        if (Math.abs(dot(n, d)) < 1e-6 && Math.abs(dot(sub(o, tp[1].origin), n)) <= 1e-6 * diag) {
+          tot.pairsTrue.through = (tot.pairsTrue.through ?? 0) + 1;
+          if (through(surfaces.get(gp), surfaces.get(ga))) tot.exactBefore.through = (tot.exactBefore.through ?? 0) + 1;
+          if (through(after.get(gp), after.get(ga))) tot.exactAfter.through = (tot.exactAfter.through ?? 0) + 1;
+        }
+      }
+    }
+  }
   // recovery of each group's true face
   const vertsOfFace = new Map();
   for (let t = 0; t < mesh.T.length; t++) {
@@ -180,7 +217,7 @@ for (const stem of stems) {
     if (a < 1e-3) tot.found3After++;
     if (a > 2 * b + 1e-5) {
       tot.worse++; row.worse++;
-      if (tot.worseEx.length < 25) tot.worseEx.push({ stem, g, kind: s[0], after: after.get(g)[0], before: +b.toPrecision(3), afterDev: +a.toPrecision(3), rejected: rejected.has(g) });
+      if (tot.worseEx.length < 60) tot.worseEx.push({ stem, g, kind: s[0], after: after.get(g)[0], before: +b.toPrecision(3), afterDev: +a.toPrecision(3), rejected: rejected.has(g) });
     }
     if (b > 2 * a + 1e-5) tot.better++;
   }
@@ -189,10 +226,10 @@ for (const stem of stems) {
 }
 const pct = (a, b) => (b ? `${((100 * a) / b).toFixed(1)}%` : '-');
 console.log(`${PATCH_DIR}: ${tot.parts} parts, shareAxes ${(tot.ms / Math.max(tot.parts, 1)).toFixed(0)} ms/part`);
-for (const rel of REL) {
-  console.log(`  adjacent ${rel} in truth: ${tot.pairsTrue[rel]}   exact before ${pct(tot.exactBefore[rel], tot.pairsTrue[rel])}   after ${pct(tot.exactAfter[rel], tot.pairsTrue[rel])}`);
+for (const rel of [...REL, 'equal_cylinder', 'equal_cone', 'equal_torus', 'through']) {
+  console.log(`  adjacent ${rel} in truth: ${tot.pairsTrue[rel]}   exact before ${pct(tot.exactBefore[rel] ?? 0, tot.pairsTrue[rel] ?? 0)}   after ${pct(tot.exactAfter[rel] ?? 0, tot.pairsTrue[rel] ?? 0)}`);
 }
-console.log(`  false shares (exact, not in truth): before ${tot.falseBefore}  after ${tot.falseAfter}`);
+console.log(`  false shares (exact, not in truth): before ${tot.falseBefore}  after ${tot.falseAfter}   equal sizes made where the truth differs: ${tot.falseValue ?? 0}`);
 console.log('  coaxial pairs left inexact, by reason:', JSON.stringify(tot.missed), 'rejected kinds:', JSON.stringify(tot.missedKinds));
 for (const e of tot.examples) console.log('    ', JSON.stringify(e));
 console.log('  false shares after, by kind:', JSON.stringify(tot.falseKinds));

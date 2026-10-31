@@ -2869,8 +2869,7 @@ were added to `js/knit/axes.js`; none rounds a value.
   the line is made to contain it.
 - **Equal sizes, part-wide.** Cylinder radii, cone half-angles and torus tube radii that agree within the
   fits' precision take one value. Each member takes the value and nothing else about it moves; a cone pivots
-  about the middle of its patch. Surfaces the tangency pass moved are references: a group takes their value,
-  and two that disagree never share.
+  about the middle of its patch. Surfaces in an exact tangency keep their own size and share with no one.
 - **Mirror symmetry.** Two directions that are mirror images across a frame direction become exact mirror
   images. The frame is the heaviest shared direction and the shared directions exactly square to it.
   Mirroring across an oblique four-face chamfer direction had once mapped the frame's x onto z.
@@ -2896,30 +2895,63 @@ pairs anywhere in the part for the size and through-axis relations):
 
 | relation | Onshape (300) | fill_eval (120) |
 |---|---|---|
-| equal cylinder radius | 25.0 → 82.8% | 1.0 → 4.0% |
-| equal cone half-angle | 3.1 → 84.3% | 4.1 → 81.6% |
-| equal torus tube radius | 0.3 → 2.3% | 0.1 → 2.3% |
-| plane through an axis | 8.4 → 11.5% | 68.6 → 87.3% |
-| coaxial | 82.2 → 80.9% | 99.0 → 99.0% |
-| perpendicular | 99.8 → 99.7% | 99.2 → 98.8% |
-| along | 95.8 → 95.8% | 97.2 → 96.0% |
-| tangent | 48.2 → 47.9% | 85.7 → 85.3% |
+| equal cylinder radius | 25.0 → 81.0% | 1.0 → 3.5% |
+| equal cone half-angle | 3.1 → 81.2% | 4.1 → 77.0% |
+| equal torus tube radius | 0.3 → 1.6% | 0.1 → 1.2% |
+| plane through an axis | 8.4 → 11.5% | 68.8 → 87.1% |
+| coaxial | 82.2 → 82.2% | 98.9 → 98.9% |
+| perpendicular | 99.8 → 99.7% | 99.4 → 99.1% |
+| along | 95.5 → 95.5% | 97.3 → 96.9% |
+| tangent | 48.3 → 48.1% | 85.6 → 85.4% |
 | groups fitting their true face worse | 0 → 4 | 2 → 12 |
 
-- **Equal sizes made where the truth differs:** 2 on Onshape, 1 on fill. found4 is unchanged on both.
-- **The fill set's along loss** (about 50 pairs) has not been traced to parts yet; the scorer's per-part rows
-  do not record it.
+- **Equal sizes made where the truth differs:** none on either set. found4 is unchanged on both.
+- **Intent off reproduces the step before this work exactly** (Onshape coaxial 82.2, along 95.5, 131 false
+  shares). An earlier version did not: the perpendicular re-snap after the parallel-intent merges ran on
+  every direction, merged or not, and cost Onshape coaxial 1.3 points and fill parallel 0.9.
 
 **What the kernel needs from it (2026-10-04, second round).** The first version cost solids:
 - **Only the size moves.** The equal-size pass first refitted the rest of each surface about its points
   with the size fixed. On 00007917 re-estimating two cones' apexes (a 6e-8 shift, the angle changed 2e-10)
   made the build 16x slower (5 s -> 77 s). Now only the value changes; a cone pivots about its patch.
-- **The references of an exact tangency stay put.** The tangency pass moves one surface against
-  references (a plane onto a cylinder, a fillet onto a cone). The equal-size pass moving a reference
-  afterwards leaves a near-tangent join: 00182468_37 went 17 s -> 673 s. Each tangency now records the
-  references its constraints came from, and those keep their size. Cost: equal cylinder radii 83.4 -> 82.8%
-  (Onshape) and 5.7 -> 4.0% (fill). Protecting every neighbour instead cost a third of them.
+- **An exact tangency keeps its sizes out of the equal-size pass**, both the surface the tangency pass
+  moved and the references its constraints came from (a plane onto a cylinder, a fillet onto a cone).
+  - Moving a reference afterwards leaves a near-tangent join: 00182468_37 went 17 s -> 673 s.
+  - A value the tangency fixed comes from the constraint rather than the surface's own points. Used as a
+    group's value, one pulled twelve exact hole radii 6e-6 off on 00005406 (their own fits spread 2e-6), and
+    the build timed out. Kept out, 00005406 builds fully analytic in 77 s; without equal sizes it was
+    hybrid in 134 s.
+  - Cost of the two steps together: about 2.4 points of equal radii and 3 of cone angles on Onshape, and
+    4.6 of cone angles on fill. Protecting every neighbour instead cost a third of the radii.
+- **Three more fixes.**
+  - *The perpendicular re-snap after intent merges touches only merged directions.* Recomputing every
+    direction rejected a torus on 00003840, and the part fell from planar to faceted.
+  - *Cone angles share only within 1% of themselves.* On 00182468_37 (gmsh), cylinders fitted as cones
+    have half-angles of 3e-8 to 8e-6 rad. They agree in absolute terms, but pivoting one onto another moved
+    its apex hundreds of times further out.
+  - *The intent acceptance floor applies only to a member that joined on the intent tolerance.* Before,
+    every equal-size member got it, on exact meshes too.
 - **Not taken.** A second tangency pass after the equal sizes was worse on every relation.
+
+**Solids.** Deterministic gates (`--budget 100000`, 2 workers, 30-minute wall clock per part) on the final
+code:
+
+| run | Onshape (275) analytic | Onshape solids | fill (45) analytic | fill solids |
+|---|---|---|---|---|
+| before the CAD-clean round (`det_none`) | 254 | 269 | 17 | 38 |
+| CAD-clean, no retry (`det_full2`) | 250 | 269 | 18 | 39 |
+| first intent version (`det_final`) | 258 | 268 | 19 | 38 |
+| final (`det_v9`) | 258 | 268 | 19 | 38 |
+
+`det_full2` lacks one Onshape part and `det_none`'s fill run one fill part; their counts are over the rest.
+
+- **Analytic gains against `det_none`:** 6 Onshape parts, among them 00005406 (faceted -> analytic).
+  00003840 is planar again.
+- **The two misses are wall-clock timeouts**, both with another session's 9 jobs running:
+  - *00009079*: analytic in every version. Alone it builds analytic with the same 29 repair builds.
+  - *00182468_37_gmsh*: hybrid in 1556 s alone.
+- **The time on both is the plain retry**, not intent. The clean build fails there, and a full plain repair
+  loop follows. 00009079 took 176 s before the retry existed; with it, 765-1640 s depending on load.
 
 **Not working yet:**
 - *Equal fillet (torus) radii, and radii held by a tangency.* Tangency fixes each fillet, and each cylinder

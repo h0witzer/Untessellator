@@ -26,7 +26,9 @@ import { dot, sub, add, scale, cross, norm, unit, distNormal } from './geometry.
 
 export const AXES = { ANGLE_DEG: 1, OFFSET: 1e-3, RADIUS: 1e-3, ACCEPT: 1.5, FLOOR: 1e-6, ROUNDS: 3, INLIER: 5, TANGENT_DEG: 3,
   CHORD_Q: 0.9,
-  PRECISION_MIN: 1e-9, SIGMA_K: 10, FLOAT: 1e-7, AXIS_COND: 100, LOW_REDUNDANCY: 3, EXACT: 1e-6 };
+  PRECISION_MIN: 1e-9, SIGMA_K: 10, FLOAT: 1e-7, AXIS_COND: 100, LOW_REDUNDANCY: 3, EXACT: 1e-6,
+  MIRROR_ROUNDS: 3, VALUE_REL: 1e-3, VALUE_ANGLE_DEG: 0.5,
+  INTENT_DEG: 0.25, INTENT_REL: 2e-4, INTENT_FLOOR: 2e-5, THROUGH: true, CONE_REL: 0.01 };
 // The profiles a member on a shared line may be retyped to when its own type fails the check, simplest first.
 const RETYPE = ['cylinder', 'cone', 'torus'];
 
@@ -269,9 +271,25 @@ export function shareAxes(mesh, surfaces, opts = {}) {
   // fit chased the tessellation's error more closely (the user's chain: a chamfer cone's outer ring of
   // vertices sits 0.015 off its circle, and the free cone tilted 0.08 degrees to follow it).
   const chord = chordByLabel(mesh, surfaces, cfg);
+  // Intent relations (parallel or mirror within INTENT_DEG, equal sizes within INTENT_REL) override data
+  // that is exact but slightly inconsistent - the user's chain: a 4-vertex chamfer plane exact at 44.90
+  // degrees, its partners at 45.00. Their members may stray up to INTENT_FLOOR x diagonal.
+  const intent = new Set(), info0 = {};
+  // a fit with redundancy (n - DOF >= LOW_REDUNDANCY) is firm: intent never moves it past its precision
+  const firm = (g) => pts.get(g).length - (DOF[surfaces.get(g)[0]] ?? 3) >= cfg.LOW_REDUNDANCY;
+  // Intent only where the mesh cannot resolve it: the median fit of its firm curved surfaces above the
+  // exactness bar. On an exact CAD tessellation a 0.1-degree difference is real (draft faces: intent
+  // moved 29 exact fill-set planes off their true faces); on the user's chain the curved surfaces fit to
+  // about 1e-5 of the diagonal and the 0.1 degree between mirror chamfers is the tessellation's.
+  const curvedFirm = [...pts.keys()].filter((g) => surfaces.get(g)[0] !== 'plane' && firm(g)).map((g) => rms0.get(g));
+  const noisy = curvedFirm.length > 0 && median(curvedFirm) > cfg.EXACT * mesh.diag;
+  info0.mesh_inexact = noisy ? 1 : 0;
+  info0.mesh_noise = curvedFirm.length ? median(curvedFirm) / mesh.diag : 0;
+  const intentOn = noisy && cfg.INTENT_DEG > 0;
   const accepts = (g, kind, p) => {
     const P = pts.get(g);
-    if (rms(kind, p, P) <= cfg.ACCEPT * Math.max(rms0.get(g), noiseOf.get(g)) + cfg.FLOOR * mesh.diag) return true;
+    const fl = (intent.has(g) ? cfg.INTENT_FLOOR : cfg.FLOOR) * mesh.diag;
+    if (rms(kind, p, P) <= cfg.ACCEPT * Math.max(rms0.get(g), noiseOf.get(g)) + fl) return true;
     // the chordal allowance only where the vertices are visibly off the surface (a fit above the exactness
     // bar): on an exact CAD tessellation the vertices are on the true surface, and moving within the sag
     // put 22 exact fill-set surfaces up to 5e-4 of the diagonal off their true faces
@@ -290,6 +308,7 @@ export function shareAxes(mesh, surfaces, opts = {}) {
       axes_retyped: 0, axes_same_radius: 0, axes_same_plane: 0, axes_perpendicular: 0 };
     const lineFor = new Map();                  // members of shared lines: the line, for a retype
     locks.dir.clear(); locks.line.clear(); locks.plane.clear(); locks.lines.length = 0; locks.planeSet.clear(); locks.perpTo.clear();
+    intent.clear();
     const items = [];
     for (const [g, s] of surfaces) {
       if (!s || rejected.has(g) || !pts.has(g)) continue;
@@ -300,9 +319,9 @@ export function shareAxes(mesh, surfaces, opts = {}) {
         // apex thousands of units out) turns a hundredth of a degree into a large offset
         const d = unit(p.axis), o = originOf(kind, p), P = pts.get(g);
         const c = scale(P.reduce((a, x) => add(a, x), [0, 0, 0]), 1 / P.length);
-        items.push({ g, kind, p, d, o: add(o, scale(d, dot(sub(c, o), d))), w: weight.get(g), sig, r0 });
+        items.push({ g, kind, p, d, o: add(o, scale(d, dot(sub(c, o), d))), w: weight.get(g), sig, r0, firm: firm(g) });
       }
-      else if (kind === 'plane') items.push({ g, kind, p, d: unit(p.normal), w: weight.get(g), sig, r0 });
+      else if (kind === 'plane') items.push({ g, kind, p, d: unit(p.normal), w: weight.get(g), sig, r0, firm: firm(g) });
     }
     info.axes_surfaces = items.length;
     // 1. directions (antipodal), then exact perpendiculars to heavier directions
@@ -323,6 +342,76 @@ export function shareAxes(mesh, surfaces, opts = {}) {
       }
       if (perp.length) { info.axes_perpendicular++; k.changed = true; k.perpTo = perp.slice(0, 2).map((f) => f.d); }
       fixed.push(k);
+    }
+    // 1b. Mirror symmetry: two directions that are mirror images across one of the part's main directions
+    // (one several faces share) within their precision become exact mirror images, at their weighted
+    // mean - the user's chain had chamfer planes at 44.9 and 45.0 degrees, mirror images across the lug's
+    // mid-plane; they now share whatever angle the data gives, not a round number. Mirroring across a main
+    // direction keeps a direction square to anything along or across it, so the perpendiculars stay exact;
+    // a few rounds settle parts with several mirrors (left/right and top/bottom).
+    // 1a. Parallel intent: directions within INTENT_DEG that precision kept apart (an exact few-vertex plane)
+    // are one direction; their members are judged with the intent floor
+    const intentRad = intentOn ? (cfg.INTENT_DEG * Math.PI) / 180 : 0;
+    for (let i = 0; i < dirs.length; i++) {
+      const a = dirs[i];
+      if (!a) continue;
+      for (let j = i + 1; j < dirs.length; j++) {
+        const b = dirs[j];
+        if (!b || angleOf(a.d, b.d) > intentRad) continue;
+        // intent moves only what cannot defend itself: two firm directions that disagree stay apart (on
+        // exact CAD meshes they really differ - merging moved 77 exact fill-set surfaces off their faces)
+        const fa = a.items.some((it) => it.firm), fb = b.items.some((it) => it.firm);
+        if (fa && fb && angleOf(a.d, b.d) > angTol(a.sig, b.sig)) continue;
+        const sg = Math.sign(dot(a.d, b.d)) || 1;
+        const moved = fa ? b.items : fb ? a.items : [...a.items, ...b.items];
+        a.d = fa ? a.d : fb ? scale(b.d, sg) : unit(add(scale(a.d, a.w), scale(b.d, sg * b.w)));
+        a.w += b.w; a.items.push(...b.items); a.changed = a.merged = true;
+        a.sig = Math.min(a.sig, b.sig);
+        if (b.perpTo && !a.perpTo) a.perpTo = b.perpTo;
+        for (const it of moved) intent.add(it.g);
+        dirs[j] = null;
+        info.axes_parallel_intent = (info.axes_parallel_intent ?? 0) + 1;
+      }
+    }
+    for (let i = dirs.length - 1; i >= 0; i--) if (!dirs[i]) dirs.splice(i, 1);
+    // keep exact perpendiculars after the merges - for the merged directions only: recomputing every one
+    // moved 00003840's directions enough to reject a torus and lose its solid (planar -> faceted)
+    for (const k of dirs) if (k.merged && k.perpTo) {
+      const [f1, f2] = k.perpTo;
+      k.d = f2 ? scale(unit(cross(f1, f2)), Math.sign(dot(cross(f1, f2), k.d)) || 1) : unit(sub(k.d, scale(f1, dot(f1, k.d))));
+    }
+    // mirror planes come from the part's frame only: its heaviest shared direction and the shared directions
+    // exactly square to it (an oblique chamfer direction with four faces once mirrored the frame's x onto z)
+    const shared = dirs.filter((k) => k.items.length > 1).sort((u, v) => v.w - u.w);
+    const mains = shared.length ? [shared[0], ...shared.slice(1).filter((k) => Math.abs(dot(k.d, shared[0].d)) <= 1e-12)].slice(0, 3) : [];
+    const reflect = (v, m) => sub(v, scale(m, 2 * dot(v, m)));
+    // (only on inexact meshes: on exact CAD tessellations mirror pairs are already exact by the data, and
+    // averaging them cost exact perpendiculars to oblique axes - fill perpendicular 98.9 -> 98.4%)
+    for (let round = 0; round < (intentOn ? cfg.MIRROR_ROUNDS : 0); round++) {
+      for (const m of mains) {
+        const used = new Set();
+        for (const a of dirs) {
+          if (a === m || used.has(a)) continue;
+          const am = Math.abs(dot(a.d, m.d));
+          if (am < 1e-6 || am > 1 - 1e-6) continue;       // along or square to the mirror: its own image
+          let best = null, ba = Infinity;
+          for (const b of dirs) {
+            if (b === a || b === m || used.has(b)) continue;
+            const t = angleOf(a.d, reflect(b.d, m.d));
+            if (t <= Math.max(angTol(a.sig, b.sig), intentRad) && t < ba) { ba = t; best = b; }
+          }
+          if (!best || ba === 0) continue;
+          const fa = a.items.some((it) => it.firm), fb = best.items.some((it) => it.firm);
+          if (fa && fb && ba > angTol(a.sig, best.sig)) { used.add(a); continue; }
+          const mb = reflect(best.d, m.d), sg = Math.sign(dot(a.d, mb)) || 1;
+          const avg = fa ? a.d : fb ? scale(mb, sg) : unit(add(scale(a.d, a.w), scale(mb, sg * best.w)));
+          a.d = avg; best.d = scale(reflect(avg, m.d), sg);
+          a.changed = best.changed = true;
+          for (const it of fa ? best.items : fb ? a.items : [...a.items, ...best.items]) intent.add(it.g);
+          used.add(a).add(best);
+          if (round === 0) info.axes_mirror_pairs = (info.axes_mirror_pairs ?? 0) + 1;
+        }
+      }
     }
     info.axes_directions = dirs.length;
     // a direction several faces share is locked; one only squared to another may turn while it stays square
@@ -384,6 +473,19 @@ export function shareAxes(mesh, surfaces, opts = {}) {
         }
       }
     }
+    // a plane along an axis that passes within its precision of the axis contains it (a cut through a
+    // shaft's axis, a slot's mid-plane)
+    if (cfg.THROUGH) for (const L of lines) {
+      for (const [g, sp] of out) {
+        if (!sp || sp[0] !== 'plane' || rejected.has(g) || !pts.has(g)) continue;
+        const n = unit(sp[1].normal);
+        if (Math.abs(dot(n, L.d)) > 1e-12) continue;
+        const dist = dot(sub(L.o, sp[1].origin), n);
+        if (dist === 0 || Math.abs(dist) > lenTol(rms0.get(g), rms0.get(g), offTol)) continue;
+        out.set(g, ['plane', { ...sp[1], origin: add(sp[1].origin, scale(n, dist)) }]);
+        info.axes_plane_through_axis = (info.axes_plane_through_axis ?? 0) + 1;
+      }
+    }
     // spheres: a centre near a shared line moves onto it
     for (const [g, s] of surfaces) {
       if (!s || s[0] !== 'sphere' || rejected.has(g) || !pts.has(g)) continue;
@@ -422,7 +524,10 @@ export function shareAxes(mesh, surfaces, opts = {}) {
   for (const g of rejected) out.set(g, surfaces.get(g));
   info.axes_rejected = rejected.size;
   for (const g of rejected) { locks.dir.delete(g); locks.line.delete(g); locks.plane.delete(g); }
-  if (cfg.TANGENT_DEG > 0) Object.assign(info, makeTangent(mesh, out, weight, accepts, pts, cfg, locks));
+  const tangentSet = new Set();
+  if (cfg.TANGENT_DEG > 0) Object.assign(info, makeTangent(mesh, out, weight, accepts, pts, cfg, locks, tangentSet));
+  if (cfg.VALUE_REL > 0) Object.assign(info, shareValues(mesh, out, weight, accepts, pts, rms0, noisy ? cfg : { ...cfg, INTENT_REL: 0, INTENT_DEG: 0 }, locks, tangentSet, intent));
+  Object.assign(info, info0);
   const byKind = {};
   for (const g of rejected) { const k = surfaces.get(g)[0]; byKind[k] = (byKind[k] ?? 0) + 1; }
   for (const [k, n] of Object.entries(byKind)) info[`axes_rejected_${k}`] = n;
@@ -572,7 +677,7 @@ function frameOf(d) {
   return [e1, cross(d, e1)];
 }
 
-function makeTangent(mesh, surfaces, weight, accepts, pts, cfg, locks) {
+function makeTangent(mesh, surfaces, weight, accepts, pts, cfg, locks, tangentSet = new Set()) {
   const info = { tangent_pairs: 0, tangent_made: 0, tangent_rejected: 0 };
   const cosT = Math.cos((cfg.TANGENT_DEG * Math.PI) / 180);
   const par = 1e-9;                                    // "exactly" along / square, after the shared directions
@@ -598,13 +703,14 @@ function makeTangent(mesh, surfaces, weight, accepts, pts, cfg, locks) {
     const d = L.d, [e1, e2] = frameOf(d), o = L.o;
     const to2 = (x) => { const v = sub(x, o); return [dot(v, e1), dot(v, e2)]; };
     const cyl = L.members.filter((g) => surfaces.get(g)?.[0] === 'cylinder' && pts.has(g));
-    const n = 2 + cyl.length, A = [], b = [];
+    const n = 2 + cyl.length, A = [], b = [], used = [];
     cyl.forEach((g, i) => {
       for (const h of partners.get(g) ?? []) {
         const [k2, q] = surfaces.get(h);
         if (k2 !== 'plane' || W(h) <= W(g) || L.members.includes(h)) continue;
         const nn = unit(q.normal);
         if (Math.abs(dot(nn, d)) > par) continue;
+        used.push(h);
         const n2 = [dot(nn, e1), dot(nn, e2)], off = dot(sub(q.origin, o), nn), side = off > 0 ? -1 : 1;
         const row = new Array(n).fill(0);
         row[0] = side * n2[0]; row[1] = side * n2[1]; row[2 + i] = -1;
@@ -639,7 +745,8 @@ function makeTangent(mesh, surfaces, weight, accepts, pts, cfg, locks) {
       next.set(g, [kind, np]);
     }
     if (!ok) { info.tangent_lines_rejected = (info.tangent_lines_rejected ?? 0) + 1; continue; }
-    for (const [g, sp] of next) { surfaces.set(g, sp); doneLine.add(g); }
+    for (const [g, sp] of next) { surfaces.set(g, sp); doneLine.add(g); tangentSet.add(g); }
+    for (const h of used) tangentSet.add(h);
     info.tangent_lines = (info.tangent_lines ?? 0) + 1;
   }
   for (const g of [...partners.keys()].sort((a, b) => W(b) - W(a))) {
@@ -654,14 +761,16 @@ function makeTangent(mesh, surfaces, weight, accepts, pts, cfg, locks) {
     if (!ref.length) continue;
     const P = pts.get(g);
     let np = null;
+    const used = [];                                   // the references the constraints came from
     if (kind === 'cylinder') {
       const d = unit(p.axis), [e1, e2] = frameOf(d), o = p.axisPoint;
       const to2 = (x) => { const v = sub(x, o); return [dot(v, e1), dot(v, e2)]; };
       const A = [], b = [];
-      for (const [, k2, q] of ref) {
+      for (const [h, k2, q] of ref) {
         if (k2 !== 'plane') continue;
         const n = unit(q.normal);
         if (Math.abs(dot(n, d)) > par) continue;        // a tangent plane runs along the axis
+        used.push(h);
         const n2 = [dot(n, e1), dot(n, e2)], off = dot(sub(q.origin, o), n);
         const side = off > 0 ? -1 : 1;                  // the axis lies on this side of the plane
         A.push([side * n2[0], side * n2[1], -1]); b.push(side * off);   // side (n2 . c - off) = r
@@ -673,19 +782,21 @@ function makeTangent(mesh, surfaces, weight, accepts, pts, cfg, locks) {
       }
     } else if (kind === 'torus' || kind === 'sphere') {
       let axisD = kind === 'torus' ? unit(p.axis) : null;
-      if (!axisD) { const c = ref.find(([, k2]) => k2 === 'cylinder'); axisD = c ? unit(c[2].axis) : null; }
+      if (!axisD) { const c = ref.find(([, k2]) => k2 === 'cylinder'); axisD = c ? unit(c[2].axis) : null; if (c) used.push(c[0]); }
       if (axisD) {
         const o = p.center;
         const R0 = kind === 'torus' ? p.majorRadius : 0, r0 = kind === 'torus' ? p.minorRadius : p.radius;
         const A = kind === 'sphere' ? [[1, 0, 0]] : [], b = kind === 'sphere' ? [0] : [];
-        for (const [, k2, q] of ref) {
+        for (const [h, k2, q] of ref) {
           if (k2 === 'cylinder') {
             const v = sub(q.axisPoint, o);
             if (Math.abs(Math.abs(dot(unit(q.axis), axisD)) - 1) > par || norm(sub(v, scale(axisD, dot(v, axisD)))) > 1e-9 * mesh.diag) continue;
+            used.push(h);
             A.push([1, 0, Math.sign(q.radius - R0) || 1]); b.push(q.radius);            // R + s r = Rc
           } else if (k2 === 'plane') {
             const n = unit(q.normal);
             if (Math.abs(Math.abs(dot(n, axisD)) - 1) > par) continue;
+            used.push(h);
             const zp = dot(sub(q.origin, o), axisD);
             A.push([0, 1, Math.sign(zp) || 1]); b.push(zp);                              // zc + s r = z
           }
@@ -705,6 +816,7 @@ function makeTangent(mesh, surfaces, weight, accepts, pts, cfg, locks) {
       if (pl) {
         const q = pl[2], n = unit(q.normal), t = dot(sub(q.origin, p.apex), n) / dot(d, n);
         np = { ...p, apex: add(p.apex, scale(d, t)), halfAngle: Math.asin(Math.abs(dot(n, d))) };
+        used.push(pl[0]);
       }
     } else if (kind === 'plane') {
       const n0 = unit(p.normal);
@@ -713,20 +825,98 @@ function makeTangent(mesh, surfaces, weight, accepts, pts, cfg, locks) {
       if (cyl) {
         const q = cyl[2], off = dot(sub(p.origin, q.axisPoint), n0), sgn = Math.sign(off) || 1;
         np = { ...p, origin: add(p.origin, scale(n0, sgn * q.radius - off)) };
+        used.push(cyl[0]);
       } else if (cone && !locks.dir.has(g)) {
         const q = cone[2], a = unit(q.axis), sa = Math.sin(q.halfAngle), ca = Math.cos(q.halfAngle);
         const s = Math.sign(dot(n0, a)) || 1, perp = sub(n0, scale(a, dot(n0, a)));
         const nn = norm(perp) > 1e-9 ? add(scale(a, s * sa), scale(unit(perp), ca)) : null;
-        if (nn && (locks.perpTo.get(g) ?? []).every((f) => Math.abs(dot(nn, f)) <= 1e-9)) np = { ...p, normal: nn, origin: q.apex };
+        if (nn && (locks.perpTo.get(g) ?? []).every((f) => Math.abs(dot(nn, f)) <= 1e-9)) { np = { ...p, normal: nn, origin: q.apex }; used.push(cone[0]); }
       }
     }
     if (!np) continue;
     // a plane shared by several faces (one offset) moves as a whole, or not at all
     const set = kind === 'plane' ? (locks.planeSet.get(g) ?? [g]) : [g];
     if (set.every((h) => !pts.has(h) || accepts(h, kind, np))) {
-      for (const h of set) surfaces.set(h, [kind, np]);
+      for (const h of set) { surfaces.set(h, [kind, np]); tangentSet.add(h); }
+      // the references it was solved against hold the tangency too: the equal-size pass moving one leaves a
+      // near-tangent join the kernel builds slowly (00182468_37: 17 s -> 673 s)
+      for (const h of used) tangentSet.add(h);
       info.tangent_made++;
     } else info.tangent_rejected++;
   }
   return info;
+}
+
+// ── equal sizes ──────────────────────────────────────────────────────────────────────────────────────
+//
+// Design intent the part repeats: a pattern of identical holes, every chamfer at one angle, every fillet one
+// radius. Cylinder radii, cone half-angles and torus tube radii that agree within the fits' precision (capped
+// at VALUE_REL relative; cones at VALUE_ANGLE_DEG and CONE_REL) take one shared value, the precision-weighted
+// mean; each member then takes that value (nothing else moved) and must pass the usual acceptance.
+// Members of an exact tangency - the surface the tangency pass moved and the references its constraints came
+// from - keep their own value and share with no one:
+//   - moving a reference breaks the tangency, and the kernel builds the near-tangent join slowly (00182468_37:
+//     17 s -> 673 s);
+//   - a value the tangency fixed comes from the constraint, not the surface's own points: as a group's value it
+//     pulled twelve exact hole radii 6e-6 off on 00005406, and the build timed out (with it kept out, 77 s).
+// A joint solve that moves the tangent partners with the size would let them share too.
+const VALUE_OF = { cylinder: (p) => p.radius, cone: (p) => p.halfAngle, torus: (p) => p.minorRadius };
+
+function shareValues(mesh, surfaces, weight, accepts, pts, rms0, cfg, locks, fixedSet, intent) {
+  const info = { values_shared: 0, values_rejected: 0 };
+  for (const kind of Object.keys(VALUE_OF)) {
+    const items = [];
+    for (const [g, sp] of surfaces) {
+      if (!sp || sp[0] !== kind || !sp[1] || !pts.has(g) || fixedSet.has(g)) continue;
+      const P = pts.get(g);
+      const c = scale(P.reduce((a, x) => add(a, x), [0, 0, 0]), 1 / P.length);
+      const ext = Math.sqrt(P.reduce((a, x) => a + dot(sub(x, c), sub(x, c)), 0) / P.length) || mesh.diag;
+      items.push({ g, p: sp[1], v: VALUE_OF[kind](sp[1]), w: weight.get(g) ?? 0,
+        tol: kind === 'cone' ? rms0.get(g) / ext : rms0.get(g) });
+    }
+    // a cone's angle shares only within CONE_REL of itself too: near-zero angles (a cylinder fitted as a cone)
+    // agree in absolute terms but pivoting one onto another moves its apex hundreds of times its distance
+    const cap = (v) => (kind === 'cone' ? Math.min((cfg.VALUE_ANGLE_DEG * Math.PI) / 180, cfg.CONE_REL * Math.abs(v)) : cfg.VALUE_REL * Math.abs(v));
+    const floor = kind === 'cone' ? 1e-9 : 10 * cfg.FLOOR * mesh.diag;
+    const groups = [];
+    for (const it of [...items].sort((a, b) => b.w - a.w)) {
+      const intentTol = kind === 'cone' ? (cfg.INTENT_DEG * Math.PI) / 180 : cfg.INTENT_REL * Math.abs(it.v);
+      const k = groups.find((q) => Math.abs(q.v - it.v) <= Math.min(cap(q.v), Math.max(cfg.SIGMA_K * (q.tol + it.tol) + floor, intentTol)));
+      if (!k) { groups.push({ v: it.v, sw: it.w, tol: it.tol, items: [it] }); continue; }
+      k.items.push(it);
+      k.tol = Math.min(k.tol, it.tol);
+      if (it.w > 0) { k.v = (k.v * k.sw + it.v * it.w) / (k.sw + it.w); k.sw += it.w; }
+    }
+    for (const k of groups) {
+      if (k.items.length < 2) continue;
+      for (const it of k.items) {
+        if (it.v === k.v) continue;
+        const np = withValue(kind, it.p, k.v, pts.get(it.g));
+        // the intent floor only for a member that joined on the intent tolerance; one that agrees within
+        // precision (all of them on an exact mesh) is judged like any other move
+        if (Math.abs(it.v - k.v) > cfg.SIGMA_K * (it.tol + k.tol) + floor) intent.add(it.g);
+        if (np && accepts(it.g, kind, np)) { surfaces.set(it.g, [kind, np]); info.values_shared++; }
+        else info.values_rejected++;
+      }
+    }
+  }
+  return info;
+}
+
+/**
+ * The surface with its size set to v (radius, half-angle or tube radius) and nothing else moved. Refitting
+ * the rest about the points cost the kernel: on 00007917 re-estimating two cones' apexes by a median (a
+ * 6e-8 shift, angle change 2e-10) made the build 16x slower, the smallest change did not. A cone pivots
+ * about its patch: the radius at the points' mean height is kept.
+ */
+function withValue(kind, p, v, P) {
+  if (kind === 'cylinder') return { ...p, radius: v };
+  if (kind === 'torus') return { ...p, minorRadius: v };
+  if (kind === 'cone') {
+    const d = unit(p.axis), zr = profile(P, p.apex, d);
+    const zc = zr.reduce((a, [z]) => a + z, 0) / zr.length;
+    const sh = zc * (1 - Math.tan(p.halfAngle) / Math.tan(v));
+    return { ...p, apex: add(p.apex, scale(d, sh)), halfAngle: v };
+  }
+  return null;
 }

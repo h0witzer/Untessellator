@@ -4,7 +4,7 @@
  *
  * Usage:  node test/knit.mjs <mesh dir> <patch dir> <stem> [--out row.json] [--step out.step]
  *                            [--no-loop] [--no-fallback] [--budget 300] [--deadline s] [--faceted] [--no-split] [--no-axes]
- *                            [--no-tidy] [--no-exact-edges] [--no-contact] [--axes-opts '{"TANGENT_DEG":0}']
+ *                            [--no-tidy] [--no-exact-edges] [--no-contact] [--no-retry] [--axes-opts '{"TANGENT_DEG":0}']
  *
  *   <mesh dir>   <stem>.pos (float32 triangle soup)
  *   <patch dir>  <stem>.fid (a group per triangle) and <stem>.json (test/exportPatchFits.mjs format:
@@ -27,6 +27,7 @@ const NO_LOOP = bool('--no-loop');
 const NO_SPLIT = bool('--no-split');
 const NO_AXES = bool('--no-axes');
 const NO_TIDY = bool('--no-tidy');
+const NO_RETRY = bool('--no-retry');          // no plain retry of a clean build that is not analytic
 const AXES_OPTS = JSON.parse(flag('--axes-opts', '{}'));
 const NO_EXACT_EDGES = bool('--no-exact-edges');
 const NO_CONTACT = bool('--no-contact');
@@ -51,7 +52,7 @@ const oc = await loadOcct();
 const loadSecs = (performance.now() - t0) / 1000;
 let row;
 try {
-  const { solid, report } = knitSolid(oc, { positions, labels, surfaces }, { loop: !NO_LOOP, fallback: !NO_FALLBACK, budget: BUDGET, deadline: DEADLINE, mode: FACETED ? 'faceted' : 'knit', split: !NO_SPLIT, axes: !NO_AXES, axesOptions: AXES_OPTS, tidy: !NO_TIDY });
+  const { solid, report } = knitSolid(oc, { positions, labels, surfaces }, { loop: !NO_LOOP, fallback: !NO_FALLBACK, budget: BUDGET, deadline: DEADLINE, mode: FACETED ? 'faceted' : 'knit', split: !NO_SPLIT, axes: !NO_AXES, axesOptions: AXES_OPTS, tidy: !NO_TIDY, retryPlain: !NO_RETRY });
   row = { stem: STEM, ...report, load_secs: Math.round(loadSecs * 10) / 10 };
   if (STEP && solid) writeFileSync(STEP, writeStep(oc, solid));
 } catch (err) {

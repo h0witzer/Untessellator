@@ -13,7 +13,7 @@
 
 import { KnitMesh } from './mesh.js';
 import { buildRepaired, facetFallback, LOOP, now } from './repair.js';
-import { buildPolyhedral, grade, tidy } from './build.js';
+import { buildPolyhedral, grade, tidy, better, BUILD } from './build.js';
 import { buildFacets } from '../meshCore.js';
 import { attachCurvature } from '../curvature.js';
 import { fitRegionAs } from '../gaussMap.js';
@@ -105,7 +105,7 @@ export function addFreeform(mesh, surfaces, onProgress = null, { split = true } 
  */
 export function knitSolid(oc, { positions, labels, surfaces }, { loop = true, fallback = true, budget = LOOP.BUDGET_S,
   maxBuilds = LOOP.MAX_BUILDS, onProgress = null, deadline = Infinity, mode = 'knit', freeform = true, split = true,
-  axes = true, axesOptions = {}, tidy: tidyUp = true } = {}) {
+  axes = true, axesOptions = {}, tidy: tidyUp = true, retryPlain = true } = {}) {
   const t0 = performance.now();
   const end = now() + deadline;                  // past it: no new repair builds or facet tiers
   const mesh = new KnitMesh(positions, labels);
@@ -121,6 +121,7 @@ export function knitSolid(oc, { positions, labels, surfaces }, { loop = true, fa
   }
   budget = Math.min(budget, deadline / 2);
   if (freeform) Object.assign(info, addFreeform(mesh, surfs, onProgress, { split }));
+  const plainSurfs = new Map(surfs);              // the fits as they came, for the plain retry
   // shared axes and directions made exact (knit/axes.js): coaxial faces meet without a kink
   if (axes) {
     const ta = performance.now();
@@ -128,15 +129,34 @@ export function knitSolid(oc, { positions, labels, surfaces }, { loop = true, fa
     surfs = r.surfaces;
     Object.assign(info, r.info, { axes_ms: Math.round(performance.now() - ta) });
   }
-  try {
-    const r = buildRepaired(oc, mesh, surfs, { fitCandidates: loop ? fitCandidatesFor(positions) : null,
-      maxBuilds: loop ? maxBuilds : 1, budget, onProgress });
-    shape = r.shape;
-    state = r.state;
-    Object.assign(info, r.info);
-  } catch (err) {
-    info.exception = String(err?.message ?? err).slice(0, 120);
+  const attempt = (sf) => {
+    try {
+      return buildRepaired(oc, mesh, sf, { fitCandidates: loop ? fitCandidatesFor(positions) : null,
+        maxBuilds: loop ? maxBuilds : 1, budget, onProgress });
+    } catch (err) {
+      info.exception = String(err?.message ?? err).slice(0, 120);
+      if (globalThis.process?.env?.KNIT_DEBUG) info.exception_stack = String(err?.stack ?? '').split(/\r?\n/).slice(0, 8).join(' | ');
+      return null;
+    }
+  };
+  let r = attempt(surfs);
+  // The clean build (shared axes, exact edges, contact loci) is not analytic everywhere the plain one is:
+  // on 274 Onshape parts each was fully analytic on parts the other was not (deterministic gates, no
+  // time budget: clean 250, plain 254, 8 one way and 5 the other). So a clean build that is not fully
+  // analytic is retried plain, time permitting, and the plain one is kept if it is.
+  const clean = axes || BUILD.EXACT_EDGES || BUILD.CONTACT;
+  if (clean && retryPlain && !(r?.state?.ok) && now() < end - (deadline === Infinity ? 0 : deadline / 4)) {
+    const saved = { ...BUILD };
+    BUILD.EXACT_EDGES = false; BUILD.CONTACT = false;
+    let r2 = null;
+    try { r2 = attempt(plainSurfs); } finally { Object.assign(BUILD, saved); }
+    info.plain_retry = 1;
+    // the plain build replaces the clean one only when it is fully analytic: otherwise the clean one goes on
+    // to the facet tiers (a plain build that grades better but is not analytic fell to facets where the
+    // clean one made a hybrid, 00005406_001)
+    if (r2?.state?.ok || (!r?.state && r2?.state)) { r = r2; info.plain_retry_won = 1; }
   }
+  if (r) { shape = r.shape; state = r.state; Object.assign(info, r.info); }
   if (state && (state.ok || !fallback)) {
     out = { shape, sc: state.sc, tier: state.ok ? 'analytic' : 'none', facetTris: 0, facetArea: 0 };
   } else if (state) {

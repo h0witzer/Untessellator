@@ -7,13 +7,18 @@
  * Usage:  node test/studioExport.mjs <out dir> <file.stl> [<file.stl> ...] [--budget 300] [--dump] [--no-axes]
  *
  * Per file: <name>.step and <name>.json (the knitter's report, groups by type, timings). The mesh is
- * centred as js/stlLoader.js does and moved back for the export, as the studio does. --dump also writes
+ * centred as js/stlLoader.js does and moved back for the export, as the studio does. --synthetic: where
+ * <file>.src exists next to the STL (js/meshRepair.js's src, as test/meshDamage.mjs writes it), triangles with
+ * src -1 (hole caps) join the group most of the input triangles around them are in and are left out of typing
+ * and fitting, so a flat cap on a curved face does not make its group inexact; they go to the knitter in that
+ * group, with the vertices only caps use
+ * moved onto that group's fitted surface (a cap's centre would otherwise sit inside a curved face). --dump also writes
  * the painted part as test/knit.mjs input: <name>.pos (float32 soup), <name>.fid (group per triangle) and
  * <name>.fits.json, so the export can be rerun without painting again (positions in float32, so a rerun
  * can differ slightly from the run that wrote them).
  */
 
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
@@ -24,6 +29,7 @@ import { annotateEdges, edgeWall } from '../js/edgeWall.js';
 import { fitRegionAs } from '../js/gaussMap.js';
 import { freeformMerge } from '../js/freeformMerge.js';
 import { loadOcct, knitSolid, writeStep } from '../js/knit/index.js';
+import { distNormal } from '../js/knit/geometry.js';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const ort = createRequire(import.meta.url)('onnxruntime-node');
@@ -33,6 +39,8 @@ const BUDGET = Number(flag('--budget', '300'));
 const DEADLINE = Number(flag('--deadline', '150'));   // the studio's EXPORT_DEADLINE_S
 const DUMP = args.includes('--dump');
 const NO_AXES = args.includes('--no-axes');
+const SYNTHETIC = args.includes('--synthetic');
+if (SYNTHETIC) args.splice(args.indexOf('--synthetic'), 1);
 if (NO_AXES) args.splice(args.indexOf('--no-axes'), 1);
 if (DUMP) args.splice(args.indexOf('--dump'), 1);
 const [OUT, ...FILES] = args;
@@ -111,9 +119,31 @@ for (const file of FILES) {
   const paintSecs = (performance.now() - t0) / 1000;
   // the studio's end of auto-paint: freeform pieces joined, each finished group's type, then its fit
   const segments = new Set(owner).size - (owner.includes(-1) ? 1 : 0);
-  const { freeform, inexactShare } = freeformMerge(owner, facets, adjacency);
+  // typing and fitting see the input's own triangles only (--synthetic)
+  const srcPath = file.replace(/\.[^.]+$/, '.src');
+  const srcBuf = SYNTHETIC && existsSync(srcPath) ? readFileSync(srcPath) : null;
+  const src = srcBuf ? new Int32Array(srcBuf.buffer.slice(srcBuf.byteOffset, srcBuf.byteOffset + srcBuf.length)) : null;
+  if (src) {
+    // a cap says nothing about the shape: each connected run of cap triangles joins the group most of the
+    // input triangles around it are in, whatever the painter made of it
+    const seen = new Uint8Array(owner.length);
+    for (let s0 = 0; s0 < owner.length; s0++) {
+      if (src[s0] >= 0 || seen[s0]) continue;
+      const comp = [s0], votes = new Map();
+      seen[s0] = 1;
+      for (let qi = 0; qi < comp.length; qi++) for (const { neighbor: u } of adjacency.get(comp[qi]) ?? []) {
+        if (src[u] >= 0) { if (owner[u] >= 0) votes.set(owner[u], (votes.get(owner[u]) ?? 0) + 1); continue; }
+        if (!seen[u]) { seen[u] = 1; comp.push(u); }
+      }
+      let best = -1, n = 0;
+      for (const [g, c] of votes) if (c > n) { n = c; best = g; }
+      if (best >= 0) for (const t of comp) owner[t] = best;
+    }
+  }
+  const fitOwner = src ? Int32Array.from(owner, (g, t) => (src[t] < 0 ? -1 : g)) : owner;
+  const { freeform, inexactShare } = freeformMerge(fitOwner, facets, adjacency);
   const byGroup = new Map();
-  for (let t = 0; t < owner.length; t++) if (owner[t] >= 0) (byGroup.get(owner[t]) ?? byGroup.set(owner[t], new Set()).get(owner[t])).add(t);
+  for (let t = 0; t < fitOwner.length; t++) if (fitOwner[t] >= 0) (byGroup.get(fitOwner[t]) ?? byGroup.set(fitOwner[t], new Set()).get(fitOwner[t])).add(t);
   const surfaces = new Map();
   const typeCount = {};
   let retyped = 0;
@@ -131,6 +161,24 @@ for (const file of FILES) {
     surfaces.set(id, [type, p]);
   }
   const positions = Float64Array.from(centred, (v, i) => v + offset[i % 3]);
+  if (src) {
+    // a vertex only caps use goes onto the fitted surface of the one group its triangles are in
+    const users = new Map();
+    for (let t = 0; t < owner.length; t++) for (let k = 0; k < 3; k++) {
+      const o = t * 9 + k * 3, key = `${positions[o]},${positions[o + 1]},${positions[o + 2]}`;
+      const u = users.get(key) ?? users.set(key, { synth: true, groups: new Set(), at: [] }).get(key);
+      if (src[t] >= 0) u.synth = false;
+      u.groups.add(owner[t]); u.at.push(o);
+    }
+    for (const u of users.values()) {
+      if (!u.synth || u.groups.size !== 1) continue;
+      const s = surfaces.get([...u.groups][0]);
+      if (!s || s[0] === 'bspline') continue;
+      const x = [positions[u.at[0]], positions[u.at[0] + 1], positions[u.at[0] + 2]];
+      const [d, n] = distNormal(s[0], s[1], x);
+      for (const o of u.at) for (let j = 0; j < 3; j++) positions[o + j] = x[j] - d * n[j];
+    }
+  }
   if (DUMP) {
     writeFileSync(join(OUT, `${name}.pos`), Buffer.from(Float32Array.from(positions).buffer));
     writeFileSync(join(OUT, `${name}.fid`), Buffer.from(owner.buffer));
