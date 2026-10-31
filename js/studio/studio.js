@@ -61,6 +61,7 @@ const EDGE_WALL_TYPES = ['cylinder', 'cone', 'sphere', 'torus'];
 import { buildMeshModel, bodyEdges, outline } from './meshModel.js';
 import { createRenderer } from './renderer.js';
 import { GroupStore, typeLabel } from './groups.js';
+import { conversionNumbers, reportUrl } from './report.js';
 
 const UNPAINTED = [0.74, 0.74, 0.74];
 const FOV = ui.LIGHTING.fieldOfViewDegrees;
@@ -107,6 +108,8 @@ ui.registerIcons({
   auto: '<path d="M8 1.5c.5 3.6 2.4 5.5 6 6-3.6.5-5.5 2.4-6 6-.5-3.6-2.4-5.5-6-6 3.6-.5 5.5-2.4 6-6zM15 11c.3 2 1.3 3 3.3 3.3-2 .3-3 1.3-3.3 3.3-.3-2-1.3-3-3.3-3.3 2-.3 3-1.3 3.3-3.3z" />',
   // A wand with sparks: auto-paint.
   wand: '<path d="M2.5 16.4 12.9 6l1.6 1.6L4.1 18z" /><path d="M14 4.9l1.3-1.3 1.6 1.6-1.3 1.3zM8.6 1.5l.6 1.5 1.5.6-1.5.6-.6 1.5-.6-1.5-1.5-.6 1.5-.6zM16.4 9.6l.5 1.2 1.2.5-1.2.5-.5 1.2-.5-1.2-1.2-.5 1.2-.5z" />',
+  // A flag on a pole: report how the conversion went.
+  flag: '<path d="M4 2h1.6v16H4z" /><path d="M6.4 2.8h10l-2.6 3.9 2.6 3.9h-10z" />',
 });
 
 const settings = {
@@ -207,6 +210,7 @@ const toolbar = ui.createToolbar(shell.toolbar, [
   { kind: 'tool', id: 'autopaint', icon: 'wand', title: 'Auto-paint every unpainted face (P); Esc stops', onClick: () => runAutoPaint() },
   { kind: 'split', id: 'fill-options', icon: 'surface', title: 'Fill method and model', onClick: () => openFillMenu(), menu: () => fillMenu() },
   { kind: 'spacer' },
+  { kind: 'tool', id: 'report', icon: 'flag', title: 'Report how this conversion went: opens a GitHub issue with this run\'s numbers; nothing is sent until you submit it', onClick: () => reportConversion() },
   { kind: 'labelled', id: 'export', icon: 'build', label: 'Export STEP', accent: true, onClick: () => exportStep() },
 ]);
 
@@ -645,6 +649,7 @@ async function runAutoPaint() {
   if (stroke || autoRun) { say('Finish or cancel (Esc) the stroke or auto-paint first', true); return; }
   const current = mesh;
   const { store } = current;
+  const started = performance.now();
   autoRun = { stop: false };
   toolbar.setPressed('autopaint', true);
   setActive(null);
@@ -767,6 +772,9 @@ async function runAutoPaint() {
     let free = 0;
     for (let t = 0; t < store.owner.length; t++) if (store.owner[t] < 0) free++;
     const left = free > 0 ? ` · ${free.toLocaleString()} triangles left unpainted` : '';
+    // for the conversion report (report.js)
+    current.autoPaint = { secs: (performance.now() - started) / 1000, groups: byGroup.size, freeform: freeform.size,
+                          unpainted: free, stopped: !!result.stopped };
     const ff = freeform.size ? ` (${freeform.size} freeform, joined from ${result.segments})` : '';
     say(`Auto-paint ${result.stopped ? 'stopped' : 'done'}: ${byGroup.size} new groups${ff}${left}`);
   } catch (error) {
@@ -980,7 +988,8 @@ function afterHistory() {
 async function exportStep({ checked = false } = {}) {
   if (!mesh) return;
   if (stroke || autoRun) { say('Finish or cancel (Esc) the stroke or auto-paint first', true); return; }
-  const { store, model, geometry, name, synthetic } = mesh;
+  const current = mesh;
+  const { store, model, geometry, name, synthetic } = current;
   const groups = store.list();
   if (!groups.length) { say('Paint at least one face group first', true); return; }
   toolbar.setDisabled('export', 'Exporting…');
@@ -1035,15 +1044,38 @@ async function exportStep({ checked = false } = {}) {
       else result.report.failed = error.message;
     }
     const { step, report } = result;
+    current.lastExport = report;                  // for the conversion report (report.js)
     if (!step) throw new Error('no shape came out of the build');
     downloadStep(step, `${name}.stp`);
     say(exportSummary(`${name}.stp`, report, model.count - store.painted), report.tier !== 'analytic');
   } catch (error) {
     console.error(error);
+    current.lastExport ??= { failed: error.message };
     say(`Export failed: ${error.message}`, true);
   } finally {
     refreshPanel();
   }
+}
+
+/**
+ * The Report button: this run's numbers (report.js) in a new tab, as a prefilled GitHub issue the user reads,
+ * adds to, and submits or not. Nothing is sent from here.
+ */
+function reportConversion() {
+  const { store } = mesh ?? {};
+  const groups = store ? store.list().map((g) => ({ type: g.type, count: store.count(g.id) })) : [];
+  const numbers = conversionNumbers({
+    triangles: mesh?.model.count ?? 0,
+    repaired: mesh?.repair ? repairChanges(mesh.repair) : [],
+    model: MODELS.find((m) => m.url === settings.model)?.label ?? settings.model,
+    settings,
+    autoPaint: mesh?.autoPaint ?? null,
+    groups,
+    painted: store?.painted ?? 0,
+    exported: mesh?.lastExport ?? null,
+  });
+  window.open(reportUrl(numbers, { tier: mesh?.lastExport?.tier, groups: groups.length }), '_blank', 'noopener');
+  say('Opened a conversion report on GitHub: check the numbers, add what went wrong, then submit it');
 }
 
 /**

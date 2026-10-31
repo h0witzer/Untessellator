@@ -10,6 +10,8 @@ Open the result in any CAD program and you can select a hole, measure a diameter
 
 It runs in your browser: nothing is uploaded, there's no per-conversion fee, and it's MIT.
 
+**Try it: <https://h0witzer.github.io/stlToStep/>**
+
 Inspired by [CNCKitchen's stlTexturizer](https://github.com/CNCKitchen/stlTexturizer), which this
 project began as a fork of.
 
@@ -29,7 +31,7 @@ There's one engine with several front ends:
 
 | Front end | Status |
 |---|---|
-| **Standalone web app** (`studio.html`) | Works today, tied to no CAD system. It's static files plus libraries from public CDNs, so any static host should serve it. A tested deployment recipe is still wanted. |
+| **Standalone web app** (`index.html`) | Live at [h0witzer.github.io/stlToStep](https://h0witzer.github.io/stlToStep/), served by GitHub Pages straight from `main` and tied to no CAD system. It's static files plus libraries from public CDNs, so any static host can serve it. |
 | **Command line** (`test/studioExport.mjs`) | Works today. It runs the studio's own code and default settings headless. |
 | **SolidCraft plugin** | Wanted. SolidCraft's WebAssembly plugin interface is still being designed ([tangency-labs/solidcraft#1221](https://github.com/tangency-labs/solidcraft/issues/1221)). Until it lands, SolidCraft opens our STEP files with its own reader. |
 | **Onshape app** | In progress. The studio already looks and handles like Onshape (through the vendored Form Studio kit), but the integration with Onshape itself isn't built yet. |
@@ -42,7 +44,7 @@ node server.js
 ```
 
 Open <http://localhost:3000> in Chrome or Edge (`npm start` does the same as `node server.js`). The
-page has to be served; opening `studio.html` directly from disk leaves it blank.
+page has to be served; opening `index.html` directly from disk leaves it blank.
 
 1. Drop an `.stl`, `.obj` or `.3mf` file onto the viewport, or open one from the toolbar.
 2. Press **Auto-paint** (or <kbd>P</kbd>). Every face of the part gets a face group with a surface type
@@ -101,6 +103,19 @@ mesh ─► repair ─► paint face groups ─► fit + type each group ─► 
 - **You get faces, not a feature history.** There are no sketches or timeline yet.
 - **Large meshes are slow.** Parts with tens of thousands of triangles can take minutes to paint and
   export.
+
+## Tell us how it did
+
+The trained models ship with the studio and run in your browser, so we only learn how they do on
+real parts if you tell us. After a conversion, press the **flag** button next to Export STEP. It opens
+a GitHub issue with that run's numbers already filled in:
+
+- the model and fill settings that ran
+- how many face groups auto-paint made, and of which types
+- which tier the export reached, and how long it took
+
+You add what went wrong, plus a screenshot. Attach the mesh only if you're allowed to share it.
+Nothing is sent until you press Submit, and good results help as much as bad ones.
 
 ## How good is it?
 

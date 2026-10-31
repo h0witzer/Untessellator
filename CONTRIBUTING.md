@@ -97,7 +97,7 @@ out. The report says which tier it reached.
 
 | Path | What it is |
 |---|---|
-| `studio.html`, `js/studio/` | The studio: paint face groups on a mesh, export a STEP solid |
+| `index.html`, `js/studio/` | The studio: paint face groups on a mesh, export a STEP solid. `js/studio/report.js` builds the Report button's prefilled issue |
 | `js/paintCore.js`, `js/paintTool.js` | One click becomes one face group. `paintCore` has no model runtime and runs the same in Node and in the browser, so the harnesses measure what ships |
 | `js/autoPaint.js` | Paints a whole part, best seed first |
 | `js/regionGrow.js`, `js/edgeWall.js`, `js/cutFill.js`, `js/mergeRegions.js`, `js/freeformMerge.js` | Growth, learned face boundaries, min-cut fills, crumb merging, freeform grouping |
@@ -193,6 +193,10 @@ them. The 300-part Onshape set (ABC's own Onshape exports) is the real-exporter 
 **Make builder gates deterministic.** The repair loop has a time budget, so solids depend on machine
 load. Compare builder changes with `--budget 100000` and a few workers.
 
+**Real parts come in as conversion reports.** The studio's flag button opens an issue labelled
+`conversion report` with the run's numbers. Triage those, and turn each shareable mesh that fails into
+a fixture with a test that measures the fix.
+
 **Known friction:** the scripts default to `D:/abc-data/...` paths, and the bakes take hours of CPU.
 Ask Derek for the prepared eval sets rather than rebuilding them, and don't publish them. Making the
 data root configurable is the first item below.
@@ -204,10 +208,10 @@ Ranked, each with what "done" means.
 1. **One data root and a one-step eval.** Replace the hard-coded `D:/abc-data` paths with one
    setting. Make a single command that runs the standard gates and prints the tables. Done: a new
    contributor gets the Onshape-set numbers from one command.
-2. **A standalone web deployment.** The studio is static files plus CDN libraries, but nobody has
-   deployed it yet. Done means:
-   - a published build (GitHub Pages or any static host), with a check in a headless browser that
-     converts the fixtures
+2. **A standalone web deployment.** The studio is live on GitHub Pages
+   ([h0witzer.github.io/stlToStep](https://h0witzer.github.io/stlToStep/)), served straight from
+   `main`. What's left:
+   - a check in a headless browser, run on every push, that converts the fixtures
    - CDN libraries pinned, with an option to serve them ourselves so the app works offline
    - a neutral look for builds that have nothing to do with Onshape. The studio currently wears the
      Onshape-style Form Studio kit.

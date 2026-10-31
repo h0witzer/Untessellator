@@ -1,0 +1,58 @@
+name: Conversion report
+description: Tell us how a mesh converted, good or bad. The studio's Report button fills in the numbers.
+title: "Conversion report: "
+labels: ["conversion report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks. Reports like this are how we learn where the models and fitters fail on real parts, so
+        good results are as useful as bad ones.
+
+        Nothing was sent automatically. If you came from the studio's **Report** button, the numbers
+        below were filled in from your run; read them before you submit.
+  - type: dropdown
+    id: result
+    attributes:
+      label: How did it go?
+      options:
+        - Every face came out right (a fully analytic solid)
+        - A closed solid, but some faces were wrong or came out as facets
+        - A closed solid, but every face came out as facets
+        - The export failed or wasn't a closed solid
+        - Auto-paint got the faces wrong, so I didn't export
+    validations:
+      required: true
+  - type: dropdown
+    id: source
+    attributes:
+      label: Where did the mesh come from?
+      options:
+        - Exported from a CAD program
+        - Downloaded (Printables, MakerWorld, Thingiverse or similar)
+        - A 3D scan
+        - Sculpted, or a game or film asset
+        - Something else
+    validations:
+      required: true
+  - type: input
+    id: part
+    attributes:
+      label: What's the part, and which program made the mesh?
+      placeholder: "A bracket with fillets, exported from Fusion as a fine STL"
+  - type: textarea
+    id: wrong
+    attributes:
+      label: What went wrong, and where?
+      description: Which faces were wrong, split up or turned into facets. A screenshot with the face groups showing helps most.
+  - type: textarea
+    id: numbers
+    attributes:
+      label: The studio's numbers
+      description: Filled in by the Report button. If you came here another way, leave it empty.
+      render: text
+  - type: textarea
+    id: files
+    attributes:
+      label: Screenshots and the mesh
+      description: Drop screenshots here. Attach the mesh (zipped) only if you're allowed to share it; this repository is public.
