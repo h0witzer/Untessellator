@@ -1,5 +1,5 @@
 name: Conversion report
-description: Tell us how a mesh converted, good or bad. The studio's Report button fills in the numbers.
+description: Tell us how a mesh converted, good or bad. Untessellator's Report button fills in the numbers.
 title: "Conversion report: "
 labels: ["conversion report"]
 body:
@@ -9,7 +9,7 @@ body:
         Thanks. Reports like this are how we learn where the models and fitters fail on real parts, so
         good results are as useful as bad ones.
 
-        Nothing was sent automatically. If you came from the studio's **Report** button, the numbers
+        Nothing was sent automatically. If you came from Untessellator's **Report** button, the numbers
         below were filled in from your run; read them before you submit.
   - type: dropdown
     id: result
@@ -48,7 +48,7 @@ body:
   - type: textarea
     id: numbers
     attributes:
-      label: The studio's numbers
+      label: Untessellator's numbers
       description: Filled in by the Report button. If you came here another way, leave it empty.
       render: text
   - type: textarea

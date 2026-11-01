@@ -63,10 +63,10 @@ npm install          # onnxruntime-node and opencascade.js, for the Node harness
 npm start            # then open http://localhost:3000 in Chrome or Edge
 ```
 
-In the studio, load a mesh, run **Auto-paint**, then **Export STEP**. The first export downloads the
+In Untessellator, load a mesh, run **Auto-paint**, then **Export STEP**. The first export downloads the
 OpenCASCADE wasm build. It's large, and the browser caches it afterwards.
 
-To run the same thing without a browser, use the studio's code and default settings headless:
+To run the same thing without a browser, use the web page's code and default settings headless:
 
 ```sh
 node test/studioExport.mjs out/ part.stl     # writes out/part.step and out/part.json (the report)
@@ -94,12 +94,12 @@ optional.
 groups becomes an edge on both fitted surfaces. OCCT then judges the result, and fallback tiers
 (hybrid, planar, faceted) make sure a closed solid always comes out. The report says which tier it
 reached. The export builds the groups and types it is given and never changes them: the groups OCCT
-rejects are flagged in the studio, where Repair (`repairGroups` in `js/knit/index.js`) tries other
+rejects are flagged on the page, where Repair (`repairGroups` in `js/knit/index.js`) tries other
 types and merges on them, and each change it keeps becomes an undo step the user can see.
 
 | Path | What it is |
 |---|---|
-| `index.html`, `js/studio/` | The studio: paint face groups on a mesh, export a STEP solid. `js/studio/report.js` builds the Report button's report file and prefilled issue |
+| `index.html`, `js/studio/` | The web page: paint face groups on a mesh, export a STEP solid. `js/studio/report.js` builds the Report button's report file and prefilled issue |
 | `js/paintCore.js`, `js/paintTool.js` | One click becomes one face group. `paintCore` has no model runtime and runs the same in Node and in the browser, so the harnesses measure what ships |
 | `js/autoPaint.js` | Paints a whole part, best seed first |
 | `js/regionGrow.js`, `js/edgeWall.js`, `js/cutFill.js`, `js/mergeRegions.js`, `js/freeformMerge.js` | Growth, learned face boundaries, min-cut fills, crumb merging, freeform grouping |
@@ -118,7 +118,7 @@ types and merges on them, and each change it keeps becomes an undo step the user
 1. **The core never depends on a model.**
    - A model may only propose which triangles belong together, plus a type hint.
    - Surfaces always come from the fitters, and topology from the knitter.
-   - With `models/` deleted, the studio still has to paint and export.
+   - With `models/` deleted, Untessellator still has to paint and export.
 2. **Recover the CAD surface, not the mesh.**
    - Fitters and typing are judged by how close they come to the true STEP surface. A lower mesh
      residual never justifies a regression against the truth.
@@ -168,7 +168,7 @@ types and merges on them, and each change it keeps becomes an undo step the user
       One example would be a host where JavaScript is too slow.
     - "Why not Rust, with solidcore?" is answered, with numbers and what would change the answer, in
       [docs/rust-and-solidcore.md](docs/rust-and-solidcore.md).
-11. **`vendor/form-studio-ui/` is never edited.** Where the studio needs different behaviour, build
+11. **`vendor/form-studio-ui/` is never edited.** Where the page needs different behavior, build
     it in `js/studio/` from the kit's exports.
 
 ## Measuring a change
@@ -197,7 +197,7 @@ them. The 300-part Onshape set (ABC's own Onshape exports) is the real-exporter 
 **Make builder gates deterministic.** Repair has a time budget, so its solids depend on machine
 load. Compare changes to it with `test/knit.mjs --repair --budget 100000` and a few workers.
 
-**Real parts come in as conversion reports.** The studio's flag button opens an issue labelled
+**Real parts come in as conversion reports.** Untessellator's flag button opens an issue labelled
 `conversion report`, with a report file attached by the user. `node test/reportReplay.mjs <report.zip>`
 reads one. It prints every group that went wrong and the step it went wrong at: the model's seed and
 prediction, the typing, the fit, the export check, or the kernel and repair loop. When the mesh is
@@ -215,12 +215,12 @@ Ranked, each with what "done" means.
 1. **One data root and a one-step eval.** Replace the hard-coded `D:/abc-data` paths with one
    setting. Make a single command that runs the standard gates and prints the tables. Done: a new
    contributor gets the Onshape-set numbers from one command.
-2. **A standalone web deployment.** The studio is live on GitHub Pages
+2. **A standalone web deployment.** Untessellator is live on GitHub Pages
    ([untessellator.com](https://untessellator.com)), served straight from
    `main`. What's left:
    - a check in a headless browser, run on every push, that converts the fixtures
    - CDN libraries pinned, with an option to serve them ourselves so the app works offline
-   - a neutral look for builds that have nothing to do with Onshape. The studio currently wears the
+   - a neutral look for builds that have nothing to do with Onshape. The page currently wears the
      Onshape-style Form Studio kit.
 3. **A SolidCraft plugin.** SolidCraft has paused work on its own kernel, so this belongs in a plugin,
    not in their kernel crate. There are two stages:
@@ -231,7 +231,7 @@ Ranked, each with what "done" means.
      engine commands): ship it as a one-shot plugin. Two questions decide how, and both get
      measured before anyone ports code:
      - **OpenCASCADE.** SolidCraft's contributors can't work on code that carries it, and its full
-       build is a 50 MB wasm file. In the studio's export path, only about 1,000 of our 16,000 lines
+       build is a 50 MB wasm file. In the web page's export path, only about 1,000 of our 16,000 lines
        of JavaScript call it (`js/knit/build.js`, `occt.js`, `repair.js`). Removing it doesn't
        depend on the language: a
        STEP can be written without a kernel (analytic faces trimmed by the mesh's own boundaries),

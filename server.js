@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
- * Minimal development server for the Untessellator studio.
+ * Minimal development server for Untessellator.
  *
  * Usage:
- *   node server.js          # serves the studio on http://localhost:3000
+ *   node server.js          # serves Untessellator on http://localhost:3000
  *   PORT=8080 node server.js
  */
 
@@ -63,7 +63,7 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, '127.0.0.1', () => {
   const url = `http://localhost:${PORT}/`;
   console.log('');
-  console.log('  Untessellator Studio');
+  console.log('  Untessellator');
   console.log('  ───────────────────────────────────');
   console.log(`  Open in your browser: ${url}`);
   console.log('');

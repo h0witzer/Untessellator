@@ -1,5 +1,5 @@
 /**
- * studio.js — the Untessellator studio: paint face groups onto a mesh, see how well each one fits, fix what
+ * studio.js — Untessellator's page: paint face groups onto a mesh, see how well each one fits, fix what
  * doesn't, and export a STEP solid. index.html loads it.
  *
  * The page is the studio's own (index.html, workbench.css): a top bar; a tool row with Select, Bucket, Brush and

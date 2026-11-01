@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://untessellator.com"><img alt="Open the studio at untessellator.com" src="https://img.shields.io/badge/Open_the_studio-untessellator.com-b98cff?style=for-the-badge&labelColor=2a1638"></a>
+  <a href="https://untessellator.com"><img alt="Open Untessellator at untessellator.com" src="https://img.shields.io/badge/Open_Untessellator-untessellator.com-b98cff?style=for-the-badge&labelColor=2a1638"></a>
   <a href="https://h0witzer.github.io/Untessellator-Gallery/"><img alt="Gallery: verified face by face" src="https://img.shields.io/badge/Gallery-verified_face_by_face-2fc59a?style=for-the-badge&labelColor=2a1638"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-ffc933?style=for-the-badge&labelColor=2a1638"></a>
   <a href="https://ko-fi.com/derekvanallen"><img alt="Support on Ko-fi" src="https://img.shields.io/badge/Support-Ko--fi-ff5c8a?style=for-the-badge&labelColor=2a1638"></a>
@@ -17,7 +17,7 @@ Untessellator reads an STL, OBJ or 3MF file and writes a STEP solid made of real
 Open the result in any CAD program and you can select a hole, measure a diameter, or push a face.
 
 <p align="center">
-  <img src="docs/images/studio.png" alt="The studio: a watch stand auto-painted into 75 face groups and colored by surface type, with a cone selected and its fit shown in the inspector" width="100%">
+  <img src="docs/images/studio.png" alt="Untessellator: a watch stand auto-painted into 75 face groups and colored by surface type, with a cone selected and its fit shown in the inspector" width="100%">
 </p>
 
 It runs in your browser: nothing is uploaded, there's no per-conversion fee, and it's MIT.
@@ -52,9 +52,9 @@ There's one engine with several front ends:
 | Front end | Status |
 |---|---|
 | **Standalone web app** (`index.html`) | Live at [untessellator.com](https://untessellator.com), served by GitHub Pages straight from `main` and tied to no CAD system. It's static files plus libraries from public CDNs, so any static host can serve it. |
-| **Command line** (`test/studioExport.mjs`) | Works today. It runs the studio's own code and default settings headless. |
+| **Command line** (`test/studioExport.mjs`) | Works today. It runs Untessellator's own code and default settings headless. |
 | **SolidCraft plugin** | Wanted. SolidCraft's WebAssembly plugin interface is still being designed ([tangency-labs/solidcraft#1221](https://github.com/tangency-labs/solidcraft/issues/1221)). Until it lands, SolidCraft opens our STEP files with its own reader. |
-| **Onshape app** | In progress. The studio's viewport handles like Onshape's (camera, view cube and lighting from the vendored Form Studio kit), but the integration with Onshape itself isn't built yet. |
+| **Onshape app** | In progress. Untessellator's viewport handles like Onshape's (camera, view cube and lighting from the vendored Form Studio kit), but the integration with Onshape itself isn't built yet. |
 
 ## Quick start
 
@@ -148,7 +148,7 @@ mesh ─► repair ─► paint face groups ─► fit + type each group ─► 
 
 ## Tell us how it did
 
-The trained models ship with the studio and run in your browser, so we only learn how they do on
+The trained models ship with Untessellator and run in your browser, so we only learn how they do on
 real parts if you tell us. After a conversion, press the **flag** button next to Export STEP and
 choose what goes in. It does two things:
 
@@ -198,7 +198,7 @@ Then open an issue saying what you're picking up.
 | [fflate](https://github.com/101arrowz/fflate) | 0.8.2 | MIT | Reading 3MF archives |
 | [onnxruntime-web](https://onnxruntime.ai/) | 1.22.0 | MIT | Running the optional models |
 | [opencascade.js](https://github.com/donalffons/opencascade.js) | 2.0.0-beta | LGPL-2.1 | The geometry kernel behind the STEP export |
-| Form Studio UI kit (`vendor/form-studio-ui/`) | vendored | LGPL-2.1-or-later | The studio's camera, view cube, menus, tooltips and rendering pieces |
+| Form Studio UI kit (`vendor/form-studio-ui/`) | vendored | LGPL-2.1-or-later | Untessellator's camera, view cube, menus, tooltips and rendering pieces |
 
 The browser loads the libraries from jsDelivr and unpkg. The Node harnesses use `onnxruntime-node`
 and `opencascade.js` from `npm install`.

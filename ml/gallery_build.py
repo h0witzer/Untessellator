@@ -7,20 +7,20 @@ gallery_build.py - the verified-results gallery: every part whose exported STEP 
 
 Two corpora:
 
-  one-shot  test/studioExport.mjs --repair output, the studio's Auto-paint then Export STEP with default
+  one-shot  test/studioExport.mjs --repair output, Untessellator's Auto-paint then Export STEP with default
             settings (then Repair and Export again when that isn't every face analytic) and no hand edits,
             for the meshes in --oneshot-in. A part whose report has "crashed" (the export died) counts as
             'no export'. The original of a part named <model>_<idx> is
             <originals>/<model>/<model>_<hash>_step_<idx>.step (ABC's layout).
   painted   --painted <dir>/<name>/ holds:
-              export.step     the studio's Export STEP
+              export.step     Untessellator's Export STEP
               original.step   the CAD the mesh came from
-              report.zip      the studio's report (the flag button): its groups say which ones were painted by
+              report.zip      Untessellator's report (the flag button): its groups say which ones were painted by
                               hand, and its part.stl is the input if it has the mesh
               <name>.stl      the mesh (input.stl in older folders), if report.zip has none
               meta.json       optional: {"title", "credit", "link", "license"}
             The queue's folders are one-shot misses (--queue-order, --queue-add). --collect [<downloads>] first moves
-            the studio's downloads into them: <name>.stp (the studio names it after the mesh) as export.step,
+            Untessellator's downloads into them: <name>.stp (Untessellator names it after the mesh) as export.step,
             and each Untessellator-report-*.zip as the report.zip of the part whose mesh has its triangle count.
 
 Writes into the site:
@@ -363,7 +363,7 @@ def notes(args, pid):
     rows = [f'  {k:10} original {t.get(k, 0):4}   one-shot STEP {o.get(k, 0):6}   auto-paint groups {g.get(k, 0):4}'
             for k in KINDS if t.get(k) or o.get(k) or g.get(k)]
     return (f"{pid}: the one-shot export missed because {rep.get('reason')}.\n\n" + '\n'.join(rows) +
-            f'\n\nTo paint it: open {pid}.stl in the studio, press Auto-paint, repaint the faces that are wrong, then\n'
+            f'\n\nTo paint it: open {pid}.stl in Untessellator, press Auto-paint, repaint the faces that are wrong, then\n'
             f'Export STEP and Save STEP ({pid}.stp), and press the flag button for the report. Both land in your\n'
             'downloads; ml/gallery_build.py --collect moves them here as export.step and report.zip and checks the\n'
             'export against original.step. QUEUE.md, one folder up, says how it did.\n')
@@ -375,7 +375,7 @@ ANALYTIC = {'plane', 'cylinder', 'cone', 'sphere', 'torus'}
 def showcase(misses):
     """The painting queue's default order: the misses a person can bring to a match, the most features first.
     Reachable means an original of analytic faces only (a freeform fit doesn't come within 1 µm of a B-spline,
-    and the studio makes no extrusions or revolutions) and auto-paint groups within a quarter of the original's
+    and Untessellator makes no extrusions or revolutions) and auto-paint groups within a quarter of the original's
     face count by type, but not all of them right while the export's types are off: then the export changed
     the types, which painting doesn't fix. Features are faces, with curved ones (holes, bosses, chamfers,
     fillets) counted thrice."""
@@ -386,8 +386,8 @@ def showcase(misses):
 
 def queue_misses(args, misses, n, first=()):
     """Tops the painting queue up to n folders from misses, in order: <painted>/<id>/ for each miss that has no
-    folder yet, with <id>.stl (so the studio saves <id>.stp), original.step, meta.json and NOTES.txt (what
-    differs). The misses named in first get a folder whatever n is. Painting one means getting the studio's
+    folder yet, with <id>.stl (so Untessellator saves <id>.stp), original.step, meta.json and NOTES.txt (what
+    differs). The misses named in first get a folder whatever n is. Painting one means getting Untessellator's
     export.step and report.zip there (--collect)."""
     args.painted.mkdir(parents=True, exist_ok=True)
     waiting = [d for d in args.painted.iterdir() if d.is_dir() and not (d / 'export.step').exists()]
@@ -417,7 +417,7 @@ def queue_misses(args, misses, n, first=()):
 
 
 def collect(args, src):
-    """Moves the studio's downloads for the painting queue from src (the browser's downloads folder) into the
+    """Moves Untessellator's downloads for the painting queue from src (the browser's downloads folder) into the
     queue's folders: a folder's newest <id>.stp / <id>.step / "<id> (n).stp" becomes its export.step, and each
     Untessellator-report-*.zip becomes report.zip of the one folder whose mesh has the report's input triangle
     count (the import repair's triangles_in; the mesh's count when nothing was repaired). Several folders with
@@ -496,7 +496,7 @@ def write_queue(args, queue, reps):
         '--queue-add, then by default the most features first). "Auto-paint vs original" counts groups by type,\n'
         'original → auto-paint.\n'
         'For each part:\n\n'
-        '1. Open `<id>.stl` from its folder in the studio (https://untessellator.com), press Auto-paint, and repaint\n'
+        '1. Open `<id>.stl` from its folder in Untessellator (https://untessellator.com), press Auto-paint, and repaint\n'
         '   the faces that are wrong. NOTES.txt in the folder has the counts.\n'
         '2. Export STEP, then Save STEP: it downloads as `<id>.stp`.\n'
         '3. Press the flag button for the report (no picture or mesh needed), and close the GitHub tab it opens.\n\n'
