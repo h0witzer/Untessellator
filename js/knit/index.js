@@ -156,6 +156,24 @@ export function knitSolid(oc, { positions, labels, surfaces }, { fallback = true
     // clean one made a hybrid, 00005406_001)
     if (r2?.state?.ok || (!r?.state && r2?.state)) { r = r2; info.plain_retry_won = 1; }
   }
+  // ssi's edges (build.js ssiArcs) are not analytic everywhere the mesh's own points are (6 of the 275 Onshape
+  // parts need the mesh's, 2026-11-01). So a part that is still not fully analytic is built again from the points
+  // the mesh has, clean then plain, time permitting, and that build is kept when it is fully analytic.
+  const timeLeft = () => now() < end - (deadline === Infinity ? 0 : deadline / 4);
+  if (BUILD.SSI && !(r?.state?.ok) && timeLeft()) {
+    const saved = { ...BUILD };
+    BUILD.SSI = false;
+    let r3 = null;
+    try {
+      r3 = attempt(surfs);
+      if (clean && retryPlain && !(r3?.state?.ok) && timeLeft()) {
+        BUILD.EXACT_EDGES = false; BUILD.CONTACT = false;
+        r3 = attempt(plainSurfs);
+      }
+    } finally { Object.assign(BUILD, saved); }
+    info.mesh_points_retry = 1;
+    if (r3?.state?.ok) { r = r3; info.mesh_points_won = 1; }
+  }
   if (r) { shape = r.shape; state = r.state; Object.assign(info, r.info); }
   if (state && (state.ok || !fallback)) {
     out = { shape, sc: state.sc, tier: state.ok ? 'analytic' : 'none', facetTris: 0, facetArea: 0 };

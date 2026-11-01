@@ -7,6 +7,8 @@
  * (TColgp_HArray1OfPnt still has no binding, so knit/geometry.js interpolates the B-splines itself).
  */
 
+import { loadSsi } from './ssi.js';
+
 export const OCCT_VERSION = '2.0.0-beta.b5ff984';
 const CDN = `https://unpkg.com/opencascade.js@${OCCT_VERSION}/dist/`;
 const isNode = typeof process !== 'undefined' && !!process.versions?.node && typeof window === 'undefined'
@@ -18,6 +20,8 @@ let loading = null;
 export function loadOcct({ onStatus } = {}) {
   if (!loading) {
     loading = (async () => {
+      // ssi (exact edges, knit/ssi.js) loads beside the kernel; without it the knitter builds its edges as before
+      await loadSsi().catch(() => null);
       if (isNode) {
         const { default: init } = await import('opencascade.js/dist/node.js');
         return init();

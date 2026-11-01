@@ -4,7 +4,8 @@
  *
  * Usage:  node test/knit.mjs <mesh dir> <patch dir> <stem> [--out row.json] [--step out.step]
  *                            [--repair] [--no-fallback] [--budget 300] [--deadline s] [--faceted] [--no-split] [--no-axes]
- *                            [--no-tidy] [--no-exact-edges] [--no-contact] [--no-retry] [--axes-opts '{"TANGENT_DEG":0}']
+ *                            [--no-tidy] [--no-exact-edges] [--no-contact] [--no-ssi] [--no-pinch] [--no-retry]
+ *                            [--axes-opts '{"TANGENT_DEG":0}']
  *
  *   <mesh dir>   <stem>.pos (float32 triangle soup)
  *   <patch dir>  <stem>.fid (a group per triangle) and <stem>.json (test/exportPatchFits.mjs format:
@@ -35,8 +36,12 @@ const NO_RETRY = bool('--no-retry');          // no plain retry of a clean build
 const AXES_OPTS = JSON.parse(flag('--axes-opts', '{}'));
 const NO_EXACT_EDGES = bool('--no-exact-edges');
 const NO_CONTACT = bool('--no-contact');
+const NO_SSI = bool('--no-ssi');
+const NO_PINCH = bool('--no-pinch');
 if (NO_EXACT_EDGES) BUILD.EXACT_EDGES = false;
 if (NO_CONTACT) BUILD.CONTACT = false;
+if (NO_SSI) BUILD.SSI = false;
+if (NO_PINCH) BUILD.PINCH = false;
 const NO_FALLBACK = bool('--no-fallback');
 const DEADLINE = Number(flag('--deadline', 'Infinity'));
 const FACETED = bool('--faceted');

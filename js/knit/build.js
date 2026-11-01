@@ -12,9 +12,10 @@
  *   repair  one ShapeFix_Shape over the shell, then natural-bound wires it added are dropped
  */
 
-import { distNormal, projectOnto, seamAway, unfoldChain, interpolateChain, unit, sub, dot, scale, norm, cross,
+import { distNormal, projectOnto, seamAway, unfoldChain, interpolateChain, unit, sub, add, dot, scale, norm, cross,
   tangentLocus, ontoLocus, cornerOnLocus, exactCurve } from './geometry.js';
 import { meshTopology, BODY_STRIDE } from './mesh.js';
+import { ssiNow } from './ssi.js';
 
 const bump = (info, k, n = 1) => { info[k] = (info[k] ?? 0) + n; };
 
@@ -104,8 +105,8 @@ function bsplineSurface(oc, p) {
 
 const EXACT_EDGE_TOL = 1e-8;
 const CONTACT_TOL = 1e-7;
-/** Switches for experiments (test/knit.mjs): exact line / circle edges and contact loci. */
-export const BUILD = { EXACT_EDGES: true, CONTACT: true };
+/** Switches for experiments (test/knit.mjs): exact line / circle edges, contact loci, ssi's edges, exact pinches. */
+export const BUILD = { EXACT_EDGES: true, CONTACT: true, SSI: true, PINCH: true };
 
 /** An edge on an exact line or circle (exactCurve) from v0 to v1, following the chain's direction. */
 function exactEdge(oc, ex, pts, closed, v0, v1) {
@@ -140,6 +141,215 @@ function chainEdge(oc, pts, closed, v0, v1) {
 }
 
 /**
+ * EXACT EDGES FROM SSI (knit/ssi.js). Each pair of analytic surfaces is intersected once, as ssi patches over
+ * their groups' vertices and SSI.PAD x diagonal more, and an edge between them follows that curve from corner to
+ * corner instead of a spline through the mesh's own points, which a coarse mesh leaves few of (Onshape meshed
+ * 0.57 mm holes as squares, 00004314_026: the spline through 4 points bulged 85 µm). The curve must pass within
+ * SSI.FOLLOW x diagonal of every point of the chain, which are on both surfaces too, or the chain keeps them: so
+ * does a pair with a B-spline side, a cone over its apex, and a pair ssi refuses (a contact it cannot prove).
+ * Returns (a, b, pts, closed) -> the edge's points, its corners first and last, or null.
+ */
+export const SSI = { PAD: 0.05, FOLLOW: 1e-4, SAG: 0.05, CORNER: 1e-2 };
+
+function ssiArcs(mesh, surf, patchTris, info) {
+  const ssi = ssiNow();
+  if (!ssi) return () => null;
+  const { V, T, diag } = mesh;
+  const pad = SSI.PAD * diag, follow = SSI.FOLLOW * diag;
+  const perp = (d) => unit(cross(d, Math.abs(d[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0]));
+  const vertsOf = (g) => {
+    const seen = new Set();
+    for (const t of patchTris.get(g) ?? []) for (const v of T[t]) seen.add(v);
+    return [...seen].map((v) => V[v]);
+  };
+  const range = (vals) => [Math.min(...vals) - pad, Math.max(...vals) + pad];
+  // the shortest arc (degrees) holding every angle (radians), `more` radians wider each way: a whole surface would
+  // set ssi's resolution by its own size (a torus fitted with R 2537 to a 50 mm part's fillet, 00003838_001)
+  const arc = (angles, more) => {
+    const deg = angles.map((t) => ((t * 180) / Math.PI + 360) % 360).sort((x, y) => x - y);
+    let gap = 360 - deg[deg.length - 1] + deg[0], from = deg[0];
+    for (let i = 1; i < deg.length; i++) if (deg[i] - deg[i - 1] > gap) { gap = deg[i] - deg[i - 1]; from = deg[i]; }
+    const wide = 360 - gap + (2 * more * 180) / Math.PI;
+    if (wide >= 360) return [0, 360];
+    const a0 = from - (more * 180) / Math.PI;
+    return [a0, a0 + wide];
+  };
+  const around = (q, o, a, x, y) => { const w = sub(q, o); return Math.atan2(dot(w, y), dot(w, x)); };
+  const spec = (g) => {
+    const [kind, p] = surf(g) ?? [];
+    const pts = vertsOf(g);
+    if (!pts.length) return null;
+    if (kind === 'plane') {
+      const n = unit(p.normal), x = perp(n), y = cross(n, x);
+      const [u0, u1] = range(pts.map((q) => dot(sub(q, p.origin), x))), [v0, v1] = range(pts.map((q) => dot(sub(q, p.origin), y)));
+      return [ssi.KIND.plane, ...p.origin, ...x, ...y, u0, u1, v0, v1];
+    }
+    if (kind === 'cylinder') {
+      const a = unit(p.axis), x = perp(a), y = cross(a, x);
+      return [ssi.KIND.cylinder, ...p.axisPoint, ...x, ...y, p.radius, ...arc(pts.map((q) => around(q, p.axisPoint, a, x, y)), pad / p.radius),
+        ...range(pts.map((q) => dot(sub(q, p.axisPoint), a)))];
+    }
+    if (kind === 'cone') {
+      let a = unit(p.axis);
+      let h = pts.map((q) => dot(sub(q, p.apex), a));
+      if (Math.max(...h) <= 0) { a = scale(a, -1); h = h.map((v) => -v); }
+      if (Math.min(...h) <= 0) return null;                   // both nappes: not one ssi patch
+      const x = perp(a), y = cross(a, x), [h0, h1] = range(h);
+      const [a0, a1] = arc(pts.map((q) => around(q, p.apex, a, x, y)), pad / (Math.min(...h) * Math.tan(p.halfAngle) || 1));
+      if (a0 !== 0 || a1 !== 360) return null;                   // ssi's cone is whole about its axis
+      return [ssi.KIND.cone, ...p.apex, ...x, ...y, (p.halfAngle * 180) / Math.PI, Math.max(h0, Math.min(...h) / 2), h1];
+    }
+    if (kind === 'sphere') {
+      const x = [1, 0, 0], y = [0, 1, 0];
+      return [ssi.KIND.sphere, ...p.center, ...x, ...y, p.radius, 0, 360, -90, 90];
+    }
+    if (kind === 'torus') {
+      const a = unit(p.axis), x = perp(a), y = cross(a, x);
+      const R = p.majorRadius, r = p.minorRadius;
+      const minor = pts.map((q) => { const w = sub(q, p.center), z = dot(w, a); return Math.atan2(z, Math.hypot(dot(w, x), dot(w, y)) - R); });
+      return [ssi.KIND.torus, ...p.center, ...x, ...y, R, r, ...arc(pts.map((q) => around(q, p.center, a, x, y)), pad / R), ...arc(minor, pad / r)];
+    }
+    return null;                                              // a B-spline: not given to ssi yet
+  };
+  const curvesOf = new Map();
+  const pairCurves = (a, b) => {
+    const key = a < b ? `${a}|${b}` : `${b}|${a}`;
+    if (!curvesOf.has(key)) {
+      let curves = null;
+      const sa = spec(a), sb = spec(b);
+      if (sa && sb) {
+        try {
+          curves = ssi.intersect(sa, sb).curves.map((c) => ({ closed: c.closed, pts: c.points.map((q) => q.p) }));
+          bump(info, 'ssi_pairs');
+        } catch (err) {
+          bump(info, `ssi_refused_${err.code ?? 'error'}`);
+        }
+      }
+      curvesOf.set(key, curves);
+    }
+    return curvesOf.get(key);
+  };
+  // where q falls along polyline P: [segment + fraction, distance less the chord's sag allowance]
+  const locate = (P, closed, q) => {
+    let best = [0, Infinity];
+    const n = closed ? P.length : P.length - 1;
+    for (let i = 0; i < n; i++) {
+      const p0 = P[i], d = sub(P[(i + 1) % P.length], p0), dd = dot(d, d);
+      const t = dd > 0 ? Math.min(1, Math.max(0, dot(sub(q, p0), d) / dd)) : 0;
+      // the polyline is chords of the curve: a point on the curve sits up to its chord's sag off it
+      const e = Math.max(0, norm(sub(q, add(p0, scale(d, t)))) - SSI.SAG * Math.sqrt(dd));
+      if (e < best[1]) best = [i + t, e];
+    }
+    return best;
+  };
+  return (a, b, pts, closed) => {
+    const curves = pairCurves(a, b);
+    if (!curves?.length) return null;
+    let pick = null;
+    for (const c of curves) {
+      if (closed && !c.closed) continue;
+      const at = pts.map((q) => locate(c.pts, c.closed, q));
+      // the chain's own points are on both surfaces, so on the curve; its corners are on three or more, which
+      // fits put a little off it (8e-4 x diagonal on 00001439_023): they need only be near
+      const ends = closed ? [0] : [0, pts.length - 1];
+      const worst = Math.max(0, ...at.filter((_, i) => !ends.includes(i)).map(([, e]) => e));
+      if (worst > follow || ends.some((i) => at[i][1] > SSI.CORNER * diag)) continue;
+      if (!pick || worst < pick.worst) pick = { c, at, worst };
+    }
+    if (!pick) { bump(info, 'ssi_not_followed'); return null; }
+    const { c, at } = pick, P = c.pts, N = P.length, s = at.map(([x]) => x);
+    const span = c.closed ? N : N - 1;
+    const ahead = (x, y) => (c.closed ? (((y - x) % span) + span) % span : y - x);   // from x forward to y
+    const s0 = s[0], s1 = closed ? s0 : s[s.length - 1];
+    // the chain's own direction along the curve, from its second point
+    const forward = c.closed ? ahead(s0, s[1]) < span / 2 : s[1] >= s0;
+    const len = closed ? span : forward ? ahead(s0, s1) : ahead(s1, s0);
+    if (!c.closed && !closed && (forward ? s1 < s0 : s1 > s0)) return null;
+    const out = [pts[0]];
+    const gap = 1e-7 * diag;
+    for (let k = 1; k < N + 1; k++) {
+      // the curve's vertices strictly between the corners, in the chain's direction
+      const idx = forward ? Math.floor(s0) + k : Math.ceil(s0) - k;
+      if (!c.closed && (idx < 0 || idx >= N)) break;
+      const i = ((idx % N) + N) % N;
+      const along = forward ? ahead(s0, i) : ahead(i, s0);
+      if (!(along > 0) || along >= len) { if (along >= len) break; continue; }
+      if (norm(sub(P[i], out[out.length - 1])) > gap && norm(sub(P[i], pts[closed ? 0 : pts.length - 1])) > gap) out.push(P[i]);
+    }
+    if (!closed) out.push(pts[pts.length - 1]);
+    return out.length >= (closed ? 3 : 2) ? out : null;
+  };
+}
+
+/**
+ * PINCHES: a corner one face's boundary passes twice, two of its loops touching there (a hole tangent to a
+ * plate's edge, 00005406_001). The face's two traces are tangent at that corner, and fits a few nm off make
+ * them cross either side of it instead (1e-4 mm apart there): BRepCheck calls the face invalid, and the shape
+ * repair splits it, filling the holes. Where the face is a plane, one trace a circle (a cylinder square to it)
+ * and the other a line (another plane) or a circle, the circle (the smaller, of two) takes the radius that makes
+ * them touch when that moves it no more than PINCH_TOL x diagonal, and the corner goes on the touching point
+ * (into pinchPos). Returns the surfaces: a copy when a radius moved, the caller's otherwise.
+ */
+const PINCH_TOL = 1e-6;
+
+function tangentPinches(mesh, surfaces, { fb, chains }, pinchPos, info) {
+  const ck = (v, b) => v * BODY_STRIDE + b;
+  const ends = new Map();                         // "face|corner" -> the neighbor across each chain end there
+  for (const { a, b, path } of chains) {
+    for (const v of [path[0], path[path.length - 1]]) {
+      const c = ck(v, fb.get(a));
+      for (const [f, g] of [[a, b], [b, a]]) {
+        if (f < 0) continue;
+        const key = `${f}|${c}`;
+        (ends.get(key) ?? ends.set(key, []).get(key)).push(g);
+      }
+    }
+  }
+  let out = surfaces;
+  for (const [key, gs] of ends) {
+    if (gs.length < 4) continue;                  // passed once: two chain ends
+    const [f, c] = key.split('|').map(Number);
+    const sf = out.get(f), nb = [...new Set(gs)];
+    if (sf?.[0] !== 'plane' || nb.length !== 2 || nb.some((g) => g < 0)) continue;
+    const n = unit(sf[1].normal), o = sf[1].origin;
+    const trace = (g) => {
+      const [k, p] = out.get(g) ?? [];
+      if (k === 'cylinder' && norm(cross(unit(p.axis), n)) <= 1e-9) {
+        const a = unit(p.axis), t = dot(sub(o, p.axisPoint), n) / dot(a, n);
+        return { g, circle: { c: add(p.axisPoint, scale(a, t)), r: p.radius } };
+      }
+      if (k === 'plane' && norm(cross(unit(p.normal), n)) > 1e-9) {
+        return { g, line: { o: projectOnto([sf, out.get(g)], o, mesh.diag), d: unit(cross(n, unit(p.normal))) } };
+      }
+      return null;
+    };
+    const ts = nb.map(trace);
+    if (ts.some((t) => !t)) continue;
+    const circles = ts.filter((t) => t.circle), line = ts.find((t) => t.line);
+    let g, r, at;
+    if (circles.length === 1 && line) {
+      const { c: cc } = circles[0].circle, { o: lo, d } = line.line;
+      at = add(lo, scale(d, dot(sub(cc, lo), d)));                  // the foot of the centre on the line
+      g = circles[0].g; r = norm(sub(cc, at));
+    } else if (circles.length === 2) {
+      const [A, B] = circles[0].circle.r <= circles[1].circle.r ? circles : [circles[1], circles[0]];   // A moves
+      const gap = norm(sub(A.circle.c, B.circle.c));
+      const outside = Math.abs(gap - (A.circle.r + B.circle.r)) < Math.abs(gap - (B.circle.r - A.circle.r));
+      r = outside ? gap - B.circle.r : B.circle.r - gap;
+      at = add(B.circle.c, scale(unit(sub(A.circle.c, B.circle.c)), B.circle.r));
+      g = A.g;
+    } else continue;
+    const was = out.get(g)[1].radius;
+    if (!(r > 0) || Math.abs(r - was) > PINCH_TOL * mesh.diag) { bump(info, 'pinch_left'); continue; }
+    if (out === surfaces) out = new Map(surfaces);
+    out.set(g, ['cylinder', { ...out.get(g)[1], radius: r }]);
+    pinchPos.set(c, at);
+    bump(info, 'pinches_made_exact');
+  }
+  return out;
+}
+
+/**
  * Build the shell. surfaces: Map label -> [kind, params]. facetLabels: labels of ONE triangle each,
  * built as a plane through its three corners with straight edges (the facet fallback). Returns
  * {shape, faceOf: Map label -> face (or the pieces the repair split it into), info, ratios}.
@@ -153,6 +363,8 @@ export function buildTopo(oc, mesh, surfaces, { facetLabels = null } = {}) {
   const topo = meshTopology(mesh, forced);
   const { fb, facesAt, corners, chains } = topo;
   Object.assign(info, topo.info);
+  const pinchPos = new Map();
+  if (BUILD.PINCH) surfaces = tangentPinches(mesh, surfaces, topo, pinchPos, info);
   const surf = (f) => surfaces.get(f) ?? null;
   const ck = (v, b) => v * BODY_STRIDE + b;
 
@@ -173,9 +385,9 @@ export function buildTopo(oc, mesh, surfaces, { facetLabels = null } = {}) {
   for (const c of corners) {
     const v = Math.floor(c / BODY_STRIDE);
     const ss = [...facesAt.get(c)].map(surf).filter(Boolean);
-    let x = ss.length ? projectOnto(ss, V[v], scaleLen) : V[v];
+    let x = pinchPos.get(c) ?? (ss.length ? projectOnto(ss, V[v], scaleLen) : V[v]);
     // a corner of two tangent surfaces lies on their contact locus: solved along it, not by projection
-    if (BUILD.CONTACT) tangent: for (let i = 0; i < ss.length; i++) for (let j = i + 1; j < ss.length; j++) {
+    if (BUILD.CONTACT && !pinchPos.has(c)) tangent: for (let i = 0; i < ss.length; i++) for (let j = i + 1; j < ss.length; j++) {
       const L = tangentLocus(ss[i], ss[j], scaleLen);
       if (!L) continue;
       // only where the corner then lies on every one of its surfaces: a 4-face corner that cannot be on
@@ -191,6 +403,7 @@ export function buildTopo(oc, mesh, surfaces, { facetLabels = null } = {}) {
   }
 
   // edges
+  const ssiArc = BUILD.SSI ? ssiArcs(mesh, surf, patchTris, info) : () => null;
   const edges = [];
   for (const { a, b, path } of chains) {
     const ss = [surf(a), b >= 0 ? surf(b) : null].filter(Boolean);
@@ -226,6 +439,10 @@ export function buildTopo(oc, mesh, surfaces, { facetLabels = null } = {}) {
         if (!closed) clean[clean.length - 1] = pts[pts.length - 1];
         clean = unfoldChain(clean, closed, info);
         if (clean.length < 2 || (closed && clean.length < 3)) { bump(info, 'edge_too_short'); continue; }
+        // the curve between the mesh's points too, not only through them, where two surfaces cross (ssiArcs); a
+        // tangent pair's edge is on its contact locus already
+        const arc = ss.length === 2 && !locus ? ssiArc(a, b, clean, closed) : null;
+        if (arc) { clean = arc; bump(info, 'edges_ssi'); }
         // an exact line or circle where the two surfaces meet in one: CAD tools treat analytic edges
         // as the intersections they are (fillets, face deletion); a spline through them is only close
         const ex = BUILD.EXACT_EDGES && ss.length === 2 ? exactCurve(closed ? [...clean, clean[0]] : clean, EXACT_EDGE_TOL * scaleLen) : null;

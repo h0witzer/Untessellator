@@ -1,0 +1,20 @@
+[package]
+name = "ssi-wasm"
+description = "solidcore's ssi (exact surface/surface intersection) for the knitter, as a plain wasm module"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# tangency-labs/solidcore main: ssi at 118 of 119 on the ssi-corpus
+ssi = { git = "https://github.com/tangency-labs/solidcore", rev = "4072cf2c62ea97ae4778e0164ccaedad938ea5fe" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
