@@ -19,7 +19,7 @@ Two corpora:
                               hand, and its part.stl is the input if it has the mesh
               <name>.stl      the mesh (input.stl in older folders), if report.zip has none
               meta.json       optional: {"title", "credit", "link", "license"}
-            The queue's folders are one-shot misses (--queue-order). --collect [<downloads>] first moves
+            The queue's folders are one-shot misses (--queue-order, --queue-add). --collect [<downloads>] first moves
             the studio's downloads into them: <name>.stp (the studio names it after the mesh) as export.step,
             and each Untessellator-report-*.zip as the report.zip of the part whose mesh has its triangle count.
 
@@ -32,8 +32,8 @@ Writes into the site:
 and into --work:
   match/<id>.json         step_match's report per part, reused while neither STEP changes
   misses.json             the one-shot parts that did not match, closest first: the queue for painting by hand
-  painted/QUEUE.md        the painting queue, closest first: what each one-shot got wrong, how each painted
-                          export did, and the steps
+  painted/QUEUE.md        the painting queue, the parts still to paint first: what each one-shot got wrong, how
+                          each painted export did, and the steps
 """
 
 from __future__ import annotations
@@ -433,7 +433,7 @@ def collect(args, src):
         newest = max(steps, key=lambda p: p.stat().st_mtime)
         target = d / 'export.step'
         if not target.exists() or newest.stat().st_mtime > target.stat().st_mtime:
-            os.replace(newest, target)
+            shutil.move(newest, target)                 # Downloads is often on another drive
             moved.append(f'{pid}/export.step  <- {newest.name}')
     tris = {}
     for pid, d in folders.items():
@@ -459,7 +459,7 @@ def collect(args, src):
             continue
         target = folders[fits[0]] / 'report.zip'
         if not target.exists() or when > target.stat().st_mtime:
-            os.replace(z, target)
+            shutil.move(z, target)
             moved.append(f'{fits[0]}/report.zip   <- {z.name}')
     for line in moved:
         print(f'  collected {line}')
@@ -469,10 +469,11 @@ def collect(args, src):
 
 
 def write_queue(args, queue, reps):
-    """painted/QUEUE.md: the folders in the queue's order, each with how far the one-shot auto-paint's groups
-    were from the original (by type) and how its painted export did."""
+    """painted/QUEUE.md: the folders still to paint, then the painted ones, each in the queue's order, with how far
+    the one-shot auto-paint's groups were from the original (by type) and how its painted export did."""
     order = {m['id']: i for i, m in enumerate(queue)}
-    folders = sorted((d for d in args.painted.iterdir() if d.is_dir()), key=lambda d: (order.get(d.name, 1e9), d.name))
+    folders = sorted((d for d in args.painted.iterdir() if d.is_dir()),
+                     key=lambda d: ((d / 'export.step').exists(), order.get(d.name, 1e9), d.name))
     rows = []
     for d in folders:
         if not (args.work / 'match' / f'{d.name}.json').exists():
@@ -491,8 +492,9 @@ def write_queue(args, queue, reps):
         rows.append(f'| {len(rows) + 1} | `{d.name}` | {off} | {status} |')
     (args.painted / 'QUEUE.md').write_text(
         '# Painting queue\n\n'
-        'One-shot misses to paint by hand, in queue order (by default the most features first, among the misses a\n'
-        'person can bring to a match). "Auto-paint vs original" counts groups by type, original → auto-paint.\n'
+        'One-shot misses to paint by hand, the ones still to paint first, in queue order (picks named with\n'
+        '--queue-add, then by default the most features first). "Auto-paint vs original" counts groups by type,\n'
+        'original → auto-paint.\n'
         'For each part:\n\n'
         '1. Open `<id>.stl` from its folder in the studio (https://untessellator.com), press Auto-paint, and repaint\n'
         '   the faces that are wrong. NOTES.txt in the folder has the counts.\n'
@@ -536,7 +538,8 @@ def main(argv=None) -> int:
     ap.add_argument('--queue-order', choices=['showcase', 'closest'], default='showcase',
                     help='which misses fill the queue: the most features a person can reach (showcase) or the closest')
     ap.add_argument('--queue-add', nargs='+', default=[], metavar='ID',
-                    help='set up these one-shot misses for painting first, whatever --queue is')
+                    help='set up these one-shot misses for painting first, whatever --queue is, '
+                         'also ones the queue order leaves out (harder ones)')
     ap.add_argument('--collect', type=Path, nargs='?', const=Path.home() / 'Downloads', default=None,
                     help="first move the painting queue's STEPs and reports out of this folder (default: Downloads)")
     ap.add_argument('--no-thumbs', action='store_true')
@@ -616,6 +619,8 @@ def main(argv=None) -> int:
                                abs((m['faces'][0] or 0) - (m['faces'][1] or 0)), m['faces'][0] or 0))
     (args.work / 'misses.json').write_text(json.dumps(misses, indent=1))
     queue = showcase(misses) if args.queue_order == 'showcase' else misses
+    picks = [m for pid in args.queue_add for m in misses if m['id'] == pid]     # any miss, reachable or not
+    queue = picks + [m for m in queue if m['id'] not in args.queue_add]
     queued = queue_misses(args, queue, args.queue, args.queue_add) if args.queue or args.queue_add else 0
     if args.painted.exists():
         write_queue(args, queue, reps)
