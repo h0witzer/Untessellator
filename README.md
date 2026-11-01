@@ -1,16 +1,28 @@
-# Untessellator
+<p align="center">
+  <a href="https://untessellator.com"><img src="brand/readme-banner.png" alt="Untessellator: turn meshes back into real CAD" width="100%"></a>
+</p>
 
-**Turn meshes back into real CAD.** Untessellator reads an STL, OBJ or 3MF file and writes a STEP
-solid made of real faces:
+<p align="center">
+  <a href="https://untessellator.com"><img alt="Open the studio at untessellator.com" src="https://img.shields.io/badge/Open_the_studio-untessellator.com-b98cff?style=for-the-badge&labelColor=2a1638"></a>
+  <a href="https://h0witzer.github.io/Untessellator-Gallery/"><img alt="Gallery: verified face by face" src="https://img.shields.io/badge/Gallery-verified_face_by_face-2fc59a?style=for-the-badge&labelColor=2a1638"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-ffc933?style=for-the-badge&labelColor=2a1638"></a>
+  <a href="https://ko-fi.com/derekvanallen"><img alt="Support on Ko-fi" src="https://img.shields.io/badge/Support-Ko--fi-ff5c8a?style=for-the-badge&labelColor=2a1638"></a>
+</p>
+
+Untessellator reads an STL, OBJ or 3MF file and writes a STEP solid made of real faces:
 
 - exact planes, cylinders, cones, spheres and tori
 - B-splines only where nothing simpler fits
 
 Open the result in any CAD program and you can select a hole, measure a diameter, or push a face.
 
+<p align="center">
+  <img src="docs/images/studio.png" alt="The studio: a watch stand auto-painted into 75 face groups and colored by surface type, with a cone selected and its fit shown in the inspector" width="100%">
+</p>
+
 It runs in your browser: nothing is uploaded, there's no per-conversion fee, and it's MIT.
 
-**Try it: <https://h0witzer.github.io/Untessellator/>**
+**Try it: <https://untessellator.com>**
 
 **See what it recovers: <https://h0witzer.github.io/Untessellator-Gallery/>**. Every part in the gallery
 was checked face by face against its original CAD file: the same faces, of the same types, each within 1 µm.
@@ -39,7 +51,7 @@ There's one engine with several front ends:
 
 | Front end | Status |
 |---|---|
-| **Standalone web app** (`index.html`) | Live at [h0witzer.github.io/Untessellator](https://h0witzer.github.io/Untessellator/), served by GitHub Pages straight from `main` and tied to no CAD system. It's static files plus libraries from public CDNs, so any static host can serve it. |
+| **Standalone web app** (`index.html`) | Live at [untessellator.com](https://untessellator.com), served by GitHub Pages straight from `main` and tied to no CAD system. It's static files plus libraries from public CDNs, so any static host can serve it. |
 | **Command line** (`test/studioExport.mjs`) | Works today. It runs the studio's own code and default settings headless. |
 | **SolidCraft plugin** | Wanted. SolidCraft's WebAssembly plugin interface is still being designed ([tangency-labs/solidcraft#1221](https://github.com/tangency-labs/solidcraft/issues/1221)). Until it lands, SolidCraft opens our STEP files with its own reader. |
 | **Onshape app** | In progress. The studio's viewport handles like Onshape's (camera, view cube and lighting from the vendored Form Studio kit), but the integration with Onshape itself isn't built yet. |
@@ -62,7 +74,7 @@ page has to be served; opening `index.html` directly from disk leaves it blank.
    map of where the mesh lies off its group's surface). The summary in the top bar lists the groups
    that need a look, worst first, in the face-group table.
 4. Fix it. In **Fix bad areas**, **Find fixes** proposes re-fills (triangles off their group's surface
-   that lie on a neighbour's), merges (neighbours one surface fits) and skips (stray shells); apply
+   that lie on a neighbor's), merges (neighbors one surface fits) and skips (stray shells); apply
    them as one undo step. Or fix by hand:
 
    | Input | Action |
@@ -180,7 +192,7 @@ Then open an issue saying what you're picking up.
 
 ## Dependencies
 
-| Library | Version | Licence | Used for |
+| Library | Version | License | Used for |
 |---|---|---|---|
 | [three.js](https://threejs.org/) | 0.170.0 | MIT | Mesh loaders |
 | [fflate](https://github.com/101arrowz/fflate) | 0.8.2 | MIT | Reading 3MF archives |
@@ -191,8 +203,8 @@ Then open an issue saying what you're picking up.
 The browser loads the libraries from jsDelivr and unpkg. The Node harnesses use `onnxruntime-node`
 and `opencascade.js` from `npm install`.
 
-## Licence
+## License
 
 MIT; see [LICENSE](LICENSE). The file loader (`js/stlLoader.js`) still carries code from
 stlTexturizer, so its copyright notice stays in LICENSE alongside ours. The two LGPL components
-above keep their own licences.
+above keep their own licenses.

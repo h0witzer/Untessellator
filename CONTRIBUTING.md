@@ -216,7 +216,7 @@ Ranked, each with what "done" means.
    setting. Make a single command that runs the standard gates and prints the tables. Done: a new
    contributor gets the Onshape-set numbers from one command.
 2. **A standalone web deployment.** The studio is live on GitHub Pages
-   ([h0witzer.github.io/Untessellator](https://h0witzer.github.io/Untessellator/)), served straight from
+   ([untessellator.com](https://untessellator.com)), served straight from
    `main`. What's left:
    - a check in a headless browser, run on every push, that converts the fixtures
    - CDN libraries pinned, with an option to serve them ourselves so the app works offline
