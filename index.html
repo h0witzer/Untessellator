@@ -65,7 +65,7 @@
       <button type="button" class="wb-iconbtn" id="redo" data-tb="redo" title="Redo (Ctrl+Y)"><span class="wb-lbl">Redo</span></button>
       <span class="wb-spacer"></span>
       <button type="button" class="wb-summary" id="summary" hidden title="Color by fit and list the groups that need a look, worst first"></button>
-      <a class="wb-iconbtn" id="gallery" href="https://h0witzer.github.io/Untessellator-Gallery/" target="_blank" rel="noopener" title="Parts Untessellator turned back into their original CAD, each checked face by face (opens in a new tab)"><span class="wb-lbl">Gallery</span></a>
+      <a class="wb-iconbtn" id="gallery" href="https://gallery.untessellator.com/" target="_blank" rel="noopener" title="Parts Untessellator turned back into their original CAD, each checked face by face (opens in a new tab)"><span class="wb-lbl">Gallery</span></a>
       <a class="wb-iconbtn" id="support" href="https://ko-fi.com/derekvanallen" target="_blank" rel="noopener" title="Untessellator is free. If it saves you time, you can leave a tip on Ko-fi (opens in a new tab)"><span class="wb-lbl">Support</span></a>
       <button type="button" class="wb-iconbtn" id="report" data-tb="report" aria-label="Report this conversion" title="Report how this conversion went: downloads a report file and opens a prefilled GitHub issue; nothing is sent until you submit it"></button>
       <button type="button" class="wb-btn wb-primary" id="export" data-tb="export">Export STEP</button>
@@ -103,20 +103,13 @@
     <p>It turns STL, OBJ and 3MF meshes into STEP files with real CAD faces: exact planes, cylinders, cones, spheres
       and tori instead of thousands of triangles. Painting those faces takes a mouse and a big screen, so open
       untessellator.com on a computer to convert a file.</p>
-    <a class="wb-btn wb-primary" href="https://h0witzer.github.io/Untessellator-Gallery/">See how it works in the gallery</a>
+    <a class="wb-btn wb-primary" href="https://gallery.untessellator.com/">See how it works in the gallery</a>
     <button type="button" class="wb-iconbtn" id="phone-anyway">Use it here anyway</button>
   </section>
   <script>
-    // "Use it here anyway" shows the tool, and this browser remembers it
-    (() => {
-      const KEY = 'untessellator.anyway';
-      const anyway = () => document.body.classList.add('wb-anyway');
-      try { if (localStorage.getItem(KEY) === '1') anyway(); } catch {}
-      document.getElementById('phone-anyway').addEventListener('click', () => {
-        anyway();
-        try { localStorage.setItem(KEY, '1'); } catch {}
-      });
-    })();
+    // "Use it here anyway" shows the tool for this visit only: a tap by mistake mustn't hide the note, and its way
+    // to the gallery, for good
+    document.getElementById('phone-anyway').addEventListener('click', () => document.body.classList.add('wb-anyway'));
   </script>
   <script>
     if (location.protocol === 'file:') {

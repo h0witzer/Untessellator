@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://untessellator.com"><img alt="Open Untessellator at untessellator.com" src="https://img.shields.io/badge/Open_Untessellator-untessellator.com-b98cff?style=for-the-badge&labelColor=2a1638"></a>
-  <a href="https://h0witzer.github.io/Untessellator-Gallery/"><img alt="Gallery: verified face by face" src="https://img.shields.io/badge/Gallery-verified_face_by_face-2fc59a?style=for-the-badge&labelColor=2a1638"></a>
+  <a href="https://gallery.untessellator.com/"><img alt="Gallery: verified face by face" src="https://img.shields.io/badge/Gallery-verified_face_by_face-2fc59a?style=for-the-badge&labelColor=2a1638"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-ffc933?style=for-the-badge&labelColor=2a1638"></a>
   <a href="https://ko-fi.com/derekvanallen"><img alt="Support on Ko-fi" src="https://img.shields.io/badge/Support-Ko--fi-ff5c8a?style=for-the-badge&labelColor=2a1638"></a>
 </p>
@@ -24,7 +24,7 @@ It runs in your browser: nothing is uploaded, there's no per-conversion fee, and
 
 **Try it: <https://untessellator.com>**
 
-**See what it recovers: <https://h0witzer.github.io/Untessellator-Gallery/>**. Every part in the gallery
+**See what it recovers: <https://gallery.untessellator.com/>**. Every part in the gallery
 was checked face by face against its original CAD file: the same faces, of the same types, each within 1 µm.
 
 **Support it: <https://ko-fi.com/derekvanallen>**. Untessellator is free to use. If it saves you time, a tip
