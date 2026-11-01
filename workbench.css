@@ -126,7 +126,9 @@ body { background: var(--wb-bg); color: var(--wb-text); font: 14.5px/1.45 var(--
 .wb-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; display: inline-block; }
 .wb-btn { border: 0; background: var(--wb-raised-2); padding: 8px 13px; cursor: pointer; white-space: nowrap; }
 .wb-btn:hover:not([disabled]) { background: var(--wb-raised-3); }
-.wb .wb-primary, .wb .wb-primary:hover:not([disabled]) { background: #ffffff; color: var(--wb-accent-ink); font-weight: 700; letter-spacing: 0.02em; padding: 9px 18px; }
+/* a primary is white wherever it sits (Export STEP, a card's Apply), the one action to take next */
+.wb .wb-primary, .wb .wb-primary:hover:not([disabled]) { background: #ffffff; color: var(--wb-accent-ink); font-weight: 700; letter-spacing: 0.02em; }
+.wb-top .wb-primary { padding: 9px 18px; }
 .wb-small { padding: 4px 9px; font-size: 12.5px; }
 .wb-btn[disabled] { opacity: 0.4; cursor: default; }
 .wb-tag { font: 500 10.5px/1 var(--wb-font-label); letter-spacing: 0.06em; text-transform: uppercase; color: var(--wb-faint); border: 1px solid var(--wb-line); border-radius: 3px; padding: 4px 6px; white-space: nowrap; }
@@ -264,8 +266,8 @@ body { background: var(--wb-bg); color: var(--wb-text); font: 14.5px/1.45 var(--
 .wb-seg button[aria-pressed="true"] { background: var(--wb-accent); color: var(--wb-accent-ink); font-weight: 700; clip-path: var(--btn-round); }
 
 .wb-fixcard { margin: 10px 16px 0; border: 0; background: var(--wb-raised); clip-path: var(--card-cut); }
-.wb-fixcard .wb-btn { background: #432c5c; }
-.wb-fixcard .wb-btn:hover:not([disabled]) { background: #553a72; }
+.wb-fixcard .wb-btn:not(.wb-primary) { background: #432c5c; }
+.wb-fixcard .wb-btn:not(.wb-primary):hover:not([disabled]) { background: #553a72; }
 .wb-fixhead { width: 100%; display: flex; align-items: center; gap: 10px; padding: 10px 13px; background: transparent; border: 0; cursor: pointer; text-align: left; }
 .wb-fixhead .wb-t { font-weight: 600; flex: 1; }
 .wb-fixhead .wb-c { font: 12px var(--wb-font-data); color: var(--wb-muted); }
