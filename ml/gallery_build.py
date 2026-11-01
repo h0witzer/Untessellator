@@ -19,7 +19,7 @@ Two corpora:
                               hand, and its part.stl is the input if it has the mesh
               <name>.stl      the mesh (input.stl in older folders), if report.zip has none
               meta.json       optional: {"title", "credit", "link", "license"}
-            The queue's folders are the closest one-shot misses (--queue). --collect [<downloads>] first moves
+            The queue's folders are one-shot misses (--queue-order). --collect [<downloads>] first moves
             the studio's downloads into them: <name>.stp (the studio names it after the mesh) as export.step,
             and each Untessellator-report-*.zip as the report.zip of the part whose mesh has its triangle count.
 
@@ -259,15 +259,16 @@ def oneshot_jobs(args):
         hits = list((args.originals / model).glob(f'{model}_*_step_{part_idx}.step'))
         if not hits:
             continue
-        info = {}
+        info, type_count = {}, None
         rj = args.oneshot_out / f'{pid}.json'
         if rj.exists():
             r = json.loads(rj.read_text())
             info = {'paint_secs': r.get('paint_secs'), 'knit_secs': r.get('knit_secs'), 'groups': r.get('groups')}
+            type_count = r.get('typeCount')
             if r.get('repair'):                         # studioExport --repair: the first export was not analytic
                 info.update(repaired=True, repair_kept=len(r['repair'].get('kept', [])),
                             repair_secs=r['repair'].get('secs'), first_tier=r['first'].get('tier'))
-        jobs.append({'id': pid, 'ours': ours, 'original': hits[0], 'stl': stl,
+        jobs.append({'id': pid, 'ours': ours, 'original': hits[0], 'stl': stl, 'type_count': type_count,
                      'row': {'corpus': 'oneshot', 'title': f'ABC {model} · part {int(part_idx)}',
                              'credit': 'ABC dataset (Onshape public documents); copyright stays with the creator',
                              'link': 'https://deep-geometry.github.io/abc-dataset/',
@@ -347,10 +348,20 @@ def one_shot_types(args, pid):
     return rep, rep.get('truth', {}).get('types', {}), rep.get('ours', {}).get('types', {})
 
 
+def group_types(args, pid):
+    """The one-shot auto-paint's groups by type (studioExport's typeCount, freeform as bspline), or {}. An export
+    that fell back to facets has thousands of planar faces; its groups say how close the painting was."""
+    rj = args.oneshot_out / f'{pid}.json'
+    counts = json.loads(rj.read_text()).get('typeCount') if rj.exists() else None
+    return {('bspline' if k == 'freeform' else k): v for k, v in (counts or {}).items()}
+
+
 def notes(args, pid):
     """A queue folder's NOTES.txt: why the one-shot missed, the face types side by side, and how to paint it."""
     rep, t, o = one_shot_types(args, pid)
-    rows = [f'  {k:10} original {t.get(k, 0):4}   one-shot {o.get(k, 0):4}' for k in KINDS if t.get(k) or o.get(k)]
+    g = group_types(args, pid)
+    rows = [f'  {k:10} original {t.get(k, 0):4}   one-shot STEP {o.get(k, 0):6}   auto-paint groups {g.get(k, 0):4}'
+            for k in KINDS if t.get(k) or o.get(k) or g.get(k)]
     return (f"{pid}: the one-shot export missed because {rep.get('reason')}.\n\n" + '\n'.join(rows) +
             f'\n\nTo paint it: open {pid}.stl in the studio, press Auto-paint, repaint the faces that are wrong, then\n'
             f'Export STEP and Save STEP ({pid}.stp), and press the flag button for the report. Both land in your\n'
@@ -358,10 +369,26 @@ def notes(args, pid):
             'export against original.step. QUEUE.md, one folder up, says how it did.\n')
 
 
-def queue_misses(args, misses, n):
-    """Tops the painting queue up to n folders: <painted>/<id>/ for the closest one-shot misses that have no
+ANALYTIC = {'plane', 'cylinder', 'cone', 'sphere', 'torus'}
+
+
+def showcase(misses):
+    """The painting queue's default order: the misses a person can bring to a match, the most features first.
+    Reachable means an original of analytic faces only (a freeform fit doesn't come within 1 µm of a B-spline,
+    and the studio makes no extrusions or revolutions) and auto-paint groups within a quarter of the original's
+    face count by type, but not all of them right while the export's types are off: then the export changed
+    the types, which painting doesn't fix. Features are faces, with curved ones (holes, bosses, chamfers,
+    fillets) counted thrice."""
+    reach = [m for m in misses if m['analytic'] and m['groups_off'] is not None and m['faces'][0]
+             and m['groups_off'] <= 0.25 * m['faces'][0] and not (m['groups_off'] == 0 and m['types_off'] > 0)]
+    return sorted(reach, key=lambda m: -(m['faces'][0] + 2 * m['curved']))
+
+
+def queue_misses(args, misses, n, first=()):
+    """Tops the painting queue up to n folders from misses, in order: <painted>/<id>/ for each miss that has no
     folder yet, with <id>.stl (so the studio saves <id>.stp), original.step, meta.json and NOTES.txt (what
-    differs). Painting one means getting the studio's export.step and report.zip there (--collect)."""
+    differs). The misses named in first get a folder whatever n is. Painting one means getting the studio's
+    export.step and report.zip there (--collect)."""
     args.painted.mkdir(parents=True, exist_ok=True)
     waiting = [d for d in args.painted.iterdir() if d.is_dir() and not (d / 'export.step').exists()]
     for d in waiting:                       # a folder from before the mesh was named after the part
@@ -369,8 +396,9 @@ def queue_misses(args, misses, n):
             (d / 'input.stl').rename(d / f'{d.name}.stl')
             (d / 'NOTES.txt').write_text(notes(args, d.name))
     made = 0
-    for m in misses:
-        if made >= n - len(waiting):
+    picked = [m for pid in first for m in misses if m['id'] == pid]
+    for m in picked + [m for m in misses if m['id'] not in first]:
+        if made >= n - len(waiting) and m['id'] not in first:
             break
         d = args.painted / m['id']
         if d.exists():
@@ -386,14 +414,6 @@ def queue_misses(args, misses, n):
         (d / 'NOTES.txt').write_text(notes(args, m['id']))
         made += 1
     return made
-
-
-def stl_triangles(path):
-    """The triangle count of a binary or ASCII STL."""
-    data = path.read_bytes()
-    if len(data) >= 84 and 84 + 50 * struct.unpack_from('<I', data, 80)[0] == len(data):
-        return struct.unpack_from('<I', data, 80)[0]
-    return data.count(b'facet normal')
 
 
 def collect(args, src):
@@ -419,7 +439,7 @@ def collect(args, src):
     for pid, d in folders.items():
         stl = next((p for p in (d / f'{pid}.stl', d / 'input.stl') if p.exists()), None)
         if stl:
-            tris[pid] = stl_triangles(stl)
+            tris[pid] = stl_triangles(stl.read_bytes())
     left = 0
     for z in sorted(src.glob('Untessellator-report-*.zip'), key=lambda p: p.stat().st_mtime):
         try:
@@ -448,17 +468,20 @@ def collect(args, src):
     return moved
 
 
-def write_queue(args, misses, reps):
-    """painted/QUEUE.md: the queue in the misses' order (closest first), each folder's one-shot error and how
-    its painted export did."""
-    order = {m['id']: i for i, m in enumerate(misses)}
+def write_queue(args, queue, reps):
+    """painted/QUEUE.md: the folders in the queue's order, each with how far the one-shot auto-paint's groups
+    were from the original (by type) and how its painted export did."""
+    order = {m['id']: i for i, m in enumerate(queue)}
     folders = sorted((d for d in args.painted.iterdir() if d.is_dir()), key=lambda d: (order.get(d.name, 1e9), d.name))
     rows = []
     for d in folders:
         if not (args.work / 'match' / f'{d.name}.json').exists():
             continue
         _, t, o = one_shot_types(args, d.name)
-        off = ', '.join(f'{k} {t.get(k, 0)} → {o.get(k, 0)}' for k in KINDS if t.get(k, 0) != o.get(k, 0)) or 'types right'
+        diff = lambda c: ', '.join(f'{k} {t.get(k, 0)} → {c.get(k, 0)}' for k in KINDS if t.get(k, 0) != c.get(k, 0))
+        off = diff(group_types(args, d.name) or o)
+        off = off or (f'groups right; the export: {diff(o)}' if diff(o) else 'types right')
+        off = f"{sum(t.values())} faces: {off}"
         rep = reps.get('p-' + ''.join(c if c.isalnum() or c in '-_' else '-' for c in d.name).lower())
         status = ('waiting' if not (d / 'export.step').exists() else
                   'not checked yet' if rep is None else
@@ -468,8 +491,9 @@ def write_queue(args, misses, reps):
         rows.append(f'| {len(rows) + 1} | `{d.name}` | {off} | {status} |')
     (args.painted / 'QUEUE.md').write_text(
         '# Painting queue\n\n'
-        'The closest one-shot misses, closest first. "What the one-shot got wrong" is the face count per type,\n'
-        'original → one-shot. For each part:\n\n'
+        'One-shot misses to paint by hand, in queue order (by default the most features first, among the misses a\n'
+        'person can bring to a match). "Auto-paint vs original" counts groups by type, original → auto-paint.\n'
+        'For each part:\n\n'
         '1. Open `<id>.stl` from its folder in the studio (https://untessellator.com), press Auto-paint, and repaint\n'
         '   the faces that are wrong. NOTES.txt in the folder has the counts.\n'
         '2. Export STEP, then Save STEP: it downloads as `<id>.stp`.\n'
@@ -479,7 +503,7 @@ def write_queue(args, misses, reps):
         'It moves each part\'s STEP and report from your Downloads into its folder, checks every painted export\n'
         'against its original, refreshes this list and the gallery\'s "Painted by hand" tab, and tops the queue\n'
         'back up. Commit and push the gallery to publish.\n\n'
-        '| # | Part | What the one-shot got wrong | Status |\n|---|---|---|---|\n' + '\n'.join(rows) + '\n',
+        '| # | Part | Auto-paint vs original | Status |\n|---|---|---|---|\n' + '\n'.join(rows) + '\n',
         encoding='utf-8')
 
 
@@ -487,9 +511,13 @@ def miss_row(job, rep):
     t, o = rep.get('truth', {}), rep.get('ours', {})
     off = sum(abs(t.get('types', {}).get(k, 0) - o.get('types', {}).get(k, 0))
               for k in set(t.get('types', {})) | set(o.get('types', {})))
+    tt = t.get('types', {})
+    g = {('bspline' if k == 'freeform' else k): v for k, v in (job.get('type_count') or {}).items()}
     return {'id': job['id'], 'stl': str(job.get('stl', '')), 'original': str(job['original']),
             'reason': rep.get('reason'), 'faces': [t.get('faces'), o.get('faces')], 'types_off': off,
-            'max_dev_mm': rep.get('max_dev_mm')}
+            'groups_off': sum(abs(tt.get(k, 0) - g.get(k, 0)) for k in set(tt) | set(g)) if g else None,
+            'curved': (t.get('faces') or 0) - tt.get('plane', 0),
+            'analytic': {k for k, v in tt.items() if v} <= ANALYTIC, 'max_dev_mm': rep.get('max_dev_mm')}
 
 
 def main(argv=None) -> int:
@@ -504,7 +532,11 @@ def main(argv=None) -> int:
     ap.add_argument('--tol', type=float, default=1e-3,
                     help="largest face-to-face distance, mm (the originals' declared uncertainty)")
     ap.add_argument('--jobs', type=int, default=8)
-    ap.add_argument('--queue', type=int, default=10, help='set up this many closest misses for painting by hand')
+    ap.add_argument('--queue', type=int, default=10, help='keep this many one-shot misses waiting to be painted by hand')
+    ap.add_argument('--queue-order', choices=['showcase', 'closest'], default='showcase',
+                    help='which misses fill the queue: the most features a person can reach (showcase) or the closest')
+    ap.add_argument('--queue-add', nargs='+', default=[], metavar='ID',
+                    help='set up these one-shot misses for painting first, whatever --queue is')
     ap.add_argument('--collect', type=Path, nargs='?', const=Path.home() / 'Downloads', default=None,
                     help="first move the painting queue's STEPs and reports out of this folder (default: Downloads)")
     ap.add_argument('--no-thumbs', action='store_true')
@@ -583,9 +615,10 @@ def main(argv=None) -> int:
     misses.sort(key=lambda m: (not (m['reason'] or '').startswith('face types differ'), m['types_off'],
                                abs((m['faces'][0] or 0) - (m['faces'][1] or 0)), m['faces'][0] or 0))
     (args.work / 'misses.json').write_text(json.dumps(misses, indent=1))
-    queued = queue_misses(args, misses, args.queue) if args.queue else 0
+    queue = showcase(misses) if args.queue_order == 'showcase' else misses
+    queued = queue_misses(args, queue, args.queue, args.queue_add) if args.queue or args.queue_add else 0
     if args.painted.exists():
-        write_queue(args, misses, reps)
+        write_queue(args, queue, reps)
 
     if not args.no_thumbs:
         render_thumbs(args.site, new)
