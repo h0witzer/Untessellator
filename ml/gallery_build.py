@@ -7,8 +7,10 @@ gallery_build.py - the verified-results gallery: every part whose exported STEP 
 
 Two corpora:
 
-  one-shot  test/studioExport.mjs output, the studio's Auto-paint then Export STEP with default settings and
-            no hand edits, for the meshes in --oneshot-in. The original of a part named <model>_<idx> is
+  one-shot  test/studioExport.mjs --repair output, the studio's Auto-paint then Export STEP with default
+            settings (then Repair and Export again when that isn't every face analytic) and no hand edits,
+            for the meshes in --oneshot-in. A part whose report has "crashed" (the export died) counts as
+            'no export'. The original of a part named <model>_<idx> is
             <originals>/<model>/<model>_<hash>_step_<idx>.step (ABC's layout).
   painted   --painted <dir>/<name>/ holds:
               export.step     the studio's Export STEP
@@ -257,6 +259,9 @@ def oneshot_jobs(args):
         if rj.exists():
             r = json.loads(rj.read_text())
             info = {'paint_secs': r.get('paint_secs'), 'knit_secs': r.get('knit_secs'), 'groups': r.get('groups')}
+            if r.get('repair'):                         # studioExport --repair: the first export was not analytic
+                info.update(repaired=True, repair_kept=len(r['repair'].get('kept', [])),
+                            repair_secs=r['repair'].get('secs'), first_tier=r['first'].get('tier'))
         jobs.append({'id': pid, 'ours': ours, 'original': hits[0], 'stl': stl,
                      'row': {'corpus': 'oneshot', 'title': f'ABC {model} · part {int(part_idx)}',
                              'credit': 'ABC dataset (Onshape public documents); copyright stays with the creator',
@@ -438,11 +443,14 @@ def main(argv=None) -> int:
             key = why(rep) if rep and not rep['match'] else None if rep else 'no export'
             if key:
                 misses[key] = misses.get(key, 0) + 1
+        matched = [j for j in jobs if reps.get(j['id'], {}).get('match')]
         return {'tried': len(jobs) - pending, 'pending': pending, 'exported': sum(1 for j in jobs if j['id'] in reps),
-                'matched': sum(1 for j in jobs if reps.get(j['id'], {}).get('match')),
+                'matched': len(matched), 'repaired': sum(1 for j in matched if j['row'].get('repaired')),
                 'misses': dict(sorted(misses.items(), key=lambda kv: -kv[1]))}
+    version = args.oneshot_out / 'CODE_VERSION'          # the engine commit the one-shot run used
     gallery = {
         'generated': time.strftime('%Y-%m-%d'),
+        'engine': version.read_text().strip() if version.exists() else None,
         'criteria': {'tol_mm': args.tol},
         'corpora': {'oneshot': {**tally('oneshot', oneshot),
                                 'set': 'ABC held-out Onshape exports: 300 parts that no model was trained or tuned on'},
