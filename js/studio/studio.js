@@ -122,6 +122,10 @@ ui.registerIcons({
   select: '<path d="M4 2l11 7-5 1.2L12.6 16l-2 .9-2.6-5.7L4 14z" />',
 });
 
+// Colorblind colors (the view menu), remembered on this browser so a color-blind viewer sets it once.
+const COLORBLIND_KEY = 'untessellator.colorblind';
+const storedColorblind = () => { try { return localStorage.getItem(COLORBLIND_KEY) === '1'; } catch { return false; } };
+
 const settings = {
   tool: 'fill',
   // Repair a mesh as it opens (js/meshRepair.js): welds, duplicate triangles and walls between bodies,
@@ -162,6 +166,8 @@ const settings = {
   deviation: 'groups',
   // Every triangle edge drawn over the shading (T), to see the tessellation.
   triangleEdges: false,
+  // The types in palette.js's COLORBLIND_HEX, kept apart under color blindness, instead of the logo's filament colors.
+  colorblind: storedColorblind(),
 };
 
 // ── frame ─────────────────────────────────────────────────────────────────────
@@ -173,8 +179,11 @@ const settings = {
 const hexRgb = (hex) => [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255);
 const css = (rgb) => `rgb(${rgb.map((v) => Math.round(v * 255)).join(',')})`;
 const SURFACE_KINDS = ['plane', 'cylinder', 'cone', 'sphere', 'torus', 'freeform', 'skip'];
-// the types' colors (js/studio/palette.js): chosen to stay apart under color blindness, test/palette.mjs checks it
-const TYPE_RGB = Object.fromEntries(SURFACE_KINDS.map((t) => [t, typeRgb(t)]));
+// the types' colors (js/studio/palette.js): the logo's filament colors, or with Colorblind colors the palette
+// test/palette.mjs keeps apart under color blindness; filled in place, so a switch reaches every reader
+const TYPE_RGB = {};
+const applyPalette = () => { for (const t of SURFACE_KINDS) TYPE_RGB[t] = typeRgb(t, settings.colorblind); };
+applyPalette();
 // skipped triangles look the same in every view: the palette's dark gray, their triangle edges drawn over them
 const SKIP_RGB = TYPE_RGB.skip;
 /** A type's icon in a color: the panel's group swatch, the group drawn as its type. */
@@ -410,6 +419,7 @@ const corner = ui.mountViewCube(shell.stage, {
       { id: 'triangles', label: 'Triangle edges (T)', checked: settings.triangleEdges, onSelect: () => toggleTriangleEdges() },
       { id: 'smooth', label: 'Smooth shading', checked: settings.smooth, onSelect: () => { settings.smooth = !settings.smooth; renderer.setShading(settings.smooth); requestRender(); } },
       { id: 'occlusion', label: 'Ambient occlusion', checked: settings.occlusion, onSelect: () => { settings.occlusion = !settings.occlusion; requestRender(); } },
+      { id: 'colorblind', label: 'Colorblind colors', checked: settings.colorblind, onSelect: () => setColorblind(!settings.colorblind) },
     ];
   },
 });
@@ -2073,6 +2083,24 @@ function toggleTriangleEdges() {
   edgesDirty = true;
   requestRender();
   say(settings.triangleEdges ? 'Triangle edges on (T)' : 'Triangle edges off (T)');
+}
+
+/** Switch the type colors between the filament palette and the colorblind one: the Paint as icons, the part, its legend and table. */
+function setColorblind(on) {
+  settings.colorblind = on;
+  try { localStorage.setItem(COLORBLIND_KEY, on ? '1' : '0'); } catch { /* storage blocked: this visit only */ }
+  applyPalette();
+  for (const type of FILL_TYPES) {
+    const icon = toolRow.querySelector(`[data-tb="type-${type}"] svg`);
+    if (icon && type !== 'auto') icon.style.color = css(TYPE_RGB[type]);
+  }
+  say(on ? 'Colorblind colors on' : 'Colorblind colors off');
+  if (!mesh) return;
+  leavePreview();
+  recolor();
+  drawLegend();
+  refreshPanel();
+  requestRender();
 }
 
 // ── selection ──

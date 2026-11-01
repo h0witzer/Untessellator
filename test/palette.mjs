@@ -1,17 +1,19 @@
 /**
- * palette.mjs — js/studio/palette.js's type colors checked for color-blind viewers.
+ * palette.mjs — js/studio/palette.js's colorblind palette checked for color-blind viewers.
  *
  * Usage:  node test/palette.mjs
  *
  * Simulates protanopia, deuteranopia and tritanopia at full severity (Machado, Oliveira and Fernandes 2009, applied
  * to linear sRGB) and measures every pair of type colors, and every type against the colors it must not be
- * mistaken for, as OKLab distance x100 (about 2 is barely visible). Fails (exit 1) when a pair is closer than
- * NORMAL_MIN with normal vision or CVD_MIN under any simulation, side by side, or closer than LIT_MIN as lit: the
- * kit's headlight scales each color by 0.5 to 1, so a pair is measured at its closest over every two shades (skip
- * left out: any two lit grays meet; its triangle edges mark it). The palette as shipped measured 15.0, 9.1 and 8.9.
+ * mistaken for, as OKLab distance x100 (about 2 is barely visible). Fails (exit 1) when a pair of COLORBLIND_HEX is
+ * closer than NORMAL_MIN with normal vision or CVD_MIN under any simulation, side by side, or closer than LIT_MIN as
+ * lit: the kit's headlight scales each color by 0.5 to 1, so a pair is measured at its closest over every two shades
+ * (skip left out: any two lit grays meet; its triangle edges mark it). That palette measured 15.0, 9.1 and 8.9.
+ * The default, TYPE_HEX (the logo's filament colors, chosen for the brand on 2026-10-31), is measured and printed
+ * the same way but not held to the floors; Colorblind colors in the view menu is what the floors guarantee.
  */
 
-import { TYPE_HEX } from '../js/studio/palette.js';
+import { TYPE_HEX, COLORBLIND_HEX } from '../js/studio/palette.js';
 
 const NORMAL_MIN = 15;
 const CVD_MIN = 9;
@@ -44,33 +46,38 @@ function oklab([r, g, b]) {
 }
 const distance = (p, q) => 100 * Math.hypot(p[0] - q[0], p[1] - q[1], p[2] - q[2]);
 
-const types = Object.keys(TYPE_HEX);
-const pairs = [];
-for (let i = 0; i < types.length; i++) {
-  for (let j = i + 1; j < types.length; j++) pairs.push([types[i], TYPE_HEX[types[i]], types[j], TYPE_HEX[types[j]], true]);
-  for (const [name, hex] of Object.entries(OTHERS)) pairs.push([types[i], TYPE_HEX[types[i]], name, hex, LIT_OTHERS.has(name)]);
+const lab = (hex, shade) => oklab(linear(hex, shade));
+
+/** Prints a palette's closest pairs in each measure; returns how many fall below the floors when it is held to them. */
+function check(name, palette, held) {
+  const types = Object.keys(palette);
+  const pairs = [];
+  for (let i = 0; i < types.length; i++) {
+    for (let j = i + 1; j < types.length; j++) pairs.push([types[i], palette[types[i]], types[j], palette[types[j]], true]);
+    for (const [other, hex] of Object.entries(OTHERS)) pairs.push([types[i], palette[types[i]], other, hex, LIT_OTHERS.has(other)]);
+  }
+  console.log(held ? name : `${name} (measured, not held to the floors)`);
+  let failed = 0;
+  const report = (label, measured, min) => {
+    const bad = measured.filter(([d]) => d < min);
+    if (held) failed += bad.length;
+    console.log(`  ${label.padEnd(12)} closest: ${measured.slice(0, 3).map(([d, p]) => `${p} ${d.toFixed(1)}`).join(', ')}` +
+      (!held ? '' : bad.length ? `  FAIL (< ${min}): ${bad.map(([d, p]) => `${p} ${d.toFixed(1)}`).join(', ')}` : `  ok (>= ${min})`));
+  };
+  for (const [vision, matrix] of Object.entries(SIMULATIONS)) {
+    report(vision, pairs.map(([a, ha, b, hb]) => [distance(oklab(simulate(linear(ha), matrix)), oklab(simulate(linear(hb), matrix))), `${a}/${b}`])
+      .sort((x, y) => x[0] - y[0]), vision === 'normal' ? NORMAL_MIN : CVD_MIN);
+  }
+  // as lit, normal vision: the closest the two get over every pair of shades
+  report('lit', pairs.filter(([a, , b]) => a !== 'skip' && b !== 'skip').map(([a, ha, b, hb, bothLit]) => {
+    let d = Infinity;
+    for (const s of SHADES) for (const t of bothLit ? SHADES : [1]) d = Math.min(d, distance(lab(ha, s), lab(hb, t)));
+    return [d, `${a}/${b}`];
+  }).sort((x, y) => x[0] - y[0]), LIT_MIN);
+  return failed;
 }
 
-let failed = 0;
-for (const [vision, matrix] of Object.entries(SIMULATIONS)) {
-  const min = vision === 'normal' ? NORMAL_MIN : CVD_MIN;
-  const measured = pairs.map(([a, ha, b, hb]) => [distance(oklab(simulate(linear(ha), matrix)), oklab(simulate(linear(hb), matrix))), `${a}/${b}`])
-    .sort((x, y) => x[0] - y[0]);
-  const bad = measured.filter(([d]) => d < min);
-  failed += bad.length;
-  console.log(`${vision.padEnd(12)} closest: ${measured.slice(0, 3).map(([d, p]) => `${p} ${d.toFixed(1)}`).join(', ')}` +
-    (bad.length ? `  FAIL (< ${min}): ${bad.map(([d, p]) => `${p} ${d.toFixed(1)}`).join(', ')}` : `  ok (>= ${min})`));
-}
-// as lit, normal vision: the closest the two get over every pair of shades
-const lab = (hex, shade) => oklab(linear(hex, shade));
-const lit = pairs.filter(([a, , b]) => a !== 'skip' && b !== 'skip').map(([a, ha, b, hb, bothLit]) => {
-  let d = Infinity;
-  for (const s of SHADES) for (const t of bothLit ? SHADES : [1]) d = Math.min(d, distance(lab(ha, s), lab(hb, t)));
-  return [d, `${a}/${b}`];
-}).sort((x, y) => x[0] - y[0]);
-const litBad = lit.filter(([d]) => d < LIT_MIN);
-failed += litBad.length;
-console.log(`${'lit'.padEnd(12)} closest: ${lit.slice(0, 3).map(([d, p]) => `${p} ${d.toFixed(1)}`).join(', ')}` +
-  (litBad.length ? `  FAIL (< ${LIT_MIN}): ${litBad.map(([d, p]) => `${p} ${d.toFixed(1)}`).join(', ')}` : `  ok (>= ${LIT_MIN})`));
+check('default: filament', TYPE_HEX, false);
+const failed = check('colorblind', COLORBLIND_HEX, true);
 if (failed) { console.log(`${failed} pairs too close`); process.exit(1); }
 console.log('palette ok');
