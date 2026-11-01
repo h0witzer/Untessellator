@@ -1,0 +1,36 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<!-- The gallery link card: brand/social-preview.png in Untessellator-Gallery. 1280x640; the tiles are live gallery thumbnails. -->
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&display=swap">
+<style>
+  html, body { margin: 0; background: #2a1638; }
+  .c { width: 1280px; height: 640px; position: relative; overflow: hidden; background: #2a1638; font-family: "Chakra Petch", sans-serif; }
+  .left { position: absolute; left: 64px; top: 0; bottom: 24px; width: 560px; display: flex; flex-direction: column; justify-content: center; gap: 20px; }
+  .row { display: flex; align-items: flex-end; gap: 16px; }
+  .row img { width: 420px; display: block; }
+  .row span { color: #c7b6da; font: 600 20px/1 "Chakra Petch", sans-serif; letter-spacing: 0.22em; padding-bottom: 4px; }
+  .t { color: #f5effb; font: 700 46px/1.06 "Chakra Petch", sans-serif; margin-top: 8px; }
+  .s { color: #c7b6da; font: 500 22px/1.4 "Chakra Petch", sans-serif; letter-spacing: 0.02em; }
+  .s b { color: #2fc59a; font-weight: 600; }
+  .u { color: #b98cff; font: 600 21px/1 "Chakra Petch", sans-serif; letter-spacing: 0.03em; margin-top: 4px; }
+  /* four gallery parts, each on the stage in an octagon tile */
+  .tiles { position: absolute; right: 56px; top: 40px; display: grid; grid-template-columns: repeat(2, 268px); gap: 12px; }
+  .tiles div { height: 262px; background: #2a1a37 center / contain no-repeat;
+    clip-path: polygon(14px 0, calc(100% - 14px) 0, 100% 14px, 100% calc(100% - 14px), calc(100% - 14px) 100%, 14px 100%, 0 calc(100% - 14px), 0 14px); }
+  .band { position: absolute; left: 0; right: 0; bottom: 0; height: 16px; background: url(../facet-band.svg) left / 100% 100% no-repeat; }
+</style></head>
+<body data-scale="1"><div class="card c">
+  <div class="left">
+    <div class="row"><img src="../wordmark-on-plum.svg" alt=""><span>GALLERY</span></div>
+    <div class="t">Mesh in. The original<br>CAD back out.</div>
+    <div class="s"><b>✓</b> STL meshes turned back into STEP solids. Each one checked face by face against its original CAD, within&nbsp;1&nbsp;µm.</div>
+    <div class="u">h0witzer.github.io/Untessellator-Gallery</div>
+  </div>
+  <div class="tiles">
+    <div style="background-image: url(https://h0witzer.github.io/Untessellator-Gallery/parts/00003583_000/thumb.png)"></div>
+    <div style="background-image: url(https://h0witzer.github.io/Untessellator-Gallery/parts/00002233_000/thumb.png)"></div>
+    <div style="background-image: url(https://h0witzer.github.io/Untessellator-Gallery/parts/00004530_000/thumb.png)"></div>
+    <div style="background-image: url(https://h0witzer.github.io/Untessellator-Gallery/parts/00002138_008/thumb.png)"></div>
+  </div>
+  <div class="band"></div>
+</div></body></html>

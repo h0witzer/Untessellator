@@ -21,3 +21,6 @@ game-assets/
 
 # Scratch probes (test/_name.mjs) stay local.
 test/_*.mjs
+
+# Link-card legibility previews (brand/cards/render.mjs --preview)
+brand/cards/preview/
