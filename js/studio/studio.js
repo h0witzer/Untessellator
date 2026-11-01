@@ -223,10 +223,7 @@ shell.stage.prepend(canvas);
 const overlay = document.createElement('canvas');
 overlay.className = 'studio-overlay';
 canvas.after(overlay);
-const empty = document.createElement('div');
-empty.className = 'studio-empty';
-empty.innerHTML = '<img src="brand/mark-on-plum.svg" alt="" width="180" height="180"><span>Open or drop an STL, OBJ or 3MF file</span>';
-shell.stage.append(empty);
+const empty = document.getElementById('empty');   // in index.html, so the page reads without scripts
 const legend = document.createElement('div');
 legend.className = 'wb-legend';
 legend.hidden = true;

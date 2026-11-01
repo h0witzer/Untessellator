@@ -31,6 +31,17 @@
 .studio-empty[hidden] {
   display: none;
 }
+.studio-empty__about {
+  max-width: 440px;
+  margin: 0;
+  padding: 0 16px;
+  text-align: center;
+  color: var(--os-text-tertiary);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.5;
+  letter-spacing: 0;
+}
 
 /* The heat legend's parts (studio.js drawHeatLegend), inside the legend workbench.css places: the ramp, hot at
    the top, a decade per row */

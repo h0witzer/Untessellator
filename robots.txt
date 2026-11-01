@@ -1,0 +1,5 @@
+User-agent: *
+Disallow: /test/
+Disallow: /ml/
+
+Sitemap: https://untessellator.com/sitemap.xml

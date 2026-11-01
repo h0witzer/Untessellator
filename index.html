@@ -3,11 +3,15 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Untessellator</title>
+  <!-- the title and description are what a search result shows: they lead with what people search for -->
+  <title>STL to STEP Converter: Free, Real CAD Faces | Untessellator</title>
   <link rel="icon" href="brand/favicon.svg" type="image/svg+xml">
-  <meta name="description" content="Turn STL, OBJ and 3MF meshes back into real CAD: STEP solids with exact planes, cylinders, cones, spheres and tori. Free, in your browser.">
+  <link rel="canonical" href="https://untessellator.com/">
+  <meta name="description" content="Convert STL, OBJ or 3MF to STEP free in your browser: exact planes, cylinders, cones, spheres and tori instead of triangles. No upload, no sign-up.">
   <!-- the card a shared link shows (brand/social-preview.png is also the GitHub repo's) -->
-  <meta property="og:title" content="Untessellator">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Untessellator">
+  <meta property="og:title" content="Untessellator: STL to STEP with real CAD faces">
   <meta property="og:description" content="Turn meshes back into real CAD: STEP solids with exact planes, cylinders, cones, spheres and tori. Free, in your browser.">
   <meta property="og:url" content="https://untessellator.com/">
   <meta property="og:image" content="https://untessellator.com/brand/social-preview.png">
@@ -15,6 +19,23 @@
   <meta property="og:image:height" content="640">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="theme-color" content="#2a1638">
+  <!-- what search engines read about the app (schema.org); no ratings until there are real ones -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebApplication",
+    "name": "Untessellator",
+    "url": "https://untessellator.com/",
+    "description": "Converts STL, OBJ and 3MF meshes to STEP with exact planes, cylinders, cones, spheres, tori and B-spline faces instead of triangles. Runs in the browser; the file is never uploaded.",
+    "applicationCategory": "DesignApplication",
+    "operatingSystem": "Any (runs in a web browser)",
+    "browserRequirements": "Requires WebGL and WebAssembly",
+    "isAccessibleForFree": true,
+    "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+    "image": "https://untessellator.com/brand/social-preview.png",
+    "sameAs": ["https://github.com/h0witzer/Untessellator"]
+  }
+  </script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
@@ -58,6 +79,15 @@
         <kbd title="C steps through them">C</kbd>
       </div>
       <div class="wb-hints" id="hint">Left: paint · Shift: brush · Alt: erase · [ ]: brush size · T: triangle edges · C: color by<br>Right-drag: orbit · Ctrl+right or middle: pan · Wheel: zoom · F: fit · right-click a group: menu</div>
+      <!-- what the view shows before a mesh opens, written here rather than by studio.js so crawlers that run no
+           scripts read what the page does -->
+      <div class="studio-empty" id="empty">
+        <img src="brand/mark-on-plum.svg" alt="" width="180" height="180">
+        <span>Open or drop an STL, OBJ or 3MF file</span>
+        <p class="studio-empty__about">Untessellator converts STL to STEP with real CAD faces: exact planes, cylinders,
+          cones, spheres and tori instead of thousands of triangles. It's free and runs in your browser, so your file
+          never leaves your computer.</p>
+      </div>
     </main>
 
     <aside class="wb-panel" id="panel"></aside>
