@@ -15,10 +15,13 @@ Two corpora:
   painted   --painted <dir>/<name>/ holds:
               export.step     the studio's Export STEP
               original.step   the CAD the mesh came from
-              report.zip      the studio's report (flag button, "+ picture + mesh"): its part.stl is the input,
-                              and its groups say which ones were painted by hand
-              input.stl       the mesh, if report.zip has none
+              report.zip      the studio's report (the flag button): its groups say which ones were painted by
+                              hand, and its part.stl is the input if it has the mesh
+              <name>.stl      the mesh (input.stl in older folders), if report.zip has none
               meta.json       optional: {"title", "credit", "link", "license"}
+            The queue's folders are the closest one-shot misses (--queue). --collect [<downloads>] first moves
+            the studio's downloads into them: <name>.stp (the studio names it after the mesh) as export.step,
+            and each Untessellator-report-*.zip as the report.zip of the part whose mesh has its triangle count.
 
 Writes into the site:
   data/gallery.json       the criteria, a tally per corpus, and one row per matching part
@@ -29,6 +32,8 @@ Writes into the site:
 and into --work:
   match/<id>.json         step_match's report per part, reused while neither STEP changes
   misses.json             the one-shot parts that did not match, closest first: the queue for painting by hand
+  painted/QUEUE.md        the painting queue, closest first: what each one-shot got wrong, how each painted
+                          export did, and the steps
 """
 
 from __future__ import annotations
@@ -286,7 +291,8 @@ def painted_jobs(args):
         meta = json.loads((d / 'meta.json').read_text()) if (d / 'meta.json').exists() else {}
         row = {'corpus': 'painted', 'title': meta.get('title', d.name), 'credit': meta.get('credit'),
                'link': meta.get('link'), 'license': meta.get('license'), 'mesher': meta.get('mesher')}
-        stl_bytes = (d / 'input.stl').read_bytes() if (d / 'input.stl').exists() else None
+        stl = next((p for p in (d / f'{d.name}.stl', d / 'input.stl') if p.exists()), None)
+        stl_bytes = stl.read_bytes() if stl else None
         rz = d / 'report.zip'
         if rz.exists():
             with zipfile.ZipFile(rz) as z:
@@ -335,38 +341,146 @@ def write_part(site, job, rep):
     return job['id']
 
 
+def one_shot_types(args, pid):
+    """The one-shot match report of a part, and its face types: (report, original's, one-shot's)."""
+    rep = json.loads((args.work / 'match' / f'{pid}.json').read_text())
+    return rep, rep.get('truth', {}).get('types', {}), rep.get('ours', {}).get('types', {})
+
+
+def notes(args, pid):
+    """A queue folder's NOTES.txt: why the one-shot missed, the face types side by side, and how to paint it."""
+    rep, t, o = one_shot_types(args, pid)
+    rows = [f'  {k:10} original {t.get(k, 0):4}   one-shot {o.get(k, 0):4}' for k in KINDS if t.get(k) or o.get(k)]
+    return (f"{pid}: the one-shot export missed because {rep.get('reason')}.\n\n" + '\n'.join(rows) +
+            f'\n\nTo paint it: open {pid}.stl in the studio, press Auto-paint, repaint the faces that are wrong, then\n'
+            f'Export STEP and Save STEP ({pid}.stp), and press the flag button for the report. Both land in your\n'
+            'downloads; ml/gallery_build.py --collect moves them here as export.step and report.zip and checks the\n'
+            'export against original.step. QUEUE.md, one folder up, says how it did.\n')
+
+
 def queue_misses(args, misses, n):
     """Tops the painting queue up to n folders: <painted>/<id>/ for the closest one-shot misses that have no
-    folder yet, with input.stl, original.step, meta.json and NOTES.txt (what differs). Painting one means
-    saving the studio's export.step and report.zip there."""
+    folder yet, with <id>.stl (so the studio saves <id>.stp), original.step, meta.json and NOTES.txt (what
+    differs). Painting one means getting the studio's export.step and report.zip there (--collect)."""
     args.painted.mkdir(parents=True, exist_ok=True)
-    waiting = sum(1 for d in args.painted.iterdir() if d.is_dir() and not (d / 'export.step').exists())
-    n -= waiting
+    waiting = [d for d in args.painted.iterdir() if d.is_dir() and not (d / 'export.step').exists()]
+    for d in waiting:                       # a folder from before the mesh was named after the part
+        if (d / 'input.stl').exists() and not (d / f'{d.name}.stl').exists() and (args.work / 'match' / f'{d.name}.json').exists():
+            (d / 'input.stl').rename(d / f'{d.name}.stl')
+            (d / 'NOTES.txt').write_text(notes(args, d.name))
     made = 0
     for m in misses:
-        if made >= n:
+        if made >= n - len(waiting):
             break
         d = args.painted / m['id']
         if d.exists():
             continue
-        rep = json.loads((args.work / 'match' / f"{m['id']}.json").read_text())
-        t, o = rep.get('truth', {}).get('types', {}), rep.get('ours', {}).get('types', {})
-        rows = [f'  {k:10} original {t.get(k, 0):4}   one-shot {o.get(k, 0):4}' for k in KINDS if t.get(k) or o.get(k)]
         d.mkdir(parents=True)
-        shutil.copyfile(m['stl'], d / 'input.stl')
+        shutil.copyfile(m['stl'], d / f"{m['id']}.stl")
         shutil.copyfile(m['original'], d / 'original.step')
         model, _, part_idx = m['id'].partition('_')
         (d / 'meta.json').write_text(json.dumps({
             'title': f'ABC {model} · part {int(part_idx)}', 'mesher': 'Onshape',
             'credit': 'ABC dataset (Onshape public documents); copyright stays with the creator',
             'link': 'https://deep-geometry.github.io/abc-dataset/'}, indent=1))
-        (d / 'NOTES.txt').write_text(
-            f"{m['id']}: the one-shot export missed because {rep.get('reason')}.\n\n" + '\n'.join(rows) +
-            '\n\nTo paint it: open input.stl in the studio, press Auto-paint, repaint the faces that are wrong,\n'
-            'then save Export STEP here as export.step, and the flag button\'s report ("+ picture + mesh") as\n'
-            'report.zip. The next gallery build checks it against original.step.\n')
+        (d / 'NOTES.txt').write_text(notes(args, m['id']))
         made += 1
     return made
+
+
+def stl_triangles(path):
+    """The triangle count of a binary or ASCII STL."""
+    data = path.read_bytes()
+    if len(data) >= 84 and 84 + 50 * struct.unpack_from('<I', data, 80)[0] == len(data):
+        return struct.unpack_from('<I', data, 80)[0]
+    return data.count(b'facet normal')
+
+
+def collect(args, src):
+    """Moves the studio's downloads for the painting queue from src (the browser's downloads folder) into the
+    queue's folders: a folder's newest <id>.stp / <id>.step / "<id> (n).stp" becomes its export.step, and each
+    Untessellator-report-*.zip becomes report.zip of the one folder whose mesh has the report's input triangle
+    count (the import repair's triangles_in; the mesh's count when nothing was repaired). Several folders with
+    that count: the one whose STEP was saved last before the report. A file older than the one it would replace
+    is left alone, and a report that fits no folder stays where it is."""
+    folders = {d.name: d for d in args.painted.iterdir() if d.is_dir()} if args.painted.exists() else {}
+    moved = []
+    for pid, d in folders.items():
+        steps = [p for p in src.iterdir() if p.suffix.lower() in ('.stp', '.step')
+                 and (p.stem == pid or p.stem.startswith(f'{pid} ('))]
+        if not steps:
+            continue
+        newest = max(steps, key=lambda p: p.stat().st_mtime)
+        target = d / 'export.step'
+        if not target.exists() or newest.stat().st_mtime > target.stat().st_mtime:
+            os.replace(newest, target)
+            moved.append(f'{pid}/export.step  <- {newest.name}')
+    tris = {}
+    for pid, d in folders.items():
+        stl = next((p for p in (d / f'{pid}.stl', d / 'input.stl') if p.exists()), None)
+        if stl:
+            tris[pid] = stl_triangles(stl)
+    left = 0
+    for z in sorted(src.glob('Untessellator-report-*.zip'), key=lambda p: p.stat().st_mtime):
+        try:
+            with zipfile.ZipFile(z) as f:
+                mesh = json.loads(f.read('report.json')).get('mesh') or {}
+        except (zipfile.BadZipFile, KeyError, json.JSONDecodeError):
+            continue
+        count = (mesh.get('repair') or {}).get('triangles_in') or mesh.get('triangles')
+        fits = [pid for pid, n in tris.items() if n == count]
+        when = z.stat().st_mtime
+        if len(fits) > 1:
+            saved = sorted(((folders[p] / 'export.step').stat().st_mtime, p) for p in fits
+                           if (folders[p] / 'export.step').exists())
+            fits = [p for m, p in saved if m <= when + 5][-1:]
+        if len(fits) != 1:
+            left += 1
+            continue
+        target = folders[fits[0]] / 'report.zip'
+        if not target.exists() or when > target.stat().st_mtime:
+            os.replace(z, target)
+            moved.append(f'{fits[0]}/report.zip   <- {z.name}')
+    for line in moved:
+        print(f'  collected {line}')
+    if left:
+        print(f'  left {left} report(s) in {src} that fit no queue folder')
+    return moved
+
+
+def write_queue(args, misses, reps):
+    """painted/QUEUE.md: the queue in the misses' order (closest first), each folder's one-shot error and how
+    its painted export did."""
+    order = {m['id']: i for i, m in enumerate(misses)}
+    folders = sorted((d for d in args.painted.iterdir() if d.is_dir()), key=lambda d: (order.get(d.name, 1e9), d.name))
+    rows = []
+    for d in folders:
+        if not (args.work / 'match' / f'{d.name}.json').exists():
+            continue
+        _, t, o = one_shot_types(args, d.name)
+        off = ', '.join(f'{k} {t.get(k, 0)} → {o.get(k, 0)}' for k in KINDS if t.get(k, 0) != o.get(k, 0)) or 'types right'
+        rep = reps.get('p-' + ''.join(c if c.isalnum() or c in '-_' else '-' for c in d.name).lower())
+        status = ('waiting' if not (d / 'export.step').exists() else
+                  'not checked yet' if rep is None else
+                  f"missed: {rep.get('reason')}" if not rep.get('match') else
+                  '**matches**, on the site' + ('' if (d / 'report.zip').exists() else
+                                                ' (no report.zip: the hand-painted count is missing)'))
+        rows.append(f'| {len(rows) + 1} | `{d.name}` | {off} | {status} |')
+    (args.painted / 'QUEUE.md').write_text(
+        '# Painting queue\n\n'
+        'The closest one-shot misses, closest first. "What the one-shot got wrong" is the face count per type,\n'
+        'original → one-shot. For each part:\n\n'
+        '1. Open `<id>.stl` from its folder in the studio (https://untessellator.com), press Auto-paint, and repaint\n'
+        '   the faces that are wrong. NOTES.txt in the folder has the counts.\n'
+        '2. Export STEP, then Save STEP: it downloads as `<id>.stp`.\n'
+        '3. Press the flag button for the report (no picture or mesh needed), and close the GitHub tab it opens.\n\n'
+        'After a few, from the Untessellator repo:\n\n'
+        f'    D:/abc-data/venv/Scripts/python.exe ml/gallery_build.py --collect\n\n'
+        'It moves each part\'s STEP and report from your Downloads into its folder, checks every painted export\n'
+        'against its original, refreshes this list and the gallery\'s "Painted by hand" tab, and tops the queue\n'
+        'back up. Commit and push the gallery to publish.\n\n'
+        '| # | Part | What the one-shot got wrong | Status |\n|---|---|---|---|\n' + '\n'.join(rows) + '\n',
+        encoding='utf-8')
 
 
 def miss_row(job, rep):
@@ -391,6 +505,8 @@ def main(argv=None) -> int:
                     help="largest face-to-face distance, mm (the originals' declared uncertainty)")
     ap.add_argument('--jobs', type=int, default=8)
     ap.add_argument('--queue', type=int, default=10, help='set up this many closest misses for painting by hand')
+    ap.add_argument('--collect', type=Path, nargs='?', const=Path.home() / 'Downloads', default=None,
+                    help="first move the painting queue's STEPs and reports out of this folder (default: Downloads)")
     ap.add_argument('--no-thumbs', action='store_true')
     ap.add_argument('--thumbs-only', action='store_true', help="redraw every thumbnail of the site's current parts")
     args = ap.parse_args(argv)
@@ -399,6 +515,8 @@ def main(argv=None) -> int:
         render_thumbs(args.site, [r['id'] for r in json.loads((args.site / 'data/gallery.json').read_text())['parts']])
         return 0
 
+    if args.collect:
+        collect(args, args.collect)
     oneshot = [j for j in oneshot_jobs(args)]
     painted = painted_jobs(args)
     exported = [j for j in oneshot if j['ours'].exists()] + painted
@@ -466,6 +584,8 @@ def main(argv=None) -> int:
                                abs((m['faces'][0] or 0) - (m['faces'][1] or 0)), m['faces'][0] or 0))
     (args.work / 'misses.json').write_text(json.dumps(misses, indent=1))
     queued = queue_misses(args, misses, args.queue) if args.queue else 0
+    if args.painted.exists():
+        write_queue(args, misses, reps)
 
     if not args.no_thumbs:
         render_thumbs(args.site, new)
