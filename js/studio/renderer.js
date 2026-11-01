@@ -2,7 +2,7 @@
  * renderer.js — the studio's WebGL2 viewport, drawn with the Form Studio kit's pieces.
  *
  * Taken from the kit as it is: the product's lighting (PART_GLSL, a Phong headlight in eye
- * space), its ambient occlusion pass, its screen-space bands and their styles, the flat #333
+ * space), its ambient occlusion pass, its screen-space bands and their styles, the flat
  * ground, and the two-pass solid that paints an inverted patch red.
  *
  * Where this app departs from the kit, on purpose:
@@ -24,6 +24,9 @@ import {
   compileProgram, BAND_VERTEX, BAND_FRAGMENT, drawBand, bandStyle, multiply4,
   setLightingUniforms, createSsao, occlusionFactor, PART_GLSL,
 } from '../../vendor/form-studio-ui/index.js';
+
+// The ground: the logo's plum (workbench.css --wb-stage, #2a1a37) where the kit has a flat #333.
+const GROUND = [0.165, 0.102, 0.216, 1];
 
 /**
  * The heat ramp: stop k is level FROM + k, held flat below the first and above the last. The levels are
@@ -272,7 +275,7 @@ export function createRenderer(canvas) {
     draw({ view, projection, width, height, ratio, occlusionPercent, occlusionRadius, edges }) {
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       gl.viewport(0, 0, width, height);
-      gl.clearColor(0.2, 0.2, 0.2, 1);
+      gl.clearColor(...GROUND);
       gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
       gl.enable(gl.DEPTH_TEST);
 
@@ -290,7 +293,7 @@ export function createRenderer(canvas) {
         gl.drawArrays(gl.TRIANGLES, 0, vertices);
         gl.bindVertexArray(null);
         ssao.compute(projection, { radius: occlusionRadius });
-        gl.clearColor(0.2, 0.2, 0.2, 1);
+        gl.clearColor(...GROUND);
         gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
         gl.enable(gl.DEPTH_TEST);
       }

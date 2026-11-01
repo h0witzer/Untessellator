@@ -103,23 +103,42 @@ const MODELS = [
 ];
 const TYPE_ICONS = { plane: 'face', cylinder: 'cylinder', cone: 'cone', sphere: 'sphere', torus: 'torus', freeform: 'freeform', skip: 'skip', auto: 'auto' };
 
+// The logo's icons: the kit's grid (0 0 20 20, filled, currentColor), straight cuts and chamfers instead of round
+// caps, a second tone at half opacity. Same names as the kit's, so these replace its drawings everywhere.
 ui.registerIcons({
-  folder: '<path d="M2 3.6h6.2l2 2H18v10.8H2zm1.6 4v7.2h12.8V7.6z" fill-rule="evenodd" />',
-  bucket: '<path d="M8.4 1.8 16 9.4l-6.2 6.2-7.6-7.6 3-3-1.1-1.1 1.2-1.2 1.1 1.1zM4.5 8l5.3 5.3L13.7 9.4z" fill-rule="evenodd" /><path d="M16.6 12.2s1.9 2.3 1.9 3.6a1.9 1.9 0 0 1-3.8 0c0-1.3 1.9-3.6 1.9-3.6z" />',
-  brush: '<path d="M17.8 2.2c.7.7-5.2 8.4-6.6 9.8L8 8.8c1.4-1.4 9.1-7.3 9.8-6.6zM6.9 10.1l3 3c-.3 2.8-2.5 5-7.9 4.7 2-1.5 1-6 4.9-7.7z" />',
-  cone: '<path d="M10 1.6 17 15.2a7 2.8 0 0 1-14 0zm0 4.4-4.6 9.1a4.6 1.4 0 0 0 9.2 0z" fill-rule="evenodd" />',
+  // Tools work on triangles, so they are drawn in facets. An arrow: select a group.
+  select: '<path d="M3.5 1.8L16.8 10.2L11.4 11.4L14.6 17.2L12.2 18.5L9 12.7L4.6 16.6Z"/>',
+  // A facet tipped up with paint in its lower half and a faceted drop: fill a face.
+  bucket: '<path d="M9 1.2L16.6 8.8L9 16.4L1.4 8.8ZM9 4L4.2 8.8L9 13.6L13.8 8.8Z" fill-rule="evenodd"/><path d="M4.6 8.8L13.4 8.8L9 13.2Z" opacity=".5"/><path d="M16.9 12L18.8 15.4L16.9 18.8L15 15.4Z"/>',
+  brush: '<path d="M15.8 1.2L18.8 4.2L11.6 11.4L8.6 8.4Z" opacity=".5"/><path d="M8 9L11 12L9.7 13.3L6.7 10.3Z"/><path d="M6.3 10.9L9.1 13.7L1.6 18.4Z"/>',
+  // An eraser cut in two by the logo's gap, the line it wipes under it.
+  eraseFill: '<path d="M12.6 1.8L18.2 7.4L14.2 11.4L8.6 5.8Z" opacity=".5"/><path d="M7.7 6.7L13.3 12.3L9.6 16L4 10.4Z"/><path d="M10.6 16.8L18.4 16.8L18.4 18.4L10.6 18.4Z" opacity=".5"/>',
+  // Three facets of a square fan and the empty slot of the fourth: delete triangles.
+  deleteFace: '<path d="M2.9 2L17.1 2L10 9.1Z"/><path d="M2 2.9L9.1 10L2 17.1Z"/><path d="M2.9 18L10 10.9L17.1 18Z"/><path d="M18 2.9V17.1L10.9 10ZM16.6 6.3L13 10L16.6 13.7Z" fill-rule="evenodd" opacity=".5"/>',
+  // Surfaces are what a group becomes, so they are drawn smooth, lit from the upper left.
+  face: '<path d="M1.6 8.2L10 3.4L18.4 8.2L10 13Z"/><path d="M1.6 8.2L10 13L18.4 8.2L18.4 10.4L10 15.2L1.6 10.4Z" opacity=".5"/>',
+  cylinder: '<path d="M3 4.8V15.2A7 2.6 0 0 0 17 15.2V4.8A7 2.6 0 0 1 3 4.8Z" opacity=".5"/><ellipse cx="10" cy="4.8" rx="7" ry="2.6"/><path d="M3 4.8V15.2A7 2.6 0 0 0 10 17.8V7.4A7 2.6 0 0 1 3 4.8Z"/>',
+  cone: '<path d="M10 1.6L17 15.4A7 2.4 0 0 1 3 15.4Z" opacity=".5"/><path d="M10 1.6L10 17.8A7 2.4 0 0 1 3 15.4Z"/>',
+  sphere: '<circle cx="10" cy="10" r="8.2" opacity=".5"/><path d="M1.8 10A8.2 8.2 0 0 1 18.2 10A8.2 3 0 0 1 1.8 10Z"/>',
+  torus: '<path d="M10 4A8.6 5.6 0 1 0 10 15.2A8.6 5.6 0 1 0 10 4ZM10 7.6A3.6 1.9 0 1 1 10 11.4A3.6 1.9 0 1 1 10 7.6Z" fill-rule="evenodd"/><path d="M6.4 9.5A3.6 1.9 0 0 1 13.6 9.5A3.6 1.4 0 0 0 6.4 9.5Z" opacity=".5"/>',
   // A rippled sheet: a freeform (B-spline) fill.
-  freeform: '<path d="M2 6.5c2.2-2.6 4.4-2.6 6.6 0s4.4 2.6 6.6 0L18 5.2v2.3c-2.2 2.6-4.4 2.6-6.6 0s-4.4-2.6-6.6 0L2 8.8z" /><path d="M2 12.2c2.2-2.6 4.4-2.6 6.6 0s4.4 2.6 6.6 0l2.8-1.3v2.3c-2.2 2.6-4.4 2.6-6.6 0s-4.4-2.6-6.6 0L2 14.5z" />',
-  // A four-point spark: the model picks the surface.
-  auto: '<path d="M8 1.5c.5 3.6 2.4 5.5 6 6-3.6.5-5.5 2.4-6 6-.5-3.6-2.4-5.5-6-6 3.6-.5 5.5-2.4 6-6zM15 11c.3 2 1.3 3 3.3 3.3-2 .3-3 1.3-3.3 3.3-.3-2-1.3-3-3.3-3.3 2-.3 3-1.3 3.3-3.3z" />',
+  freeform: '<path d="M1.6 7.4C4.4 2.4 7.4 2.4 10 6.6S15.6 10.8 18.4 5.8V9.6C15.6 14.6 12.6 14.6 10 10.4S4.4 6.2 1.6 11.2Z"/><path d="M1.6 11.2C4.4 6.2 7.4 6.2 10 10.4S15.6 14.6 18.4 9.6V12.6C15.6 17.6 12.6 17.6 10 13.4S4.4 9.2 1.6 14.2Z" opacity=".5"/>',
+  // An octagon struck through: skipped, set aside.
+  skip: '<path d="M6.7 1.8H13.3L18.2 6.7V13.3L13.3 18.2H6.7L1.8 13.3V6.7ZM7.5 4L4 7.5V12.5L7.5 16H12.5L16 12.5V7.5L12.5 4Z" fill-rule="evenodd"/><path d="M5.3 4.1L15.9 14.7L14.7 15.9L4.1 5.3Z"/>',
+  // Sparks cut from triangles: the model picks the surface.
+  auto: '<path d="M8.5 1.2L10.2 6.8L15.8 8.5L10.2 10.2L8.5 15.8L6.8 10.2L1.2 8.5L6.8 6.8Z"/><path d="M15.6 11.8L16.4 14.8L19.4 15.6L16.4 16.4L15.6 19.4L14.8 16.4L11.8 15.6L14.8 14.8Z" opacity=".5"/>',
   // A wand with sparks: auto-paint.
-  wand: '<path d="M2.5 16.4 12.9 6l1.6 1.6L4.1 18z" /><path d="M14 4.9l1.3-1.3 1.6 1.6-1.3 1.3zM8.6 1.5l.6 1.5 1.5.6-1.5.6-.6 1.5-.6-1.5-1.5-.6 1.5-.6zM16.4 9.6l.5 1.2 1.2.5-1.2.5-.5 1.2-.5-1.2-1.2-.5 1.2-.5z" />',
+  wand: '<path d="M1.6 16.8L12 6.4L13.8 8.2L3.4 18.6Z"/><path d="M12.6 5.8L14 4.4L15.8 6.2L14.4 7.6Z" opacity=".5"/><path d="M15.6 0.8L16.4 3.6L19.2 4.4L16.4 5.2L15.6 8L14.8 5.2L12 4.4L14.8 3.6Z"/><path d="M7 1.2L7.6 2.6L9 3.2L7.6 3.8L7 5.2L6.4 3.8L5 3.2L6.4 2.6Z" opacity=".5"/>',
+  // Three rails with diamond knobs: fill options.
+  surface: '<path d="M1.6 3.7L18.4 3.7L18.4 5.3L1.6 5.3Z" opacity=".5"/><path d="M1.6 9.2L18.4 9.2L18.4 10.8L1.6 10.8Z" opacity=".5"/><path d="M1.6 14.7L18.4 14.7L18.4 16.3L1.6 16.3Z" opacity=".5"/><path d="M6.5 1.6L9.4 4.5L6.5 7.4L3.6 4.5Z"/><path d="M13.5 7.1L16.4 10L13.5 12.9L10.6 10Z"/><path d="M9 12.6L11.9 15.5L9 18.4L6.1 15.5Z"/>',
   // A flag on a pole: report how the conversion went.
-  flag: '<path d="M4 2h1.6v16H4z" /><path d="M6.4 2.8h10l-2.6 3.9 2.6 3.9h-10z" />',
-  // A circle struck through: skipped, set aside.
-  skip: '<path d="M10 2a8 8 0 1 0 0 16 8 8 0 1 0 0-16zm0 2a6 6 0 1 1 0 12 6 6 0 1 1 0-12zM6.5 5.1l8.4 8.4-1.4 1.4-8.4-8.4z" fill-rule="evenodd" />',
-  // An arrow: select a group.
-  select: '<path d="M4 2l11 7-5 1.2L12.6 16l-2 .9-2.6-5.7L4 14z" />',
+  flag: '<path d="M3.4 2.6L5 1.2L5 18.6L3.4 18.6Z" opacity=".5"/><path d="M6 2.4L17.8 2.4L14.6 6.6L17.8 10.8L6 10.8Z"/>',
+  // A U-turn with chamfered corners: undo, and its mirror.
+  undo: '<path d="M6.6 4.6L13.6 4.6L18.2 9.2L18.2 12.2L13.6 16.8L6.2 16.8L6.2 14.6L12.7 14.6L16 11.3L16 10.1L12.7 6.8L6.6 6.8Z"/><path d="M1.6 5.7L7.4 1.2L7.4 10.2Z"/>',
+  redo: '<path d="M13.4 4.6L6.4 4.6L1.8 9.2L1.8 12.2L6.4 16.8L13.8 16.8L13.8 14.6L7.3 14.6L4 11.3L4 10.1L7.3 6.8L13.4 6.8Z"/><path d="M18.4 5.7L12.6 1.2L12.6 10.2Z"/>',
+  folder: '<path d="M1.6 3.2L7.6 3.2L9.6 5.2L18.4 5.2L18.4 16.8L1.6 16.8Z" opacity=".5"/><path d="M1.6 8L17 8L18.4 9.4L18.4 16.8L1.6 16.8Z"/>',
+  // A heart in facets: support.
+  heart: '<path d="M10 18L1.6 9.6L1.6 5.4L4.8 2.2L7.8 2.2L10 4.4L12.2 2.2L15.2 2.2L18.4 5.4L18.4 9.6Z"/><path d="M10 4.4L10 18L18.4 9.6L18.4 5.4L15.2 2.2L12.2 2.2Z" opacity=".22" fill="#000"/>',
 });
 
 // Colorblind colors (the view menu), remembered on this browser so a color-blind viewer sets it once.
@@ -206,7 +225,7 @@ overlay.className = 'studio-overlay';
 canvas.after(overlay);
 const empty = document.createElement('div');
 empty.className = 'studio-empty';
-empty.textContent = 'Open or drop an STL, OBJ or 3MF file';
+empty.innerHTML = '<img src="brand/mark-on-plum.svg" alt="" width="180" height="180"><span>Open or drop an STL, OBJ or 3MF file</span>';
 shell.stage.append(empty);
 const legend = document.createElement('div');
 legend.className = 'wb-legend';
@@ -459,6 +478,10 @@ toolRow.addEventListener('click', (event) => {
 // the flag, next to Export STEP: report how this conversion went (report.js)
 const reportButton = document.getElementById('report');
 reportButton.innerHTML = ui.iconMarkup('flag', { className: 'wb-ticon' });
+// the header's other icons, before their labels (a narrow window hides the labels)
+for (const [id, icon] of [['open', 'folder'], ['undo', 'undo'], ['redo', 'redo'], ['support', 'heart']]) {
+  document.getElementById(id).insertAdjacentHTML('afterbegin', ui.iconMarkup(icon, { className: 'wb-ticon' }));
+}
 reportButton.addEventListener('click', () => reportConversion());
 document.getElementById('brush-size').addEventListener('input', (event) => {
   settings.brushPx = Number(event.target.value);

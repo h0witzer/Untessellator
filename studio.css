@@ -20,8 +20,12 @@
   display: flex;
   align-items: center;
   justify-content: center;
+  flex-direction: column;
+  gap: 22px;
   color: var(--os-text-secondary);
-  font-size: 13px;
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
   pointer-events: none;
 }
 .studio-empty[hidden] {
@@ -75,5 +79,5 @@
 }
 
 .os-stage.studio-dropping {
-  box-shadow: inset 0 0 0 2px #3e94ff;
+  box-shadow: inset 0 0 0 2px #b98cff;
 }

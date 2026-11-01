@@ -50,6 +50,20 @@
 //   * Below the box, right-aligned: a 44 x 28 dropdown, "Camera and render
 //     options", with a 20px four-tone cube icon and a caret. Not a home button.
 //
+// THIS COPY (Untessellator, 2026-10-31) departs from the reading on purpose:
+//
+//   * The corner discs are painted where the geometry puts them, behind the
+//     near plates, so they show only in the vertex notches; the kit painted
+//     them over the plates. Only a hovered disc is drawn on top.
+//   * A far face shows only its light plate, through the seams.
+//   * The plates and discs are faceted (octagons, hexagons) until clicked: the
+//     face or corner clicked eases round once the camera has turned to it, and
+//     back to facets when the view leaves it. Each near centre plate carries the
+//     diagonal an STL splits a face on, fading as it smooths. Hover only lights.
+//   * A near face's centre plate picks before the corners; a corner's target is
+//     a little wider than its notch.
+//   * The colours are the logo's plum, lilac and filament axes.
+//
 // The cube is handed the camera's view matrix and nothing else, so it cannot
 // disagree with the viewport about which way is up. See `src/ui/camera.js`
 // for the camera whose rotation model matches the product's drag.
@@ -91,29 +105,33 @@ export const ROTATE_ANGLES = Object.freeze({
 
 /** Their `CAMERA_*_ANIMATION_TIME_MS`. */
 export const ANIMATION_MS = Object.freeze({ snap: 125, short: 250, long: 500 });
+// facets to round, or back, for a face or corner of the cube
+const SMOOTH_MS = 240;
 
 export const COLOURS = Object.freeze({
   dark: Object.freeze({
-    front: 'rgba(51,51,51,1)',
-    back: 'rgba(153,153,153,1)',
-    arrow: 'rgba(153,153,153,1)',
-    highlight: 'rgba(144,206,241,0.6)',
-    textIdle: '#fff',
-    textHover: '#000',
-    axisX: '#dd979b',
-    axisY: '#a2db7d',
-    axisZ: '#90cef1',
+    front: 'rgba(42,26,55,1)',
+    back: 'rgba(122,96,152,1)',
+    arrow: 'rgba(154,133,176,0.9)',
+    highlight: 'rgba(185,140,255,1)',
+    seam: 'rgba(122,96,152,0.9)',
+    textIdle: '#f5effb',
+    textHover: '#2a1638',
+    axisX: '#ff5c8a',
+    axisY: '#2fc59a',
+    axisZ: '#37adf3',
   }),
   light: Object.freeze({
     front: 'rgba(255,255,255,1)',
-    back: 'rgba(206,219,229,0.6)',
-    arrow: 'rgba(206,219,229,0.6)',
-    highlight: 'rgba(144,206,241,0.6)',
-    textIdle: '#000',
-    textHover: '#000',
-    axisX: '#cd0000',
-    axisY: '#009400',
-    axisZ: '#0000d0',
+    back: 'rgba(203,187,220,1)',
+    arrow: 'rgba(134,116,154,0.8)',
+    highlight: 'rgba(42,22,56,1)',
+    seam: 'rgba(203,187,220,1)',
+    textIdle: '#2a1638',
+    textHover: '#ffffff',
+    axisX: '#e8336b',
+    axisY: '#16a37b',
+    axisZ: '#277fe5',
   }),
 });
 
@@ -254,29 +272,37 @@ export const CONTROLS = Object.freeze([
 ]);
 
 /** A rounded rectangle in 3D: centre, half extents along unit `r`/`o`, corner radius. */
-function roundedRect(centre, r, o, halfR, halfO, radius, segments = 9) {
+// `cut`: the same points laid on each corner's chord instead of its arc, so the plate is an octagon that can ease
+// into the rounded plate point for point.
+function roundedRect(centre, r, o, halfR, halfO, radius, segments = 9, cut = false) {
   const points = [];
   const cornerOrder = [[1, 1, 0], [-1, 1, Math.PI / 2], [-1, -1, Math.PI], [1, -1, (3 * Math.PI) / 2]];
+  const at = (arcCentre, angle) => add(add(arcCentre, scale(r, Math.cos(angle) * radius)), scale(o, Math.sin(angle) * radius));
   for (const [sr, so, start] of cornerOrder) {
     const arcCentre = add(add(centre, scale(r, sr * (halfR - radius))), scale(o, so * (halfO - radius)));
+    const a = at(arcCentre, start), b = at(arcCentre, start + Math.PI / 2);
     for (let i = 0; i <= segments; i += 1) {
-      const angle = start + (i / segments) * (Math.PI / 2);
-      points.push(add(add(arcCentre, scale(r, Math.cos(angle) * radius)), scale(o, Math.sin(angle) * radius)));
+      const t = i / segments;
+      points.push(cut ? add(a, scale(add(b, scale(a, -1)), t)) : at(arcCentre, start + t * (Math.PI / 2)));
     }
   }
   return points;
 }
 
-/** A disc in 3D. */
-function disc(centre, normal, radius, segments = 36) {
+/** A disc in 3D; `cut`, a hexagon with the same points, to ease into the disc. */
+function disc(centre, normal, radius, segments = 36, cut = false) {
   const n = norm(normal);
   const helper = Math.abs(n[2]) > 0.9 ? [1, 0, 0] : [0, 0, 1];
   const u = norm(cross(n, helper));
   const v = cross(n, u);
+  const on = (angle) => add(add(centre, scale(u, Math.cos(angle) * radius)), scale(v, Math.sin(angle) * radius));
+  const side = segments / 6;
   const points = [];
   for (let i = 0; i < segments; i += 1) {
-    const angle = (i / segments) * Math.PI * 2;
-    points.push(add(add(centre, scale(u, Math.cos(angle) * radius)), scale(v, Math.sin(angle) * radius)));
+    if (!cut) { points.push(on((i / segments) * Math.PI * 2)); continue; }
+    const j = Math.floor(i / side), t = (i % side) / side;
+    const a = on((j / 6) * Math.PI * 2), b = on(((j + 1) / 6) * Math.PI * 2);
+    points.push(add(a, scale(add(b, scale(a, -1)), t)));
   }
   return points;
 }
@@ -300,12 +326,15 @@ const GEOMETRY = (() => {
       ],
       back: roundedRect(centre, face.r, face.o, (edge * BACK_SIZE) / 2, (edge * BACK_SIZE) / 2, radius),
       front: roundedRect(centre, face.r, face.o, (edge * FRONT_SIZE) / 2, (edge * FRONT_SIZE) / 2, radius),
+      backCut: roundedRect(centre, face.r, face.o, (edge * BACK_SIZE) / 2, (edge * BACK_SIZE) / 2, radius, 9, true),
+      frontCut: roundedRect(centre, face.r, face.o, (edge * FRONT_SIZE) / 2, (edge * FRONT_SIZE) / 2, radius, 9, true),
     };
   });
   const corners = CORNERS.map((corner) => ({
     corner,
     centre: scale(corner.signs, 0.8 * h),
     polygon: disc(scale(corner.signs, 0.8 * h), corner.signs, 0.24 * h),
+    polygonCut: disc(scale(corner.signs, 0.8 * h), corner.signs, 0.24 * h, 36, true),
   }));
   const axisOrigin = [-h - AXIS_GAP_PX, -h - AXIS_GAP_PX, -h - AXIS_GAP_PX];
   const axes = [
@@ -378,6 +407,13 @@ export class ViewCube {
     this.hover = null;
     this.hits = [];
     this.font = resolveFont(canvas);
+    // how smooth each face and corner is, 0 faceted .. 1 rounded, and the animation frame easing them
+    this.smooth = new Map();
+    this._last = 0;
+    this._frame = null;
+    // the face or corner last clicked, and whether the camera has finished turning to it
+    this.active = null;
+    this.settled = true;
 
     canvas.addEventListener('pointermove', (event) => this._onMove(event));
     canvas.addEventListener('pointerleave', () => {
@@ -402,6 +438,11 @@ export class ViewCube {
         viewMatrix[4], viewMatrix[5], viewMatrix[6],
         viewMatrix[8], viewMatrix[9], viewMatrix[10],
       ];
+    // a clicked face or corner stays smooth while its view holds; turn away and it goes back to facets
+    if (this.active && this.settled) {
+      const region = REGIONS.find((r) => r.id === this.active || r.view === this.active);
+      if (!region || this._toView(region.normal)[2] < 0.9) this.active = null;
+    }
     this.render();
   }
 
@@ -443,6 +484,21 @@ export class ViewCube {
     const k = size / SCREEN_SIZE_PX;
     const palette = COLOURS[this.theme];
     const hover = this.hover?.id ?? '';
+    // The cube is a mesh until you click it: the face or corner clicked eases from facets to round while its view
+    // holds, then back once the camera turns away. Hover only lights it. SMOOTH_MS each way, a frame at a time.
+    const now = performance.now();
+    const dt = this._last ? Math.min(64, now - this._last) : 16;
+    this._last = now;
+    let moving = false;
+    const smooth = (id) => {
+      const target = this.active === id ? 1 : 0;
+      const was = this.smooth.get(id) ?? target;
+      const next = was + Math.sign(target - was) * Math.min(Math.abs(target - was), dt / SMOOTH_MS);
+      if (next !== target) moving = true;
+      this.smooth.set(id, next);
+      return next * next * (3 - 2 * next);
+    };
+    const blend = (cut, round, t) => cut.map((p, i) => [p[0] + (round[i][0] - p[0]) * t, p[1] + (round[i][1] - p[1]) * t, p[2]]);
     context.save();
     context.clearRect(0, 0, size, size);
     context.lineJoin = 'round';
@@ -452,39 +508,69 @@ export class ViewCube {
     // Which faces look at the camera, and how deep each is.
     const faces = GEOMETRY.faces.map((item) => {
       const normalView = this._toView(item.face.normal);
+      const t = smooth(item.face.id);
       return {
         ...item,
+        t,
         facing: normalView[2] > 1e-6,
         depth: this._toView(item.centre)[2],
-        backPolygon: item.back.map((p) => this._project(p)),
-        frontPolygon: item.front.map((p) => this._project(p)),
+        backPolygon: blend(item.backCut.map((p) => this._project(p)), item.back.map((p) => this._project(p)), t),
+        frontPolygon: blend(item.frontCut.map((p) => this._project(p)), item.front.map((p) => this._project(p)), t),
         outline: item.corners.map((p) => this._project(p)),
       };
     });
     const far = faces.filter((f) => !f.facing).sort((a, b) => a.depth - b.depth);
     const near = faces.filter((f) => f.facing).sort((a, b) => a.depth - b.depth);
 
-    const paintFace = (item) => {
-      const lit = hover === item.face.id;
-      this._path(item.backPolygon);
-      context.fillStyle = lit ? palette.highlight : palette.back;
-      context.fill();
-      // A hovered face is ONE wash of the translucent highlight in the
-      // product, not two: its depth test keeps the second plate from
-      // compositing over the first. So the inner plate is skipped when lit.
-      if (lit) return;
-      this._path(item.frontPolygon);
-      context.fillStyle = palette.front;
+    // As the product draws it (this file's header): a face turned to the camera is its light 97% plate with the
+    // dark 75% plate on it, the frame and the centre; a face turned away shows only its light plate, through the
+    // seams. A corner is a disc inside the cube, seen only through the notch the plates leave at the vertex.
+    // Hover lights a whole face, both plates, as one wash.
+    const paintPlate = (item, polygon, colour) => {
+      this._path(polygon);
+      context.fillStyle = hover === item.face.id ? palette.highlight : colour;
       context.fill();
     };
 
-    // 1. The far side. Mostly covered, but it is what shows through the seams
-    //    and the corner notches, as it does in the product.
-    for (const item of far) paintFace(item);
+    // 1. The far side: light plates, seen through the seams.
+    for (const item of far) paintPlate(item, item.backPolygon, palette.back);
 
-    // 2. The near side, then its labels sheared onto the faces.
-    for (const item of near) paintFace(item);
+    // 2. The corner discs, behind the near faces: they show only in the vertex notches and never cover a face.
+    //    Every disc whose corner points at the camera; the far corner is behind everything and is not drawn.
+    const discs = GEOMETRY.corners
+      .filter((item) => this._toView(item.corner.normal)[2] > 0)
+      .map((item) => ({
+        ...item,
+        polygon: blend(item.polygonCut.map((p) => this._project(p)), item.polygon.map((p) => this._project(p)), smooth(item.corner.id)),
+        depth: this._toView(item.centre)[2],
+      }))
+      .sort((a, b) => a.depth - b.depth);
+    for (const item of discs) {
+      this._path(item.polygon);
+      context.fillStyle = hover === item.corner.id ? palette.highlight : palette.front;
+      context.fill();
+    }
+
+    // 3. The near side: each face's frame plate and centre plate, the centre with the diagonal an STL splits a face
+    //    on (fading as a clicked face smooths), then the labels sheared onto them.
     for (const item of near) {
+      paintPlate(item, item.backPolygon, palette.back);
+      paintPlate(item, item.frontPolygon, palette.front);
+    }
+    for (const item of near) {
+      if (hover === item.face.id || item.t >= 1) continue;
+      const a = item.frontPolygon[5], b = item.frontPolygon[25];
+      context.save();
+      context.globalAlpha = 1 - item.t;
+      context.strokeStyle = palette.seam;
+      context.lineWidth = 1.2 * k;
+      context.beginPath();
+      context.moveTo(a[0], a[1]);
+      context.lineTo(b[0], b[1]);
+      context.stroke();
+      context.restore();
+    }
+    const label = (item) => {
       const lit = hover === item.face.id;
       const centre = this._project(item.centre);
       const rEnd = this._project(add(item.centre, item.face.r));
@@ -503,21 +589,13 @@ export class ViewCube {
       context.fillStyle = lit ? palette.textHover : palette.textIdle;
       context.fillText(item.face.label, 0, 0.5);
       context.restore();
-    }
-
-    // 3. The corner discs. Geometrically they sit just inside the cube, but
-    //    the product's polygon offset brings them out in front of the plates:
-    //    in its own frames a corner reads as a full dark circle over the
-    //    frames, and a hovered one as a full blue circle. So: every disc whose
-    //    corner points at the camera, painted over the near plates. The far
-    //    corner is behind everything and is not drawn.
-    const discs = GEOMETRY.corners
-      .filter((item) => this._toView(item.corner.normal)[2] > 0)
-      .map((item) => ({ ...item, polygon: item.polygon.map((p) => this._project(p)), depth: this._toView(item.centre)[2] }))
-      .sort((a, b) => a.depth - b.depth);
+    };
+    for (const item of near) label(item);
+    // a corner under the pointer lights as its whole disc, over the faces, as long as it is hovered
     for (const item of discs) {
+      if (hover !== item.corner.id) continue;
       this._path(item.polygon);
-      context.fillStyle = hover === item.corner.id ? palette.highlight : palette.front;
+      context.fillStyle = palette.highlight;
       context.fill();
     }
 
@@ -581,13 +659,20 @@ export class ViewCube {
         this.hits.push({ id: control.id, kind: 'control', control, polygon: points });
       }
     }
-    // Pick order is the reverse of paint order: controls, discs, near faces,
-    // far faces through the seams.
-    for (const item of discs) this.hits.push({ id: item.corner.id, kind: 'corner', region: item.corner, polygon: item.polygon });
+    // Pick order: the controls; a near face's centre plate; a corner, over a target a little wider than its rivet so
+    // it can be hit; the rest of the near face, its frame; then the far faces through the seams.
+    for (const item of near) this.hits.push({ id: item.face.id, kind: 'face', region: item.face, polygon: item.frontPolygon });
+    for (const item of discs) {
+      const c = this._project(item.centre);
+      const target = item.polygon.map((p) => [c[0] + (p[0] - c[0]) * 1.6, c[1] + (p[1] - c[1]) * 1.6]);
+      this.hits.push({ id: item.corner.id, kind: 'corner', region: item.corner, polygon: target });
+    }
     for (const item of near) this.hits.push({ id: item.face.id, kind: 'face', region: item.face, polygon: item.backPolygon });
     for (const item of far) this.hits.push({ id: item.face.id, kind: 'face', region: item.face, polygon: item.backPolygon });
 
     context.restore();
+    if (moving) this._frame ??= requestAnimationFrame(() => { this._frame = null; this.render(); });
+    else this._last = 0;
   }
 
   hitTest(x, y) {
@@ -630,6 +715,10 @@ export class ViewCube {
           : ROTATE_ANGLES.default;
       this.onRotate(hit.control.direction, angle);
     } else {
+      // smooth it once the camera has turned to it (the turn itself passes through other orientations)
+      this.active = hit.region.id;
+      this.settled = false;
+      setTimeout(() => { this.settled = true; }, ANIMATION_MS.long + 100);
       this.onView(hit.region.view, hit.region);
     }
   }
@@ -681,8 +770,8 @@ function resolveFont(canvas) {
 /** Their `#svg-icon-view-cube-button`, verbatim, with its static four-tone fills. */
 export const VIEW_CUBE_ICON_SVG =
   '<svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true">'
-  + '<path d="M1 3.25l.5 11.25 8.5 4.75 8.5-4.75.5-11.25L10 1 1 3.25z" fill="#333333"></path>'
-  + '<path d="M10 7v11l-7.5-4L2 4l8 3z" fill="#999999"></path>'
-  + '<path fill-rule="evenodd" clip-rule="evenodd" d="M18 4l-.5 10-7.5 4V7l8-3z" fill="#D7D7D7"></path>'
-  + '<path fill-rule="evenodd" clip-rule="evenodd" d="M18 4l-8 3-8-3 8-2 8 2z" fill="#FFFFFF"></path>'
+  + '<path d="M10 1.6L17.6 5.8L17.6 14.4L10 18.6L2.4 14.4L2.4 5.8Z" fill="#170c20"></path>'
+  + '<path d="M2.9 6.6L9.5 10.3L9.5 17.8L2.9 14.1Z" fill="#8a4fe0"></path>'
+  + '<path d="M10.5 10.3L17.1 6.6L17.1 14.1L10.5 17.8Z" fill="#b98cff"></path>'
+  + '<path d="M10 2.2L16.7 5.9L10 9.6L3.3 5.9Z" fill="#f5effb"></path>'
   + '</svg>';
