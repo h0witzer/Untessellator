@@ -127,7 +127,7 @@ body { background: var(--wb-bg); color: var(--wb-text); font: 14.5px/1.45 var(--
 .wb-btn { border: 0; background: var(--wb-raised-2); padding: 8px 13px; cursor: pointer; white-space: nowrap; }
 .wb-btn:hover:not([disabled]) { background: var(--wb-raised-3); }
 /* a primary is white wherever it sits (Export STEP, a card's Apply), the one action to take next */
-.wb .wb-primary, .wb .wb-primary:hover:not([disabled]) { background: #ffffff; color: var(--wb-accent-ink); font-weight: 700; letter-spacing: 0.02em; }
+.wb .wb-primary, .wb .wb-primary:hover:not([disabled]), .wb-phone .wb-primary { background: #ffffff; color: var(--wb-accent-ink); font-weight: 700; letter-spacing: 0.02em; }
 .wb-top .wb-primary { padding: 9px 18px; }
 .wb-small { padding: 4px 9px; font-size: 12.5px; }
 .wb-btn[disabled] { opacity: 0.4; cursor: default; }
@@ -322,6 +322,20 @@ body { background: var(--wb-bg); color: var(--wb-text); font: 14.5px/1.45 var(--
 .wb-legend > div:first-child { display: grid; gap: 7px; }   /* the studio's legend body, one line each */
 .wb-fixcard .wb-fixlist .wb-irow { margin-top: 2px; }
 div.wb-fixhead { cursor: default; }
+
+/* A phone or tablet (narrow, or touch with no mouse) gets a note in place of the tool, until "Use it here anyway"
+   (index.html's script) sets wb-anyway on the body */
+.wb-phone { display: none; box-sizing: border-box; min-height: 100vh; min-height: 100dvh; flex-direction: column; align-items: center; justify-content: center; gap: 20px; padding: 40px 16px; text-align: center; }
+.wb-phone::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 6px; background: url(brand/facet-band.svg) left / 100% 100% no-repeat; }   /* the header's band, at the foot */
+.wb-phone { position: relative; }
+.wb-phone h2 { margin: 0; font-size: 24px; line-height: 1.2; text-wrap: balance; }
+.wb-phone p { margin: 0; max-width: 420px; color: var(--wb-muted); text-wrap: pretty; }
+.wb-phone button { font: inherit; }
+.wb-phone .wb-btn { padding: 12px 20px; text-decoration: none; }
+@media (max-width: 760px), (hover: none) and (pointer: coarse) {
+  body:not(.wb-anyway) .wb { display: none; }
+  body:not(.wb-anyway) .wb-phone { display: flex; }
+}
 
 @media (max-width: 980px) {
   html, body { height: auto; }

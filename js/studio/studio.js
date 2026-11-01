@@ -137,6 +137,8 @@ ui.registerIcons({
   undo: '<path d="M6.6 4.6L13.6 4.6L18.2 9.2L18.2 12.2L13.6 16.8L6.2 16.8L6.2 14.6L12.7 14.6L16 11.3L16 10.1L12.7 6.8L6.6 6.8Z"/><path d="M1.6 5.7L7.4 1.2L7.4 10.2Z"/>',
   redo: '<path d="M13.4 4.6L6.4 4.6L1.8 9.2L1.8 12.2L6.4 16.8L13.8 16.8L13.8 14.6L7.3 14.6L4 11.3L4 10.1L7.3 6.8L13.4 6.8Z"/><path d="M18.4 5.7L12.6 1.2L12.6 10.2Z"/>',
   folder: '<path d="M1.6 3.2L7.6 3.2L9.6 5.2L18.4 5.2L18.4 16.8L1.6 16.8Z" opacity=".5"/><path d="M1.6 8L17 8L18.4 9.4L18.4 16.8L1.6 16.8Z"/>',
+  // Four tiles, two of them dimmed: the gallery.
+  gallery: '<path d="M1.6 1.6L8.8 1.6L8.8 8.8L1.6 8.8Z"/><path d="M11.2 1.6L18.4 1.6L18.4 8.8L11.2 8.8Z" opacity=".5"/><path d="M1.6 11.2L8.8 11.2L8.8 18.4L1.6 18.4Z" opacity=".5"/><path d="M11.2 11.2L18.4 11.2L18.4 18.4L11.2 18.4Z"/>',
   // A heart in facets: support.
   heart: '<path d="M10 18L1.6 9.6L1.6 5.4L4.8 2.2L7.8 2.2L10 4.4L12.2 2.2L15.2 2.2L18.4 5.4L18.4 9.6Z"/><path d="M10 4.4L10 18L18.4 9.6L18.4 5.4L15.2 2.2L12.2 2.2Z" opacity=".22" fill="#000"/>',
 });
@@ -476,7 +478,7 @@ toolRow.addEventListener('click', (event) => {
 const reportButton = document.getElementById('report');
 reportButton.innerHTML = ui.iconMarkup('flag', { className: 'wb-ticon' });
 // the header's other icons, before their labels (a narrow window hides the labels)
-for (const [id, icon] of [['open', 'folder'], ['undo', 'undo'], ['redo', 'redo'], ['support', 'heart']]) {
+for (const [id, icon] of [['open', 'folder'], ['undo', 'undo'], ['redo', 'redo'], ['gallery', 'gallery'], ['support', 'heart']]) {
   document.getElementById(id).insertAdjacentHTML('afterbegin', ui.iconMarkup(icon, { className: 'wb-ticon' }));
 }
 reportButton.addEventListener('click', () => reportConversion());
