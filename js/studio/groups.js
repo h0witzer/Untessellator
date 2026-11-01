@@ -26,19 +26,23 @@ export function typeLabel(type) {
 }
 
 /**
- * A colour per group id: golden-angle hues, stepping round the amber band the highlight
- * owns (Onshape marks geometry in amber, so a group must never read as selected).
+ * The group colors: clean ones, near the edge of what sRGB can show. Twelve OKLCH hues, each at the lightness where
+ * it is most saturated (held to 0.64..0.86) and 0.88 of the gamut's chroma there; a second ring 15 degrees on, a
+ * step lighter if warm, darker if cool; and deeper tones of the cool hues only, since a darkened yellow is olive and
+ * a darkened orange brown, the mud the old golden-angle HSL colors (50% saturation, 62% lightness) were full of.
+ * No pale tints, and no yellows or peach: the headlight puts a face at half light when it turns away, and those go
+ * olive, tan or gray-brown there. Ambers are free to use: selection and hover are border lines (renderer.js
+ * faceBorder bands), never fills. In order of hue. (2026-10-31)
  */
+const GROUP_HEX = [
+  '#f4356d', '#f45956', '#f4652d', '#f7a73b', '#a4ea44', '#8ffc94', '#4cf499', '#49e7ba', '#4ceed4', '#38b5a1', '#4be7e7', '#37b1bd', '#4ce9f9',
+  '#3dbfe2', '#37adf3', '#247aad', '#277fe5', '#707ff2', '#432eec', '#8360f0', '#ab5ff2', '#7c24bd', '#be31db', '#ab2598', '#f53ad9', '#f55eb0',
+];
+const GROUP_RGB = GROUP_HEX.map((hex) => [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255));
+
+/** A colour per group id: seven places round the hue order at a time (about 100 degrees), every color in turn. */
 export function groupColour(id) {
-  let hue = (id * 137.508 + 200) % 360;
-  if (hue > 22 && hue < 62) hue = (hue + 45) % 360;
-  const s = 0.5, l = 0.62;
-  const c = (1 - Math.abs(2 * l - 1)) * s;
-  const x = c * (1 - Math.abs(((hue / 60) % 2) - 1));
-  const m = l - c / 2;
-  const [r, g, b] = hue < 60 ? [c, x, 0] : hue < 120 ? [x, c, 0] : hue < 180 ? [0, c, x]
-    : hue < 240 ? [0, x, c] : hue < 300 ? [x, 0, c] : [c, 0, x];
-  return [r + m, g + m, b + m];
+  return [...GROUP_RGB[(Math.max(0, id - 1) * 7) % GROUP_RGB.length]];
 }
 
 // ── colors apart from their neighbors ────────────────────────────────────────
@@ -47,18 +51,20 @@ export function groupColour(id) {
  * How far apart two colors read: OKLab distance x100 (about 2 is barely visible), the least of normal vision / 1.6
  * and simulated protanopia, deuteranopia and tritanopia (Machado 2009): test/palette.mjs's measure. Bordering groups
  * closer than COLOUR_GAP read as one face, as a plane, cone and cylinder in three greens did (2026-10-31): the
- * golden-angle colors of two ids are that close 45% of the time, so a color per id alone cannot keep them apart.
+ * old golden-angle colors of two ids were that close 45% of the time, so a color per id alone cannot keep them apart.
  */
 const COLOUR_GAP = 9;
+// A recolored group takes a color at least this far from its neighbors when one is free, with room to spare.
+const CLEAR_GAP = 12;
 const VISION = [
   [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
   [[0.152286, 1.052583, -0.204868], [0.114503, 0.786281, 0.099216], [-0.003882, -0.048116, 1.051998]],
   [[0.367322, 0.860646, -0.227968], [0.280085, 0.672501, 0.047413], [-0.011820, 0.042940, 0.968881]],
   [[1.255528, -0.076749, -0.178779], [-0.078411, 0.930809, 0.147602], [0.004733, 0.691367, 0.303900]],
 ];
-// What a group's color must not be read as: unpainted triangles (studio.js UNPAINTED) and the kit's selected and
-// pre-highlight colors (vendor/form-studio-ui/viewport.js HIGHLIGHT_STYLE).
-const AVOID = [[0.74, 0.74, 0.74], [1, 169 / 255, 10 / 255], [1, 198 / 255, 133 / 255]];
+// What a group's color must not be read as: unpainted triangles (studio.js UNPAINTED). The kit's selected and
+// pre-highlight ambers are outlines, so a filled group can't be taken for them.
+const AVOID = [[0.74, 0.74, 0.74]];
 
 const clamp01 = (v) => Math.min(1, Math.max(0, v));
 const toLinear = (c) => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
@@ -82,25 +88,10 @@ function gap(a, b) {
   }
   return least;
 }
-function oklchRgb(L, C, h) {
-  const a = C * Math.cos((h * Math.PI) / 180), b = C * Math.sin((h * Math.PI) / 180);
-  const l = (L + 0.3963377774 * a + 0.2158037573 * b) ** 3;
-  const m = (L - 0.1055613458 * a - 0.0638541728 * b) ** 3;
-  const s = (L - 0.0894841775 * a - 1.2914855480 * b) ** 3;
-  return [4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s, -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
-    -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s].map((v) => { v = clamp01(v); return v <= 0.0031308 ? 12.92 * v : 1.055 * v ** (1 / 2.4) - 0.055; });
-}
-// The colors a group may move to: four lightnesses, since lightness is what color-blind vision keeps, by every
-// 15 degrees of OKLCH hue outside the amber band
+// The colors a group may move to: all of GROUP_HEX, so a recolored group is as clean as the rest
 let spare = null;
 function spareColours() {
-  if (spare) return spare;
-  spare = [];
-  for (const L of [0.6, 0.68, 0.76, 0.84]) for (let h = 0; h < 360; h += 15) {
-    if (h >= 45 && h <= 105) continue;
-    const rgb = oklchRgb(L, 0.12, h);
-    spare.push({ rgb, seen: seen(rgb) });
-  }
+  spare ??= GROUP_RGB.map((rgb) => ({ rgb, seen: seen(rgb) }));
   return spare;
 }
 const avoidSeen = AVOID.map(seen);
@@ -259,13 +250,15 @@ export class GroupStore {
       const against = [...borders.get(id)].filter((n) => this.groups.has(n)).map((n) => seen(this.groups.get(n).colour)).concat(avoidSeen);
       const own = seen(group.colour);
       if (against.every((s) => gap(own, s) >= COLOUR_GAP)) continue;
-      // each id starts the search at its own place in the pool, so equally good choices spread out
+      // each id starts the search at its own place in the pool and takes the first color clear of them all, so
+      // recolored groups spread over the pool; the farthest alone is nearly always a deep tone
       let best = null;
       let bestGap = -1;
       for (let i = 0; i < pool.length; i++) {
         const c = pool[(i + id * 7) % pool.length];
         let least = Infinity;
         for (const s of against) least = Math.min(least, gap(c.seen, s));
+        if (least >= CLEAR_GAP) { best = c; break; }
         if (least > bestGap) { bestGap = least; best = c; }
       }
       group.colour = [...best.rgb];
