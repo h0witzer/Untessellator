@@ -1471,6 +1471,9 @@ async function exportStep({ checked = false } = {}) {
     const { step, report } = result;
     current.lastExport = report;                  // for the conversion report (report.js)
     if (!step) throw new Error('no shape came out of the build');
+    // every face built on its surface: an earlier export's rejections and the check's doubts no longer hold
+    // (left in place, the list kept calling groups of a finished solid rejected)
+    if (report.tier === 'analytic' && current.flags.size) { current.flags = new Map(); updateVerdicts(); }
     busy.end();
     // The solid on show, and the STEP waits for Save: fully analytic, it is ready; with faces off their surfaces,
     // the card says which groups failed and offers Repair or this export as it is; a stopped or failed build
@@ -1955,7 +1958,8 @@ function showNeedsALook() {
 /** How many groups have each verdict. */
 function verdictCounts() {
   const counts = { off: 0, maybe: 0, on: 0, none: 0, skip: 0 };
-  if (mesh) for (const v of mesh.verdicts.values()) counts[v]++;
+  // a group emptied by an erase or a merge keeps its last verdict until it is measured again: not counted
+  if (mesh) for (const [id, v] of mesh.verdicts) if (mesh.store.count(id)) counts[v]++;
   return counts;
 }
 
