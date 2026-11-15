@@ -5,11 +5,14 @@
  *   pieces  small loose pieces go (the triangles the studio marks)
  *   holes   js/holeFill.js: fins and walls stuck to the surface go, then every hole is capped (on the survey's 45 game
  *           models, closed meshes 33 -> 43, after the import repair)
- *   join    pieces that cut through each other become one solid, by a boolean union in Manifold (manifold-3d 3.5.4,
- *           Apache-2.0, 532 KB of WebAssembly from the CDN): 38 of the survey's 51 meshes with overlapping pieces
- *           joined whole, median 6 ms; OCCT's fuse of the same pieces took 0.7 s to 20 s on 400 to 10,700 triangles
+ *   join    bodies the user picks in the Bodies list become one solid (joinBodies: a body id per triangle, -1 for the
+ *           rest), by a boolean union in Manifold (manifold-3d 3.5.4, Apache-2.0, 532 KB of WebAssembly from the CDN):
+ *           38 of the survey's 51 meshes with overlapping pieces joined whole, median 6 ms; OCCT's fuse of the same
+ *           pieces took 0.7 s to 20 s on 400 to 10,700 triangles. Bodies stay separate unless asked: the mesh fixes
+ *           no longer join anything on their own
  *
- * In:  {id, positions: Float32Array (9 per triangle), small: Uint8Array (per triangle) | null, steps: {pieces, holes, join}}
+ * In:  {id, positions: Float32Array (9 per triangle), small: Uint8Array (per triangle) | null, steps: {pieces, holes, join},
+ *       joinBodies: Int32Array | undefined}
  * Out: {id, positions, src (each output triangle's input triangle; -1 for a cap), pieces: {removed, triangles},
  *       holes: holeFill's report, join: {pieces, joined, refused, overlap, bodies}} or {id, error}
  * A piece goes into the union with each triangle's index as its faceID, which Manifold carries to every triangle it
@@ -48,9 +51,23 @@ function pieces(P) {
   return { list: [...groups.values()], idx };
 }
 
-/** Manifold's union of the soup's pieces: {positions, src (into P), report}, or null with fewer than two closed pieces. */
-async function join(P) {
-  const { list, idx } = pieces(P);
+/**
+ * Manifold's union of the soup's pieces: {positions, src (into P), report}, or only {report} with fewer than two closed
+ * pieces. `bodies` (a body id per triangle, -1 to leave one out) joins those bodies, each as a piece, and passes every
+ * other triangle through as it is; it joins them even when they only touch (the Bodies list's Join). Without it, the
+ * soup's own pieces are joined only where they cut through each other (the mesh fix).
+ */
+async function join(P, bodies = null) {
+  let list, idx, rest = [];
+  if (bodies) {
+    ({ idx } = pieces(P));
+    const by = new Map();
+    for (let t = 0; t < bodies.length; t++) {
+      if (bodies[t] < 0) { rest.push(t); continue; }
+      (by.get(bodies[t]) ?? by.set(bodies[t], []).get(bodies[t])).push(t);
+    }
+    list = [...by.values()];
+  } else ({ list, idx } = pieces(P));
   const report = { pieces: list.length, joined: 0, refused: 0, overlap: false, bodies: list.length };
   if (list.length < 2) return { report };
   const { Manifold, Mesh } = await manifold();
@@ -88,9 +105,10 @@ async function join(P) {
     const bodies = union.decompose();
     report.bodies = bodies.length + report.refused;
     for (const b of bodies) b.delete();
-    if (!report.overlap) return { report };    // nothing cuts anything: the mesh stays as it is
+    if (!report.overlap && !bodies) return { report };    // nothing cuts anything: the mesh stays as it is
     const out = union.getMesh();
     const nOut = out.triVerts.length / 3;
+    refusedTris.push(...rest);                  // left out of the join: passed through as they are
     const positions = new Float32Array((nOut + refusedTris.length) * 9);
     const src = new Int32Array(nOut + refusedTris.length);
     for (let t = 0; t < nOut; t++) {
@@ -133,7 +151,7 @@ self.onmessage = async ({ data }) => {
     }
     // pieces that cut through each other
     if (steps.join) {
-      const r = await join(P);
+      const r = await join(P, data.joinBodies ?? null);
       result.join = r.report;
       if (r.positions) after(r.positions, r.src);
     }

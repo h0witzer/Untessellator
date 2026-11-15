@@ -12,9 +12,11 @@
  *               apart); positions are snapped to the kept vertex, so the painter's grid weld and the knitter's
  *               exact one agree afterwards
  *   collapsed   triangles with two corners on one vertex go
- *   duplicates  a triangle repeated with the same winding is kept once; a pair with OPPOSITE windings is a
- *               wall between two bodies that touch (zero thickness, inside the part) and both go, which joins
- *               the bodies into one solid (option walls: 'keep' leaves them)
+ *   duplicates  a triangle repeated with the same winding is kept once; a pair with OPPOSITE windings is either
+ *               the face two bodies share where they touch, one side each, or a sheet of no thickness inside one
+ *               part. walls: 'auto' (the default) keeps a pair when both its triangles end up in closed shells, so
+ *               touching bodies stay separate, and takes it out otherwise; 'remove' takes every pair out (joining
+ *               touching bodies), 'keep' none
  *   needles     triangles with an altitude under WELD x the diagonal go; the crack each leaves (and any other
  *               T-junction) is zipped by splitting the triangle across the long edge at the stray vertex. On a
  *               curved face the stray vertex is ON the surface and the long edge a chord, so it lies off the edge
@@ -23,18 +25,21 @@
  *               Only open loops are zipped, so a closed mesh's thin triangles are never touched
  *   holes       a boundary loop that is still open after zipping is capped by a fan from its centroid (the cap
  *               triangles carry src -1: they are not in the input, and the painter decides what they are)
- *   winding     made consistent across every manifold edge, then outward per piece (positive volume)
+ *   winding     js/bodies.js: consistent per shell, then every body's outer shell outward and every void (a shell
+ *               inside a body, written the other way round) inward
  *
  * Returns the repaired soup, src (the input triangle each output triangle came from; -1 for caps), and counts.
  */
 
+import { findBodies } from './bodies.js';
+
 export const REPAIR = { WELD: 1e-6, ZIP_REL: 0.1, LOOP_MAX: 4000, ZIP_ROUNDS: 4 };
 
 export function repairMesh(positions, opts = {}) {
-  const cfg = { ...REPAIR, walls: 'remove', caps: true, ...opts };
+  const cfg = { ...REPAIR, walls: 'auto', caps: true, ...opts };
   const nIn = Math.floor(positions.length / 9);
   const report = { triangles_in: nIn, welded: 0, collapsed: 0, dup_same: 0, dup_walls: 0, needles: 0, zipped: 0,
-    holes_capped: 0, cap_triangles: 0, holes_left: 0, flipped: 0, nonmanifold_edges: 0 };
+    holes_capped: 0, walls_kept: 0, cap_triangles: 0, holes_left: 0, flipped: 0, nonmanifold_edges: 0 };
 
   // ── weld: grid hash, merging into the first vertex within tol (neighbouring cells searched) ──
   let lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
@@ -83,6 +88,7 @@ export function repairMesh(positions, opts = {}) {
     const byKey = new Map();
     T.forEach((tri, i) => { const k = [...tri].sort((a, b) => a - b).join(','); (byKey.get(k) ?? byKey.set(k, []).get(k)).push(i); });
     const drop = new Uint8Array(T.length);
+    const pairs = [];
     const cyc = (tri) => { const m = tri.indexOf(Math.min(...tri)); return `${tri[m]},${tri[(m + 1) % 3]},${tri[(m + 2) % 3]}`; };
     for (const ids of byKey.values()) {
       if (ids.length < 2) continue;
@@ -97,6 +103,28 @@ export function repairMesh(positions, opts = {}) {
         for (let r = 1; r < rest.length; r++) { drop[rest[r]] = 1; report.dup_same++; }
       } else {
         for (const side of [same, other]) for (let r = 1; r < side.length; r++) { drop[side[r]] = 1; report.dup_same++; }
+        // with 'auto', one pair a side is a wall to judge below; a spare of the larger side stands in if it goes
+        if (cfg.walls === 'auto' && walls) {
+          const big = same.length > other.length ? same : other.length > same.length ? other : null;
+          pairs.push([same[0], other[0], big ? big[1] : -1]);
+        }
+      }
+    }
+    // 'auto': a wall stays where both its triangles end up in closed shells (two bodies touching, each with its own
+    // skin: js/bodies.js pairs each with its body) and goes where either does not (a zero-thickness sheet inside one
+    // part, which only closes once it is gone). On the Onshape eval set, 8 of 300 parts have walls; both kinds occur.
+    if (pairs.length) {
+      const live = [];
+      for (let i = 0; i < T.length; i++) if (!drop[i]) live.push(i);
+      const at = new Int32Array(T.length).fill(-1);
+      live.forEach((t, j) => { at[t] = j; });
+      const { shells, shellOf } = findBodies(Int32Array.from(live.flatMap((t) => T[t])), Float64Array.from(V.flat()));
+      const closed = (t) => shells[shellOf[at[t]]].closed;
+      for (const [a, b, spare] of pairs) {
+        if (closed(a) && closed(b)) { report.walls_kept++; continue; }
+        drop[a] = drop[b] = 1;
+        report.dup_walls++;
+        if (spare >= 0) { drop[spare] = 0; report.dup_same--; }
       }
     }
     T = T.filter((_, i) => !drop[i]); src = src.filter((_, i) => !drop[i]);
@@ -259,46 +287,12 @@ function simpleCycles(L) {
   return cycles;
 }
 
-/** Consistent winding over manifold edges, then outward per piece. Returns how many triangles were reversed. */
+/** Windings as js/bodies.js sets them (outer shells out, voids in), in place. Returns how many triangles were reversed. */
 function orient(T, V) {
-  const nV = V.length;
-  const byEdge = new Map();
-  T.forEach((tri, i) => {
-    for (let k = 0; k < 3; k++) {
-      const u = tri[k], v = tri[(k + 1) % 3];
-      const key = Math.min(u, v) * nV + Math.max(u, v);
-      (byEdge.get(key) ?? byEdge.set(key, []).get(key)).push(i);
-    }
-  });
-  const seen = new Uint8Array(T.length);
-  const flip = new Uint8Array(T.length);
+  const idx = Int32Array.from(T.flat());
+  const flat = Float64Array.from(V.flat());
+  const { flip } = findBodies(idx, flat);
   let flipped = 0;
-  const dir = (tri, u, v) => { for (let k = 0; k < 3; k++) if (tri[k] === u && tri[(k + 1) % 3] === v) return 1; return -1; };
-  for (let s = 0; s < T.length; s++) {
-    if (seen[s]) continue;
-    seen[s] = 1;
-    const comp = [s], queue = [s];
-    for (let qi = 0; qi < queue.length; qi++) {
-      const t = queue[qi];
-      const tri = T[t];
-      for (let k = 0; k < 3; k++) {
-        const u = tri[k], v = tri[(k + 1) % 3];
-        const owners = byEdge.get(Math.min(u, v) * nV + Math.max(u, v));
-        if (owners.length !== 2) continue;
-        const n = owners[0] === t ? owners[1] : owners[0];
-        if (seen[n]) continue;
-        // a consistent neighbour runs the shared edge the other way
-        if (dir(T[n], u, v) === 1) { T[n].reverse(); flip[n] ^= 1; }
-        seen[n] = 1; comp.push(n); queue.push(n);
-      }
-    }
-    let vol = 0;
-    for (const t of comp) {
-      const [a, b, c] = T[t].map((i) => V[i]);
-      vol += a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0]) + a[2] * (b[0] * c[1] - b[1] * c[0]);
-    }
-    if (vol < 0) for (const t of comp) { T[t].reverse(); flip[t] ^= 1; }
-  }
-  for (let t = 0; t < T.length; t++) flipped += flip[t];
+  for (let t = 0; t < T.length; t++) if (flip[t]) { T[t].reverse(); flipped++; }
   return flipped;
 }

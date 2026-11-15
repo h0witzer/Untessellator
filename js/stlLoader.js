@@ -45,6 +45,27 @@ function setupGeometry(geometry) {
 }
 
 /**
+ * The file's named objects (OBJ o/g groups, 3MF objects and parts), for naming bodies: objectNames (each name once;
+ * a repeated name gets " 2", " 3"...) and objectOf (the object of each triangle, in the geometry's order). Null when the
+ * file names nothing.
+ */
+function namedObjects(names, counts) {
+  if (!names.some(Boolean)) return null;
+  const seen = new Map(), objectNames = [];
+  const objectOf = new Int32Array(counts.reduce((a, b) => a + b, 0));
+  let at = 0;
+  names.forEach((raw, i) => {
+    const base = String(raw || 'Body').trim() || 'Body';
+    const n = (seen.get(base) ?? 0) + 1;
+    seen.set(base, n);
+    objectNames.push(n === 1 ? base : `${base} ${n}`);
+    objectOf.fill(i, at, at + counts[i]);
+    at += counts[i];
+  });
+  return { objectNames, objectOf };
+}
+
+/**
  * Compute the bounds object that all UV mapping functions depend on.
  * Must be called after the geometry has been centred.
  */
@@ -81,9 +102,10 @@ export function loadOBJFile(file) {
       try {
         const group = objLoader.parse(e.target.result);
         const geometry = mergeGroupGeometries(group);
+        const objects = geometry.userData.objects ? namedObjects(geometry.userData.objects.names, geometry.userData.objects.counts) : null;
         const offset = setupGeometry(geometry);
         const bounds = computeBounds(geometry);
-        resolve({ geometry, bounds, offset });
+        resolve({ geometry, bounds, offset, ...(objects ?? {}) });
       } catch (err) {
         reject(err);
       }
@@ -106,9 +128,10 @@ export function load3MFFile(file) {
     reader.onload = (e) => {
       try {
         const geometry = parse3MF(new Uint8Array(e.target.result));
+        const objects = geometry.userData.objects ? namedObjects(geometry.userData.objects.names, geometry.userData.objects.counts) : null;
         const offset = setupGeometry(geometry);
         const bounds = computeBounds(geometry);
-        resolve({ geometry, bounds, offset });
+        resolve({ geometry, bounds, offset, ...(objects ?? {}) });
       } catch (err) {
         reject(err);
       }
@@ -205,20 +228,23 @@ function parse3MF(data) {
     return new THREE.Matrix4();
   }
 
-  function resolveObject(filePath, objectId, parentMatrix) {
+  function resolveObject(filePath, objectId, parentMatrix, parentName = '') {
     const normFile = filePath.replace(/^\//, '').replace(/\\/g, '/');
     const key = normFile + '#' + objectId;
 
+    const doc = readXML(filePath);
+    const objects = doc ? [...doc.getElementsByTagNameNS(NS_CORE, 'object')] : [];
+    // a part's own name (Bambu and Prusa name each part), else the object it is part of
+    const name = objects.find((obj) => obj.getAttribute('id') === objectId)?.getAttribute('name') || parentName;
+
     // If this object has a mesh, emit an instance
     if (objectMap.has(key)) {
-      instances.push({ meshKey: key, matrix: parentMatrix.clone() });
+      instances.push({ meshKey: key, matrix: parentMatrix.clone(), name });
     }
 
     // Also check for components (the object may have both mesh + components,
     // or only components referencing other objects)
-    const doc = readXML(filePath);
     if (!doc) return;
-    const objects = doc.getElementsByTagNameNS(NS_CORE, 'object');
     for (const obj of objects) {
       if (obj.getAttribute('id') !== objectId) continue;
       const components = obj.getElementsByTagNameNS(NS_CORE, 'component');
@@ -233,7 +259,7 @@ function parse3MF(data) {
         }
         const compTransform = parseTransform(comp.getAttribute('transform'));
         const combined = parentMatrix.clone().multiply(compTransform);
-        resolveObject(compPath, compObjId, combined);
+        resolveObject(compPath, compObjId, combined, name);
       }
     }
   }
@@ -289,6 +315,8 @@ function parse3MF(data) {
 
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  const placed = instances.filter((inst) => objectMap.get(inst.meshKey));
+  geometry.userData.objects = { names: placed.map((inst) => inst.name), counts: placed.map((inst) => objectMap.get(inst.meshKey).triangles.length / 3) };
   return geometry;
 }
 
@@ -307,9 +335,10 @@ export function loadModelFile(file) {
  * non-indexed BufferGeometry suitable for the texturizer pipeline.
  */
 function mergeGroupGeometries(group) {
-  const geometries = [];
+  const geometries = [], names = [];
   group.traverse((child) => {
     if (child.isMesh && child.geometry) {
+      names.push(child.name || child.parent?.name || '');
       // Apply the mesh's world transform to the geometry
       const geo = child.geometry.clone();
       child.updateWorldMatrix(true, false);
@@ -324,7 +353,8 @@ function mergeGroupGeometries(group) {
     }
   });
   if (geometries.length === 0) throw new Error('No mesh data found in file');
-  if (geometries.length === 1) return geometries[0];
+  const objects = { names, counts: geometries.map((g) => g.attributes.position.count / 3) };
+  if (geometries.length === 1) { geometries[0].userData.objects = objects; return geometries[0]; }
 
   // Merge multiple geometries into one
   const totalVerts = geometries.reduce((sum, g) => sum + g.attributes.position.count, 0);
@@ -345,5 +375,6 @@ function mergeGroupGeometries(group) {
   const merged = new THREE.BufferGeometry();
   merged.setAttribute('position', new THREE.BufferAttribute(mergedPos, 3));
   if (mergedNrm) merged.setAttribute('normal', new THREE.BufferAttribute(mergedNrm, 3));
+  merged.userData.objects = objects;
   return merged;
 }

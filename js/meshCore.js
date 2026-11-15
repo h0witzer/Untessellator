@@ -13,6 +13,8 @@
  * zero or unnormalized. Geometric normals recomputed here are always valid.
  */
 
+import { pairEdges } from './bodies.js';
+
 // ── 3x3 linear algebra ───────────────────────────────────────────────────────
 
 /**
@@ -207,40 +209,40 @@ export function weldQuantum(positions) {
  * @returns {Map<number, Array<{neighbor:number, angle:number}>>} angle in degrees
  */
 export function buildAdjacency(positions, facets, quant = weldQuantum(positions)) {
-  const key = (x, y, z) =>
-    Math.round(x * quant) + '_' + Math.round(y * quant) + '_' + Math.round(z * quant);
-
-  const edgeMap = new Map();
+  // Corners welded on the quantum grid; a degenerate facet's corners all get one id, so it pairs with nothing.
+  // Degenerate facets are excluded, not merely ignored: leaving them in inflates edge multiplicity and makes real
+  // edges look non-manifold. See buildFacets.
+  const ids = new Map(), V = [];
+  const idx = new Int32Array(facets.count * 3);
   for (let t = 0; t < facets.count; t++) {
-    // Degenerate facets are excluded, not merely ignored: leaving them in inflates
-    // edge multiplicity and makes real edges look non-manifold. See buildFacets.
-    if (facets.degenerate && facets.degenerate[t]) continue;
     const o = t * 9;
-    const k = [
-      key(positions[o],     positions[o + 1], positions[o + 2]),
-      key(positions[o + 3], positions[o + 4], positions[o + 5]),
-      key(positions[o + 6], positions[o + 7], positions[o + 8]),
-    ];
-    for (let e = 0; e < 3; e++) {
-      const a = k[e], b = k[(e + 1) % 3];
-      const ek = a < b ? a + '|' + b : b + '|' + a;
-      const hit = edgeMap.get(ek);
-      if (hit) hit.push(t); else edgeMap.set(ek, [t]);
+    for (let k = 0; k < 3; k++) {
+      const x = positions[o + k * 3], y = positions[o + k * 3 + 1], z = positions[o + k * 3 + 2];
+      const key = Math.round(x * quant) + '_' + Math.round(y * quant) + '_' + Math.round(z * quant);
+      let id = ids.get(key);
+      if (id === undefined) { id = ids.size; ids.set(key, id); V.push(x, y, z); }
+      idx[t * 3 + k] = id;
     }
+    if (facets.degenerate && facets.degenerate[t]) idx[t * 3 + 1] = idx[t * 3 + 2] = idx[t * 3];
   }
+  // Across each edge, the triangle in the same body (js/bodies.js): an edge with two triangles pairs them, one on
+  // 3+ (bodies touching) pairs each face with its own body's, so a fill never crosses into the other body.
+  const across = pairEdges(idx, Float64Array.from(V));
 
   const adjacency = new Map();
   for (let t = 0; t < facets.count; t++) adjacency.set(t, []);
-  for (const tris of edgeMap.values()) {
-    if (tris.length !== 2) continue;      // boundary or non-manifold edge
-    const [a, b] = tris;
-    const d = Math.max(-1, Math.min(1,
-      facets.normals[a * 3]     * facets.normals[b * 3] +
-      facets.normals[a * 3 + 1] * facets.normals[b * 3 + 1] +
-      facets.normals[a * 3 + 2] * facets.normals[b * 3 + 2]));
-    const angle = Math.acos(d) * 180 / Math.PI;
-    adjacency.get(a).push({ neighbor: b, angle });
-    adjacency.get(b).push({ neighbor: a, angle });
+  for (let a = 0; a < facets.count; a++) {
+    for (let k = 0; k < 3; k++) {
+      const b = across[a * 3 + k];
+      if (b <= a) continue;                // each pair once, from its lower triangle
+      const d = Math.max(-1, Math.min(1,
+        facets.normals[a * 3]     * facets.normals[b * 3] +
+        facets.normals[a * 3 + 1] * facets.normals[b * 3 + 1] +
+        facets.normals[a * 3 + 2] * facets.normals[b * 3 + 2]));
+      const angle = Math.acos(d) * 180 / Math.PI;
+      adjacency.get(a).push({ neighbor: b, angle });
+      adjacency.get(b).push({ neighbor: a, angle });
+    }
   }
   return adjacency;
 }

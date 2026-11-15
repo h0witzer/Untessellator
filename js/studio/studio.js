@@ -141,6 +141,9 @@ ui.registerIcons({
   gallery: '<path d="M1.6 1.6L8.8 1.6L8.8 8.8L1.6 8.8Z"/><path d="M11.2 1.6L18.4 1.6L18.4 8.8L11.2 8.8Z" opacity=".5"/><path d="M1.6 11.2L8.8 11.2L8.8 18.4L1.6 18.4Z" opacity=".5"/><path d="M11.2 11.2L18.4 11.2L18.4 18.4L11.2 18.4Z"/>',
   // A heart in facets: support.
   heart: '<path d="M10 18L1.6 9.6L1.6 5.4L4.8 2.2L7.8 2.2L10 4.4L12.2 2.2L15.2 2.2L18.4 5.4L18.4 9.6Z"/><path d="M10 4.4L10 18L18.4 9.6L18.4 5.4L15.2 2.2L12.2 2.2Z" opacity=".22" fill="#000"/>',
+  // A faceted lens with a diamond pupil: a body on show in the Bodies list; struck through and dimmed, hidden.
+  eye: '<path d="M1.4 10L6 4.6H14L18.6 10L14 15.4H6ZM3.8 10L6.9 13.4H13.1L16.2 10L13.1 6.6H6.9Z" fill-rule="evenodd"/><path d="M10 6.9L13.1 10L10 13.1L6.9 10Z"/>',
+  eyeOff: '<path d="M1.4 10L6 4.6H14L18.6 10L14 15.4H6ZM3.8 10L6.9 13.4H13.1L16.2 10L13.1 6.6H6.9Z" fill-rule="evenodd" opacity=".5"/><path d="M10 6.9L13.1 10L10 13.1L6.9 10Z" opacity=".5"/><path d="M3.3 2.1L17.9 16.7L16.7 17.9L2.1 3.3Z"/>',
 });
 
 // Colorblind colors (the view menu), remembered on this browser so a color-blind viewer sets it once.
@@ -517,6 +520,10 @@ let mesh = null;
 let active = null;
 /** The groups picked in the table or the viewport; `active` is the last one picked. */
 let selection = new Set();
+/** The bodies picked in the Bodies list: the face-group table shows theirs. */
+let bodySel = new Set();
+/** {id, draft} while a body's name is being edited in the Bodies list. */
+let bodyRename = null;
 let hoverKey = null;
 let stroke = null;
 /** The auto-paint in progress: { stop } — Esc sets stop. */
@@ -559,6 +566,7 @@ async function openFile(file) {
     // The repaired soup replaces the loaded one: everything after (view, painting, export) indexes its
     // triangles. Caps the repair added are marked, so painting and fitting can leave them out (caps.js).
     let repair = null, synthetic = null;
+    let objectOf = loaded.objectOf ?? null;     // the file's named object of each triangle (3MF, OBJ), for body names
     if (settings.repair) {
       progress(`Opening ${file.name}: checking the mesh…`);
       await new Promise((resolve) => setTimeout(resolve, 0));   // let the message show: a big mesh takes seconds
@@ -567,6 +575,7 @@ async function openFile(file) {
       if (repairChanges(repair).length) {
         geometry = { index: null, attributes: { position: { array: Float32Array.from(r.positions) } } };
         if (repair.cap_triangles) synthetic = Uint8Array.from(r.src, (s) => (s < 0 ? 1 : 0));
+        if (objectOf) objectOf = Int32Array.from(r.src, (s) => (s < 0 ? -1 : objectOf[s]));
       }
     }
     const model = buildMeshModel(geometry.attributes.position.array);
@@ -584,12 +593,18 @@ async function openFile(file) {
              // at, so a result older than the groups is never passed off as theirs (the report says so)
              edits: 0,
              // how each group came to be, for the conversion report (report.js): group id -> origin
-             origins: new Map() };
+             origins: new Map(),
+             // the bodies (js/bodies.js, on the model): their names, the ones hidden in the Bodies list (view only:
+             // every body is exported) and, after an export, each one's result
+             ...nameBodies(model, null, null, loaded.objectNames ?? null, objectOf) };
     active = null;
+    bodySel = new Set();
+    bodyRename = null;
     hoverKey = null;
     paintPromise = null;
     prepared = null;
     renderer.setMesh(model);
+    applyHidden(mesh);
     renderer.setShading(settings.smooth);
     renderer.updateColours(colours, 0, model.count - 1);
     renderer.setBands('active', null);
@@ -1488,6 +1503,7 @@ async function exportStep({ checked = false } = {}) {
     const { step, report } = result;
     current.lastExport = report;                  // for the conversion report (report.js)
     current.lastExportEdits = current.edits;
+    current.bodyResults = Array.isArray(report.bodies) ? report.bodies : null;   // each body's result, for the Bodies list
     if (!step) throw new Error('no shape came out of the build');
     // every face built on its surface: an earlier export's rejections and the check's doubts no longer hold
     // (left in place, the list kept calling groups of a finished solid rejected)
@@ -1682,6 +1698,7 @@ async function knitPayload(current) {
   for (const [t, id] of capOwners(labels, caps, model.neighbours)) labels[t] = id;
   // `source` maps a payload triangle back to the mesh's when stray ones were dropped (Repair's moves name triangles)
   let kept = positions, source = null;
+  let bodies = Int32Array.from(model.bodyOf);
   if (anySkip) {
     const keep = [];
     for (let t = 0; t < labels.length; t++) if (!(skipped[t] && store.groups.get(labels[t])?.type === 'skip')) keep.push(t);
@@ -1689,13 +1706,17 @@ async function knitPayload(current) {
       kept = new Float64Array(keep.length * 9);
       keep.forEach((t, i) => kept.set(positions.subarray(t * 9, t * 9 + 9), i * 9));
       labels = Int32Array.from(keep, (t) => labels[t]);
+      bodies = Int32Array.from(keep, (t) => bodies[t]);
       caps = Uint8Array.from(keep, (t) => caps[t]);
       source = Int32Array.from(keep);
     }
   }
   const shiftedSurfaces = surfaces.map(([id, [type, p]]) => [id, [type, shifted(p, current.offset)]]);
   projectCapVertices(kept, labels, caps, new Map(shiftedSurfaces));
-  return { positions: kept, labels, surfaces: shiftedSurfaces, ...(source ? { source } : {}) };
+  // Bodies (js/bodies.js): one solid each, voids as inner shells; the windings are final (every body faces out, every
+  // void in), so the knitter keeps them. One body takes the file's name.
+  const names = model.bodies.length === 1 ? [current.name] : current.bodyNames.slice();
+  return { positions: kept, labels, surfaces: shiftedSurfaces, bodies, names, oriented: true, ...(source ? { source } : {}) };
 }
 
 /**
@@ -1829,7 +1850,7 @@ function offerDoubts({ groups, mesh: meshDoubt }) {
         { label: 'Fix by hand', detail: 'Outlines them. A group spanning two faces: repaint it with the bucket. A narrow curve: set its type under Fit as, or merge it into its neighbor.', onSelect: () => showDoubts() },
       ] : []),
       ...(meshDoubt ? [
-        { label: 'Fix the mesh', primary: !n, detail: 'Closes its holes, takes off fins and walls stuck to it and joins pieces that cut through each other, as one undo step; Fix bad areas lists each.', onSelect: () => applyMeshFixes() },
+        { label: 'Fix the mesh', primary: !n, detail: 'Closes its holes and takes off fins and walls stuck to it, as one undo step; Fix bad areas lists each. Separate bodies stay separate (join them in the Bodies list).', onSelect: () => applyMeshFixes() },
         { label: 'Show where', detail: 'Outlines the bad edges in amber and zooms to them; again for the next spot.', onSelect: () => showMeshFix('holes') },
       ] : []),
       { label: 'Export anyway', detail: n ? 'Builds the solid as it is: where these faces fail, you can still save with them as flat facets.' : 'Builds what it can: the file will be an open shell, not a solid.', onSelect: () => exportStep({ checked: true }) },
@@ -2112,7 +2133,7 @@ function workbenchEdges(model, store) {
   const ends = bodyEdges(model, store.owner);
   const P = model.positions, extra = [];
   for (let t = 0; t < model.count; t++) {
-    if (!settings.triangleEdges && !isSkipGroup(store.owner[t])) continue;
+    if (model.hidden?.[t] || (!settings.triangleEdges && !isSkipGroup(store.owner[t]))) continue;
     for (let k = 0; k < 3; k++) {
       const nb = model.neighbours[t * 3 + k];
       if (nb >= 0 && nb < t && (settings.triangleEdges || isSkipGroup(store.owner[nb]))) continue;   // each edge once
@@ -2292,7 +2313,7 @@ async function findFixes() {
     const shells = new Map();
     for (let t = 0; t < n; t++) {
       const c = comp[t];
-      if (c === main || sizes[c] > small || isSkipGroup(owner[t])) continue;
+      if (c === main || sizes[c] > small || isSkipGroup(owner[t]) || realBody(model, model.bodyOf[t])) continue;
       (shells.get(c) ?? shells.set(c, []).get(c)).push(t);
     }
     for (const [c, tris] of shells) {
@@ -2772,6 +2793,8 @@ function downloadFile(data, filename) {
 
 /** Loose pieces this small (triangles, of `n`) are strays: the mesh fixes remove them. */
 const SMALL_SHELL = (n) => Math.min(500, Math.max(8, n * 0.01));
+/** A closed body with volume (over a billionth of the bounding cube) is a body however small, never a stray. */
+const realBody = (model, b) => { const body = model.bodies[b]; return !!body?.closed && body.volume > 1e-9 * (2 * model.radius) ** 3; };
 
 /**
  * The mesh's health, worked out once per mesh: its open and non-manifold edges as segments (to outline), the spots
@@ -2829,7 +2852,7 @@ function meshHealth(current) {
   let main = 0;
   sizes.forEach((size, c) => { if (size > sizes[main]) main = c; });
   const small = new Set();
-  for (let t = 0; t < n; t++) if (comp[t] !== main && sizes[comp[t]] <= SMALL_SHELL(n)) small.add(t);
+  for (let t = 0; t < n; t++) if (comp[t] !== main && sizes[comp[t]] <= SMALL_SHELL(n) && !realBody(model, model.bodyOf[t])) small.add(t);
   const pieces = new Set([...small].map((t) => comp[t])).size;
   current.health = { open: model.openEdges.length, nonManifold: model.nonManifoldEdges.length, ends, spots, small, pieces, parts: sizes.length };
   return current.health;
@@ -2857,8 +2880,8 @@ function zoomToSpot(i) {
  */
 let fixWorker = null, fixSeq = 0;
 const fixWaiting = new Map();
-const ALL_STEPS = { pieces: true, holes: true, join: true };
-function runMeshFixes(current, steps) {
+const ALL_STEPS = { pieces: true, holes: true, join: false };   // bodies join only when asked (the Bodies list)
+function runMeshFixes(current, steps, extra = {}) {
   if (!fixWorker) {
     fixWorker = new Worker(new URL('./meshFixWorker.js', import.meta.url), { type: 'module' });
     fixWorker.onmessage = ({ data }) => { const done = fixWaiting.get(data.id); fixWaiting.delete(data.id); done?.(data); };
@@ -2873,7 +2896,7 @@ function runMeshFixes(current, steps) {
   const id = ++fixSeq;
   return new Promise((resolve) => {
     fixWaiting.set(id, resolve);
-    fixWorker.postMessage({ id, positions: current.geometry.attributes.position.array, small, smallPieces: h.pieces, steps });
+    fixWorker.postMessage({ id, positions: current.geometry.attributes.position.array, small, smallPieces: h.pieces, steps, ...extra });
   });
 }
 function checkMesh(current) {
@@ -2893,8 +2916,6 @@ function meshFixList(current) {
       title: [h.filled ? `Close ${plural(h.filled, 'hole')}` : '', sheets ? `${h.filled ? 'remove' : 'Remove'} ${plural(sheets, 'fin or wall', 'fins and walls')} stuck to the surface` : ''].filter(Boolean).join(', '),
       detail: h.filled ? 'Each cap is shaped to the surface round it; on export it joins that group, on its surface' : 'Sheets of no thickness on an edge that two other faces share' });
   }
-  const j = r.join;
-  if (j?.overlap) out.push({ id: 'mesh-join', step: 'join', title: `Join ${plural(j.joined, 'overlapping piece')}`, detail: `They cut through each other; joined, they make ${plural(j.bodies, 'body', 'bodies')}` });
   if (r.pieces.triangles) out.push({ id: 'mesh-pieces', step: 'pieces', title: `Remove ${plural(r.pieces.removed, 'small loose piece')}`, detail: `${plural(r.pieces.triangles, 'triangle')} apart from the main body` });
   return out;
 }
@@ -2952,7 +2973,6 @@ function meshTrouble(current) {
     if (r.holes?.filled) words.push(plural(r.holes.filled, 'hole'));
     const sheets = r.holes ? r.holes.walls_removed + r.holes.fins_removed : 0;
     if (sheets) words.push(plural(sheets, 'fin or wall', 'fins and walls'));
-    if (r.join?.overlap) words.push(plural(r.join.joined, 'overlapping piece'));
     if (r.pieces.triangles) words.push(plural(r.pieces.removed, 'loose piece'));
     if (words.length) return words.join(' · ');
     // nothing left to fix: edges on 3+ triangles now are bodies touching at an edge, each closed; only an open
@@ -2999,6 +3019,7 @@ function replaceMesh(positions, src, label) {
     flags: new Map(), showFlags: false,
     deviation: new Float32Array(model.count).fill(NaN), levels: new Float32Array(model.count * 3).fill(NO_LEVEL),
     refitted: new Set(), groupWorst: new Map(), verdicts: new Map(), origins: new Map(old.origins), edits: 0,
+    ...nameBodies(model, old, src),
     before: old, label,
   };
   for (let m = next, depth = 0; m; m = m.before, depth++) if (depth === MESH_UNDO) { m.before = null; break; }
@@ -3011,11 +3032,14 @@ function swapMesh(target) {
   mesh = target;
   active = null;
   selection = new Set();
+  bodySel = new Set();
+  bodyRename = null;
   hoverKey = null;
   paintPromise = null;
   prepared = null;
   fixes.list = null;
   renderer.setMesh(target.model);
+  applyHidden(target);
   renderer.setShading(settings.smooth);
   renderer.setBands('active', null);
   renderer.setBands('hover', null);
@@ -3027,6 +3051,185 @@ function swapMesh(target) {
   const opened = mesh;
   setTimeout(() => preparePaint().then(() => edgeScoresFor(opened)).catch(() => {}), 50);
   checkMesh(target);
+}
+
+// ── bodies (js/bodies.js): the Bodies list above the face groups ─────────────
+
+/**
+ * The bodies' names, the hidden ones and their results, for a new mesh object. After an edit (old, src), each body
+ * takes the name of the body most of its triangles came from (a body split in two: the larger part keeps it) and
+ * stays hidden if that one was. On open, a body made of one named object of the file (3MF, OBJ) takes that name.
+ * The rest are "Body n", numbered past the names in use.
+ */
+function nameBodies(model, old = null, src = null, objectNames = null, objectOf = null) {
+  const n = model.bodies.length;
+  const names = new Array(n).fill(null), hidden = new Set();
+  const majority = (keyOf) => {
+    const votes = Array.from({ length: n }, () => new Map());
+    for (let t = 0; t < model.count; t++) {
+      const k = keyOf(t);
+      if (k === null || k < 0) continue;
+      const m = votes[model.bodyOf[t]];
+      m.set(k, (m.get(k) ?? 0) + 1);
+    }
+    return votes.map((m) => [...m.entries()].sort((x, y) => y[1] - x[1])[0]?.[0] ?? null);
+  };
+  if (old?.bodyNames && src) {
+    const taken = new Set();
+    majority((t) => (src[t] >= 0 ? old.model.bodyOf[src[t]] : null)).forEach((ob, b) => {
+      if (ob === null) return;
+      if (!taken.has(ob)) { names[b] = old.bodyNames[ob]; taken.add(ob); }
+      if (old.hiddenBodies?.has(ob)) hidden.add(b);
+    });
+  } else if (objectNames && objectOf) {
+    const taken = new Set();
+    majority((t) => objectOf[t]).forEach((o, b) => {
+      const name = o === null ? null : objectNames[o];
+      if (name && !taken.has(name)) { names[b] = name; taken.add(name); }
+    });
+  }
+  const used = new Set(names.filter(Boolean));
+  for (let b = 0, k = 1; b < n; b++) {
+    if (names[b]) continue;
+    while (used.has(`Body ${k}`)) k++;
+    names[b] = `Body ${k}`;
+    used.add(names[b]);
+  }
+  return { bodyNames: names, hiddenBodies: hidden, bodyResults: null };
+}
+
+/** Hide the triangles of `current`'s hidden bodies (view only): the viewport, its picking and its drawn edges. */
+function applyHidden(current = mesh) {
+  if (!current) return;
+  const { model } = current;
+  let mask = null;
+  if (current.hiddenBodies?.size) {
+    mask = new Uint8Array(model.count);
+    for (let t = 0; t < model.count; t++) if (current.hiddenBodies.has(model.bodyOf[t])) mask[t] = 1;
+  }
+  model.hidden = mask;
+  if (current !== mesh) return;
+  renderer.setHidden(mask);
+  edgesDirty = true;
+  requestRender();
+}
+
+/** The eye: show or hide body `b`; with Alt, show only it. */
+function toggleBody(b, only) {
+  const name = mesh.bodyNames[b];
+  if (only) mesh.hiddenBodies = new Set(mesh.model.bodies.map((_, i) => i).filter((i) => i !== b));
+  else if (mesh.hiddenBodies.has(b)) mesh.hiddenBodies.delete(b);
+  else mesh.hiddenBodies.add(b);
+  applyHidden();
+  refreshPanel();
+  say(only ? `Showing only ${name}` : mesh.hiddenBodies.has(b) ? `${name} hidden: it is still exported` : `${name} shown`);
+}
+
+/** A click on a body's row: pick it (again: unpick); with Ctrl, Cmd or Shift, add or remove it. */
+function pickBody(b, event) {
+  if (event.ctrlKey || event.metaKey || event.shiftKey) { if (bodySel.has(b)) bodySel.delete(b); else bodySel.add(b); }
+  else bodySel = bodySel.size === 1 && bodySel.has(b) ? new Set() : new Set([b]);
+  edgesDirty = true;      // the picked bodies' borders are outlined
+  requestRender();
+  refreshPanel();
+}
+
+/** Turn the camera to bodies `ids`. */
+function zoomToBodies(ids) {
+  if (!mesh || !ids.length) return;
+  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  for (const b of ids) {
+    const body = mesh.model.bodies[b];
+    for (let a = 0; a < 3; a++) { lo[a] = Math.min(lo[a], body.lo[a]); hi[a] = Math.max(hi[a], body.hi[a]); }
+  }
+  fitMove = null;
+  camera.center = lo.map((v, a) => (v + hi[a]) / 2);
+  camera.distance = Math.max(Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) / 2, mesh.model.radius * 0.03) * FIT_DISTANCE;
+  requestRender();
+}
+
+/** Keep (or drop) the name being typed for a body. */
+function finishRename(keep) {
+  if (!bodyRename || !mesh) return;
+  const { id, draft } = bodyRename;
+  bodyRename = null;
+  const name = String(draft ?? '').trim();
+  if (keep && name && name !== mesh.bodyNames[id]) {
+    const was = mesh.bodyNames[id];
+    mesh.bodyNames[id] = name;
+    say(`${was} is now ${name}`);
+  }
+  refreshPanel();
+}
+
+/** Union bodies `ids` into one (Manifold, in the mesh fix worker), as one undo step. */
+async function joinBodies(ids) {
+  if (!mesh || stroke || autoRun || ids.length < 2) return;
+  if (busy.onStop) { say('Stop the export first (Esc), or let it finish', true); return; }
+  const current = mesh;
+  const names = ids.map((b) => current.bodyNames[b]);
+  const mark = Int32Array.from(current.model.bodyOf, (b) => (ids.includes(b) ? b : -1));
+  busy.start(`Joining ${names.join(' + ')}`, { onStop: null });
+  progress(`Joining ${plural(ids.length, 'body', 'bodies')}…`);
+  let r;
+  try {
+    r = await runMeshFixes(current, { pieces: false, holes: false, join: true }, { joinBodies: mark });
+  } finally {
+    busy.end();
+  }
+  if (mesh !== current) return;
+  if (r.error) { say(`Could not join them: ${r.error}`, true); return; }
+  if (r.join?.refused) {
+    say(`Could not join them: ${plural(r.join.refused, 'body is', 'bodies are')} not closed, so the union cannot take ${r.join.refused === 1 ? 'it' : 'them'} (Fix bad areas closes holes first)`, true);
+    return;
+  }
+  if (!r.positions || (r.join?.joined ?? 0) < 2) { say('Nothing to join', true); return; }
+  replaceMesh(r.positions, r.src, `Join ${names.join(' + ')}`);
+  say(`Joined ${names.join(' + ')} into one body (one undo step)`);
+}
+
+/** A body's export result, in a few words with a verdict dot. */
+function bodyResultCell(res) {
+  if (!res) return '';
+  const verdict = res.tier === 'analytic' ? 'on' : res.tier === 'hybrid' || res.tier === 'planar' ? 'maybe' : 'off';
+  const words = res.tier === 'analytic' ? 'analytic' : res.tier === 'none' ? 'not closed' : `${Math.round(100 * (res.facetArea ?? 1))}% facets`;
+  return `<span class="wb-dot" style="background:${css(VERDICTS[verdict].rgb)}"></span>${words}`;
+}
+
+/** The Bodies list (with two or more bodies): an eye each, the name (double-click renames), groups and paint, the result. */
+function bodiesHtml() {
+  const { model, store } = mesh;
+  if (model.bodies.length < 2) return '';
+  const stats = model.bodies.map(() => ({ painted: 0, groups: new Set() }));
+  for (let t = 0; t < model.count; t++) {
+    const id = store.owner[t];
+    if (id < 0) continue;
+    const s = stats[model.bodyOf[t]];
+    s.painted++;
+    s.groups.add(id);
+  }
+  const results = new Map((mesh.bodyResults ?? []).map((r) => [r.id, r]));
+  const rows = model.bodies.map((body, b) => {
+    const hidden = mesh.hiddenBodies.has(b), name = mesh.bodyNames[b], s = stats[b];
+    const pct = Math.round((100 * s.painted) / body.triangles);
+    const what = `${body.triangles.toLocaleString()} triangles${body.voids ? `, ${plural(body.voids, 'void')}` : ''}${body.closed ? '' : ', not closed'}`;
+    const label = bodyRename?.id === b
+      ? `<input class="wb-bname" value="${esc(bodyRename.draft)}" aria-label="Name of ${esc(name)}" spellcheck="false">`
+      : `<span class="wb-bn" data-rename="${b}" title="Double-click to rename">${esc(name)}</span>`;
+    return `<li class="wb-b${hidden ? ' wb-b--hidden' : ''}" data-body="${b}" aria-selected="${bodySel.has(b)}" title="${esc(`${name}: ${what}`)}">
+      <button type="button" class="wb-eye" data-eye="${b}" aria-pressed="${!hidden}" aria-label="${hidden ? 'Show' : 'Hide'} ${esc(name)}" title="${hidden ? 'Show' : 'Hide'} ${esc(name)} (Alt-click: show only this one). Hidden bodies are still exported">${ui.iconMarkup(hidden ? 'eyeOff' : 'eye', { className: 'wb-ticon' })}</button>
+      ${label}<span class="wb-bc">${plural(s.groups.size, 'group')} · ${pct}% painted</span><span class="wb-br">${bodyResultCell(results.get(b))}</span></li>`;
+  });
+  const picked = [...bodySel];
+  const bar = picked.length ? `<div class="wb-selbar wb-bodybar"><span class="wb-n">${picked.length === 1 ? esc(mesh.bodyNames[picked[0]]) : `${picked.length} bodies`}</span>
+      <button type="button" class="wb-btn wb-small" data-act="body-zoom">Zoom to</button>
+      <button type="button" class="wb-btn wb-small" data-act="body-solo" title="Hide every other body (view only)">Show only</button>
+      ${picked.length > 1 ? '<button type="button" class="wb-btn wb-small" data-act="body-join" title="Union them into one body; one undo step">Join</button>' : ''}
+      <button type="button" class="wb-btn wb-small" data-act="body-clear">Clear</button></div>` : '';
+  return `<div class="wb-bodies">
+    <div class="wb-ptitle"><h2>Bodies</h2><span class="wb-count">${model.bodies.length}</span><span class="wb-spacer"></span>
+      ${mesh.hiddenBodies.size ? `<button type="button" class="wb-btn wb-small" data-act="body-showall">Show all</button>` : ''}</div>
+    <ul class="wb-blist">${rows.join('')}</ul>${bar}</div>`;
 }
 
 // ── panel, toolbar, status ────────────────────────────────────────────────────
@@ -3066,8 +3269,8 @@ function groupRows() {
     mesh.triArea = area;
   }
   const rows = new Map();
-  for (const g of store.list()) rows.set(g.id, { id: g.id, group: g, name: store.name(g.id), type: g.type, count: 0, area: 0 });
-  for (let t = 0; t < model.count; t++) { const r = rows.get(store.owner[t]); if (r) { r.count++; r.area += mesh.triArea[t]; } }
+  for (const g of store.list()) rows.set(g.id, { id: g.id, group: g, name: store.name(g.id), type: g.type, count: 0, area: 0, bodies: new Set() });
+  for (let t = 0; t < model.count; t++) { const r = rows.get(store.owner[t]); if (r) { r.count++; r.area += mesh.triArea[t]; r.bodies.add(model.bodyOf[t]); } }
   const diag = 2 * model.radius;
   for (const r of rows.values()) {
     r.verdict = mesh.verdicts.get(r.id) ?? 'none';
@@ -3114,7 +3317,8 @@ function visibleRows() {
   if (!mesh) return [];
   const q = table.search.trim().toLowerCase();
   const rows = groupRows().filter((r) => (!table.types.size || table.types.has(r.type ?? 'freeform'))
-    && (!table.fits.size || table.fits.has(r.verdict)) && (!q || r.name.toLowerCase().includes(q)));
+    && (!table.fits.size || table.fits.has(r.verdict)) && (!q || r.name.toLowerCase().includes(q))
+    && (!bodySel.size || [...r.bodies].some((b) => bodySel.has(b))));
   const { key, dir } = table.sort;
   rows.sort((a, b) => (compareRows(a, b, key) || a.id - b.id) * dir);
   return rows;
@@ -3154,7 +3358,10 @@ function refreshPanel() {
   const all = groupRows();
   const rows = visibleRows();
   const typeCounts = new Map();
-  for (const r of all) typeCounts.set(r.type ?? 'freeform', (typeCounts.get(r.type ?? 'freeform') ?? 0) + 1);
+  for (const r of all) {
+    if (bodySel.size && ![...r.bodies].some((b) => bodySel.has(b))) continue;
+    typeCounts.set(r.type ?? 'freeform', (typeCounts.get(r.type ?? 'freeform') ?? 0) + 1);
+  }
   const picked = [...selection].filter((id) => store.count(id));
   const fitCell = (r) => (r.verdict === 'skip' ? '<span class="wb-skipped">skipped</span>'
     : r.verdict === 'none' ? `<span class="wb-dot" style="background:${css(NO_SURFACE)}"></span>none`
@@ -3175,7 +3382,8 @@ function refreshPanel() {
     }
   }
   if (rows.length > shown) body += `<tr class="wb-unp"><td colspan="5">${(rows.length - shown).toLocaleString()} more: filter or search to see them</td></tr>`;
-  const unpainted = mesh.model.count - store.painted;
+  let unpainted = mesh.model.count - store.painted;
+  if (bodySel.size) { unpainted = 0; for (let t = 0; t < mesh.model.count; t++) if (store.owner[t] < 0 && bodySel.has(mesh.model.bodyOf[t])) unpainted++; }
   if (unpainted) body += `<tr class="wb-unp"><td>Unpainted</td><td></td><td class="wb-num">${unpainted.toLocaleString()}</td><td class="wb-col-area"></td><td></td></tr>`;
   // the arrow points the way the numbers run: Fit's first order is worst first, so its numbers fall
   const arrow = (k) => (table.sort.key !== k ? '' : (k === 'fit' ? table.sort.dir < 0 : table.sort.dir > 0) ? ' ▲' : ' ▼');
@@ -3236,9 +3444,9 @@ function refreshPanel() {
 
   const caret = document.activeElement?.id === 'search' ? document.activeElement.selectionStart : null;
   const scroll = panelEl.querySelector('.wb-tablewrap')?.scrollTop ?? 0;
-  panelEl.innerHTML = `
+  panelEl.innerHTML = `${bodiesHtml()}
     <div class="wb-phead">
-      <div class="wb-ptitle"><h2>Face groups</h2><span class="wb-count">${all.length.toLocaleString()}</span><span class="wb-spacer"></span>
+      <div class="wb-ptitle"><h2>Face groups</h2><span class="wb-count">${bodySel.size ? `${rows.length.toLocaleString()} in ${esc(bodySel.size === 1 ? mesh.bodyNames[[...bodySel][0]] : `${bodySel.size} bodies`)}` : all.length.toLocaleString()}</span><span class="wb-spacer"></span>
         <span class="wb-seg" role="group" aria-label="Arrange">${[['none', 'List'], ['type', 'By type'], ['fit', 'By fit']].map(([k, l]) => `<button type="button" data-by="${k}" aria-pressed="${table.by === k}">${l}</button>`).join('')}</span></div>
       <input class="wb-search" id="search" type="search" placeholder="Find a group by name" value="${esc(table.search)}" aria-label="Find a group by name">
       <div class="wb-filters">
@@ -3255,6 +3463,8 @@ function refreshPanel() {
   const wrap = panelEl.querySelector('.wb-tablewrap');
   if (wrap) wrap.scrollTop = scroll;
   if (caret !== null) { const s = document.getElementById('search'); s.focus(); s.setSelectionRange(caret, caret); }
+  const naming = panelEl.querySelector('input.wb-bname');
+  if (naming) { naming.focus(); naming.setSelectionRange(naming.value.length, naming.value.length); }
 }
 
 function setType(type) {
@@ -3269,6 +3479,11 @@ function setType(type) {
 // the table's controls
 panelEl.addEventListener('click', (event) => {
   if (!mesh) return;
+  if (event.target.closest('input.wb-bname')) return;
+  const eye = event.target.closest('[data-eye]');
+  if (eye) { toggleBody(Number(eye.dataset.eye), event.altKey); return; }
+  const bodyRow = event.target.closest('li.wb-b');
+  if (bodyRow) { pickBody(Number(bodyRow.dataset.body), event); return; }
   const el = event.target.closest('[data-act],[data-sort],[data-by],[data-ftype],[data-ffit],[data-mshow],tr.wb-g');
   if (!el || el.disabled) return;
   const d = el.dataset;
@@ -3279,6 +3494,11 @@ panelEl.addEventListener('click', (event) => {
   else if (d.ftype) { if (table.types.has(d.ftype)) table.types.delete(d.ftype); else table.types.add(d.ftype); refreshPanel(); }
   else if (d.ffit) { if (table.fits.has(d.ffit)) table.fits.delete(d.ffit); else table.fits.add(d.ffit); refreshPanel(); }
   else if (el.matches('tr.wb-g')) selectGroup(Number(d.group), event);
+  else if (d.act === 'body-zoom') zoomToBodies([...bodySel]);
+  else if (d.act === 'body-solo') { mesh.hiddenBodies = new Set(mesh.model.bodies.map((_, b) => b).filter((b) => !bodySel.has(b))); applyHidden(); refreshPanel(); }
+  else if (d.act === 'body-showall') { mesh.hiddenBodies = new Set(); applyHidden(); refreshPanel(); }
+  else if (d.act === 'body-join') joinBodies([...bodySel].sort((a, b) => a - b));
+  else if (d.act === 'body-clear') { bodySel = new Set(); edgesDirty = true; requestRender(); refreshPanel(); }
   else if (d.act === 'fix-find') findFixes();
   else if (d.act === 'mfix-apply') applyMeshFixes();
   else if (d.act === 'fix-toggle') { fixes.open = !fixes.open; refreshPanel(); }
@@ -3303,6 +3523,11 @@ panelEl.addEventListener('click', (event) => {
   } else if (d.act === 'clear') selectGroup(null);
 });
 panelEl.addEventListener('dblclick', (event) => {
+  if (!mesh) return;
+  const nameEl = event.target.closest('[data-rename]');
+  if (nameEl) { const id = Number(nameEl.dataset.rename); bodyRename = { id, draft: mesh.bodyNames[id] }; refreshPanel(); return; }
+  const bodyRow = event.target.closest('li.wb-b');
+  if (bodyRow && !event.target.closest('[data-eye],input')) { zoomToBodies([Number(bodyRow.dataset.body)]); return; }
   const tr = event.target.closest('tr.wb-g');
   if (!tr || !mesh) return;
   const id = Number(tr.dataset.group);
@@ -3332,10 +3557,18 @@ panelEl.addEventListener('change', (event) => {
   }
 });
 panelEl.addEventListener('input', (event) => {
+  if (event.target.matches('input.wb-bname') && bodyRename) { bodyRename.draft = event.target.value; return; }
   if (event.target.id !== 'search') return;
   table.search = event.target.value;
   refreshPanel();
 });
+
+panelEl.addEventListener('keydown', (event) => {
+  if (!event.target.matches('input.wb-bname')) return;
+  if (event.key === 'Enter') { event.preventDefault(); finishRename(true); }
+  else if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); finishRename(false); }
+});
+panelEl.addEventListener('focusout', (event) => { if (event.target.matches('input.wb-bname')) finishRename(true); });
 
 function fillMenu() {
   const pick = (key, value) => () => {
@@ -3606,7 +3839,8 @@ function frame(now) {
     const flagged = !picked.size && mesh.showFlags && mesh.flags.size ? mesh.flags : null;
     const ring = picked.size ? picked : flagged;
     renderer.setBands('active', !picked.size && mesh.showProblems ? meshHealth(mesh).ends
-      : ring ? outline(model, trianglesOf(store.owner, ring), (t) => ring.has(store.owner[t])) : null);
+      : ring ? outline(model, trianglesOf(store.owner, ring), (t) => ring.has(store.owner[t]))
+        : bodySel.size ? bodyEdges(model, store.owner, 30, (t) => bodySel.has(model.bodyOf[t])) : null);
     if (hoverKey?.startsWith('g')) { const key = hoverKey; hoverKey = null; setHover(key); }
     edgesDirty = false;
     needsRender = true;

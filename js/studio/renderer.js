@@ -204,6 +204,7 @@ export function createRenderer(canvas) {
       const positions = model.positions instanceof Float32Array ? model.positions : Float32Array.from(model.positions);
       mesh = {
         count: model.count,
+        source: positions,
         position: arrayBuffer(positions),
         facet: arrayBuffer(model.facetNormals),
         smooth: arrayBuffer(model.smoothNormals),
@@ -227,6 +228,26 @@ export function createRenderer(canvas) {
       gl.bindVertexArray(mesh.pickVao);
       bindAttribute(pickProgram, 'position', mesh.position, 3);
       gl.bindVertexArray(null);
+      pickDirty = true;
+    },
+
+    /**
+     * Hide triangles (mask: 1 per hidden triangle, or null for none): their corners are uploaded collapsed onto their
+     * first, so they draw nothing and the pick buffer never returns them. The model's positions are untouched.
+     */
+    setHidden(mask) {
+      if (!mesh) return;
+      let data = mesh.source;
+      if (mask) {
+        data = Float32Array.from(mesh.source);
+        for (let t = 0; t < mesh.count; t++) {
+          if (!mask[t]) continue;
+          const o = t * 9;
+          for (let k = 3; k < 9; k++) data[o + k] = data[o + (k % 3)];
+        }
+      }
+      gl.bindBuffer(gl.ARRAY_BUFFER, mesh.position);
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, data);
       pickDirty = true;
     },
 

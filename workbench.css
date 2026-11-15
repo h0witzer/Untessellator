@@ -285,6 +285,26 @@ body { background: var(--wb-bg); color: var(--wb-text); font: 14.5px/1.45 var(--
 .wb-selbar select, .wb-kv select { background: var(--wb-raised-2); border: 1px solid var(--wb-line-strong); border-radius: 5px; padding: 3px 6px; font-size: 12.5px; }
 
 .wb-tablewrap { flex: 1; overflow: auto; min-height: 120px; margin-top: 10px; }
+/* The Bodies list (two or more bodies): an eye, the name, groups and paint, the export result; picked rows filter the
+   face groups below. Hiding is view only. */
+.wb-bodies { padding: 12px 16px 10px; border-bottom: 1px solid var(--wb-line); }
+.wb-blist { list-style: none; margin: 8px 0 0; padding: 0; max-height: 28vh; overflow: auto; }
+.wb-b { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; align-items: center; gap: 8px; padding: 3px 6px 3px 2px; cursor: pointer; }
+.wb-b:hover { background: var(--wb-raised); }
+.wb-b[aria-selected="true"] { background: rgba(255, 201, 51, 0.13); box-shadow: inset 3px 0 0 var(--wb-select); }
+.wb-b--hidden .wb-bn, .wb-b--hidden .wb-bc, .wb-b--hidden .wb-br { color: var(--wb-muted); opacity: 0.65; }
+.wb-eye { border: 0; background: transparent; color: var(--wb-text); padding: 3px; cursor: pointer; display: inline-flex; border-radius: 0; clip-path: var(--btn-cut); }
+.wb-eye:hover { background: var(--wb-raised-2); }
+.wb-eye:active { clip-path: var(--btn-round); }
+.wb-b--hidden .wb-eye { color: var(--wb-muted); }
+.wb-eye .wb-ticon { width: 18px; height: 18px; }
+.wb-bn { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wb-bname { font: inherit; font-weight: 600; min-width: 0; padding: 2px 6px; border: 0; background: var(--wb-raised-2); color: var(--wb-text); border-radius: 0; clip-path: var(--btn-cut); }
+.wb-bc { color: var(--wb-muted); font: 12px var(--wb-font-data); white-space: nowrap; }
+.wb-br { display: inline-flex; align-items: center; gap: 5px; font: 12px var(--wb-font-data); white-space: nowrap; }
+.wb-bodies .wb-bodybar { margin: 8px -16px -10px; border-bottom: 0; }
+@media (max-width: 600px) { .wb-bc { display: none; } }
+
 .wb table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .wb thead th { position: sticky; top: 0; background: var(--wb-panel); z-index: 1; text-align: left; font: 600 11px/1 var(--wb-font-label); letter-spacing: 0.1em; text-transform: uppercase; color: var(--wb-faint); padding: 0; border-bottom: 1px solid var(--wb-line); }
 .wb thead th button { width: 100%; text-align: inherit; background: transparent; border: 0; padding: 9px 8px; cursor: pointer; color: inherit; font: inherit; letter-spacing: inherit; white-space: nowrap; }

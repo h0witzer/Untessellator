@@ -5,14 +5,24 @@
  * three.js geometry, meshCore.buildFacets and paintTool, so a triangle index means the
  * same triangle everywhere.
  *
- *   neighbours[t*3+k]  the triangle across edge k (corner k to corner k+1), or -1 for an
- *                      open or non-manifold edge
+ *   neighbours[t*3+k]  the triangle across edge k (corner k to corner k+1) in the same body, or -1 for an open
+ *                      edge or one left unpaired (js/bodies.js pairs the triangles round an edge on 3+ triangles
+ *                      body by body, as the knitter does, so fills work on bodies that touch)
  *   openEdges          the open edges (one triangle), each as a corner t*3+k
- *   nonManifoldEdges   the edges three or more triangles share, each once, as a corner of one of them
+ *   nonManifoldEdges   the edges three or more triangles share that the pairing could not resolve (some triangle on
+ *                      it pairs with none), each once, as a corner of one of them; bodies touching cleanly are not
+ *   bodyOf, bodies     each triangle's body and the bodies (js/bodies.js findBodies: largest first, with their
+ *                      shells, voids, volume and bounds); shellOf, shells likewise
+ *   hidden             set by the studio: 1 per triangle of a body hidden in the Bodies list (or null); the drawn
+ *                      edges and outlines leave those out
+ *   flipped            how many triangles were turned round so every body faces out and every void in: the flips
+ *                      are made IN PLACE on `positions`, which the export and the fills read too
  *   facetNormals       one normal per corner, all three the facet's: faceted shading
  *   smoothNormals      area-weighted welded-vertex normals, falling back to the facet
  *                      normal where they differ by more than 60 degrees so a crease stays sharp
  */
+
+import { findBodies } from '../bodies.js';
 
 const COS_KEEP_SMOOTH = Math.cos(60 * Math.PI / 180);
 
@@ -46,46 +56,39 @@ export function buildMeshModel(positions) {
   const vertexCount = ids.size;
   ids.clear();
 
-  const neighbours = new Int32Array(count * 3).fill(-1);
-  const firstOwner = new Map();
-  const nonManifold = new Map();   // key -> a corner on the edge
+  // Bodies, shells and the windings (js/bodies.js), from the welded corners.
+  const V = new Float64Array(vertexCount * 3);
+  for (let c = count * 3 - 1; c >= 0; c--) V.set([P[c * 3], P[c * 3 + 1], P[c * 3 + 2]], weld[c] * 3);
+  const { flip, across, bodyOf, bodies, shellOf, shells } = findBodies(weld, V);
+  let flipped = 0;
+  for (let t = 0; t < count; t++) {
+    if (!flip[t]) continue;
+    flipped++;
+    const o = t * 9;
+    for (let a = 0; a < 3; a++) { const x = P[o + 3 + a]; P[o + 3 + a] = P[o + 6 + a]; P[o + 6 + a] = x; }
+    const w = weld[t * 3 + 1]; weld[t * 3 + 1] = weld[t * 3 + 2]; weld[t * 3 + 2] = w;
+  }
+  const neighbours = across;
+
+  // open edges (one triangle) and the edges on 3+ triangles that some triangle could not pair across
+  const owners = new Map();
   for (let t = 0; t < count; t++) {
     for (let k = 0; k < 3; k++) {
-      const a = weld[t * 3 + k];
-      const b = weld[t * 3 + (k + 1) % 3];
+      const a = weld[t * 3 + k], b = weld[t * 3 + (k + 1) % 3];
       if (a === b) continue;
       const key = a < b ? a * vertexCount + b : b * vertexCount + a;
-      if (nonManifold.has(key)) continue;
-      const other = firstOwner.get(key);
-      if (other === undefined) {
-        firstOwner.set(key, t * 3 + k);
-      } else if (other >= 0) {
-        neighbours[t * 3 + k] = Math.floor(other / 3);
-        neighbours[other] = t;
-        firstOwner.set(key, -1);
-      } else {
-        // A third owner: the edge is non-manifold, so nothing is adjacent across it.
-        nonManifold.set(key, t * 3 + k);
-      }
+      const list = owners.get(key);
+      if (list) list.push(t * 3 + k); else owners.set(key, [t * 3 + k]);
     }
   }
-  // Undo any pair recorded before a third owner of the same edge turned up.
-  if (nonManifold.size) {
-    for (let t = 0; t < count; t++) {
-      for (let k = 0; k < 3; k++) {
-        const a = weld[t * 3 + k];
-        const b = weld[t * 3 + (k + 1) % 3];
-        const key = a < b ? a * vertexCount + b : b * vertexCount + a;
-        if (nonManifold.has(key)) neighbours[t * 3 + k] = -1;
-      }
-    }
+  const open = [], nonManifold = [];
+  for (const list of owners.values()) {
+    if (list.length === 1) open.push(list[0]);
+    else if (list.length > 2 && list.some((corner) => neighbours[corner] < 0)) nonManifold.push(list[0]);
   }
-
-  // an edge whose first owner was never matched has one triangle: open
-  const open = [];
-  for (const corner of firstOwner.values()) if (corner >= 0) open.push(corner);
+  owners.clear();
   const openEdges = Int32Array.from(open);
-  const nonManifoldEdges = Int32Array.from(nonManifold.values());
+  const nonManifoldEdges = Int32Array.from(nonManifold);
 
   const facetNormals = new Float32Array(count * 9);
   const vertexSums = new Float64Array(vertexCount * 3);
@@ -119,7 +122,8 @@ export function buildMeshModel(positions) {
     }
   }
 
-  return { count, positions: P, centre, radius, neighbours, unitNormals: unit, facetNormals, smoothNormals, openEdges, nonManifoldEdges };
+  return { count, positions: P, centre, radius, neighbours, unitNormals: unit, facetNormals, smoothNormals, openEdges, nonManifoldEdges,
+    bodyOf, bodies, shellOf, shells, flipped };
 }
 
 function pushEdge(out, P, t, k) {
@@ -131,13 +135,14 @@ function pushEdge(out, P, t, k) {
 /**
  * The drawn edges of the body: every edge between triangles of different owners (a group
  * boundary, or painted against unpainted), every open edge, and every crease sharper than
- * `creaseDeg`. Returns segment endpoints, six numbers per segment.
+ * `creaseDeg`; with `keep(t)`, only those triangles' edges. Returns segment endpoints, six numbers per segment.
  */
-export function bodyEdges(model, owner, creaseDeg = 30) {
-  const { count, positions: P, neighbours, unitNormals: N } = model;
+export function bodyEdges(model, owner, creaseDeg = 30, keep = null) {
+  const { count, positions: P, neighbours, unitNormals: N, hidden } = model;
   const cosCrease = Math.cos(creaseDeg * Math.PI / 180);
   const out = [];
   for (let t = 0; t < count; t++) {
+    if (hidden?.[t] || (keep && !keep(t))) continue;
     for (let k = 0; k < 3; k++) {
       const nb = neighbours[t * 3 + k];
       if (nb >= 0 && nb < t) continue;   // drawn from the other side already
@@ -154,9 +159,10 @@ export function bodyEdges(model, owner, creaseDeg = 30) {
 
 /** The outline of a set of triangles: its edges that border anything outside it. */
 export function outline(model, triangles, inside) {
-  const { positions: P, neighbours } = model;
+  const { positions: P, neighbours, hidden } = model;
   const out = [];
   for (const t of triangles) {
+    if (hidden?.[t]) continue;
     for (let k = 0; k < 3; k++) {
       const nb = neighbours[t * 3 + k];
       if (nb < 0 || !inside(nb)) pushEdge(out, P, t, k);

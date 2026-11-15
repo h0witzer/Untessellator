@@ -9,8 +9,9 @@
  *   orient      consistent winding across every edge with two triangles
  *   fins, walls the sheets that edges on 3+ triangles cut off are judged by the generalized winding number
  *               (Jacobson et al. 2013) just in front of and behind them: a surface has inside on one side only (mean
- *               near 1/2); a wall inside a body has it on both (near 1), a fin outside on neither (near 0); those go
- *   pair        what is left on 3+ triangles is bodies touching at an edge: round it, each face pairs with the face
+ *               near 1/2); a wall inside a body has it on both (near 1), a fin outside on neither (near 0); those go,
+ *               unless every triangle of the sheet is in a closed shell (bodies touching: each keeps its own skin)
+ *   pair       what is left on 3+ triangles is bodies touching at an edge: round it, each face pairs with the face
  *               next to it on its inside, when that face's inside is it in turn
  *   flat        an open piece standing alone that closes over no volume (FLAT x area^1.5: a stray flat sheet) is
  *               left as it is rather than capped into a sheet of zero thickness; a 1 mm plate 100 mm wide closes
@@ -26,6 +27,8 @@
  *
  * Returns the soup with caps appended, src (each triangle's input triangle; -1 for a cap) and counts.
  */
+
+import { findBodies } from './bodies.js';
 
 export const FILL = { DP_MAX: 160, FLAT: 1e-3, REFINE: 1.5, FAIR_ROUNDS: 40, MAX_CAP: 200000 };
 
@@ -114,6 +117,17 @@ export function fillHoles(positions, opts = {}) {
   };
   const tri = (h) => Math.floor(h / 3);
 
+  // A triangle in a closed shell (js/bodies.js pairs the faces round an edge on 3+ triangles body by body) is a body's
+  // skin: two bodies touching along a face each have their own copy of it, opposite-wound, inside material on both
+  // sides, and it stays, so the bodies stay separate. A sheet is kept so only when every triangle on every edge it
+  // shares with 3+ is in a closed shell: a single wall inside one body closes the half on its side but leaves the
+  // other half open, so it is still judged (and goes).
+  const skin = new Uint8Array(nIn);
+  {
+    const { shells, shellOf } = findBodies(T, Float64Array.from(V));
+    for (let t = 0; t < nIn; t++) if (live[t] && shells[shellOf[t]].closed) skin[t] = 1;
+  }
+
   // ── fins and walls: the sheets an edge on 3+ triangles cuts off, judged by the generalized winding number ──
   // (Jacobson, Kavan and Sorkine-Hornung 2013). A surface has inside on one side and outside on the other, so the
   // mean of the winding numbers just in front of it and just behind it is near 1/2 (-1/2 wound inward); a wall inside
@@ -136,8 +150,12 @@ export function fillHoles(positions, opts = {}) {
       }
       sheets.push(list);
     }
-    const cut = new Set();
-    for (const hs of edges.values()) if (hs.length >= 3) for (const h of hs) cut.add(sheet[tri(h)]);
+    const cut = new Set(), exposed = new Set();
+    for (const hs of edges.values()) {
+      if (hs.length < 3) continue;
+      const allSkin = hs.every((h) => skin[tri(h)]);
+      for (const h of hs) { cut.add(sheet[tri(h)]); if (!allSkin) exposed.add(sheet[tri(h)]); }
+    }
     report.sheets_split = cut.size;
     if (cut.size) {
       // every live triangle, flat, for the winding number
@@ -163,6 +181,7 @@ export function fillHoles(positions, opts = {}) {
       };
       for (const id of cut) {
         const list = sheets[id];
+        if (!exposed.has(id) && list.every((t) => skin[t])) continue;   // bodies touching: each keeps its skin
         const area = (t) => { const a = P(T[t * 3]), b = P(T[t * 3 + 1]), c = P(T[t * 3 + 2]); return Math.hypot(...cross(sub(b, a), sub(c, a))); };
         const samples = [...list].sort((x, y) => area(y) - area(x)).slice(0, per);
         const means = samples.map((t) => {
