@@ -301,12 +301,16 @@ resultEl.setAttribute('role', 'dialog');
 resultEl.hidden = true;
 shell.stage.append(resultEl);
 let resultSteps = [];
+/** The last step of every problem card: a failure can always be reported (report.js). */
+const REPORT_STEP = { label: 'Report it', detail: 'Downloads a report file and opens a prefilled GitHub issue; nothing is sent until you submit it.', onSelect: () => reportConversion() };
 /**
  * Show the result card: `title`, a `lead` sentence, `groups` ([id, why] pairs, worst first) and `steps`
- * ([{ label, detail, primary?, onSelect }]). `bad` marks it as a problem. A new run or a new mesh closes it.
+ * ([{ label, detail, primary?, onSelect }]). `bad` marks it as a problem, and a problem card always ends with
+ * Report it. A new run or a new mesh closes it.
  */
 function showResult({ title, lead = '', groups = [], steps = [], bad = false }) {
   const SHOWN = 6;
+  if (bad) steps = [...steps, REPORT_STEP];
   resultSteps = steps;
   resultEl.classList.toggle('wb-result--bad', bad);
   resultEl.setAttribute('aria-label', title);
@@ -1539,10 +1543,9 @@ async function exportStep({ checked = false } = {}) {
     say(`Export failed: ${why}`, true);
     showResult({
       title: 'Export failed', bad: true,
-      lead: `${why[0].toUpperCase()}${why.slice(1)}. Nothing was saved. Exporting again usually gets past a one-off kernel failure; if it keeps failing, report it with the flag so the run can be replayed.`,
+      lead: `${why[0].toUpperCase()}${why.slice(1)}. Nothing was saved. Exporting again usually gets past a one-off kernel failure; if it keeps failing, report it so the run can be replayed.`,
       steps: [
         { label: 'Export again', primary: true, detail: 'Builds the solid from the groups as they are now.', onSelect: () => exportStep({ checked: true }) },
-        { label: 'Report it', detail: 'Downloads a report file and opens a prefilled GitHub issue; nothing is sent until you submit it.', onSelect: () => reportConversion() },
       ],
     });
   } finally {
