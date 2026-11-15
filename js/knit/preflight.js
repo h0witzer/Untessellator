@@ -45,6 +45,8 @@ const AXIAL = new Set(['cylinder', 'cone', 'torus']);
  * @param {ArrayLike<number>} positions  triangle soup, 9 per triangle
  * @param {ArrayLike<number>} labels     group per triangle (-1 unpainted); optional
  * @param {Map<number, [string, object]>} surfaces  group -> [type, params]; optional
+ * opts.bodies: a body id per triangle (the export payload's): an edge is judged in each body on its own, so two bodies
+ * touching along it (four triangles, two each) is no non-manifold edge, and one triangle in each is open in both.
  */
 export function preflight(positions, labels = null, surfaces = new Map(), opts = {}) {
   const cfg = { ...PREFLIGHT, ...opts };
@@ -87,13 +89,30 @@ export function preflight(positions, labels = null, surfaces = new Map(), opts =
       const u = idx[t * 3 + k], v = idx[t * 3 + (k + 1) % 3];
       const key = Math.min(u, v) * nV + Math.max(u, v);
       let e = edges.get(key);
-      if (!e) edges.set(key, (e = { u: Math.min(u, v), v: Math.max(u, v), fwd: 0, back: 0, tris: [] }));
+      if (!e) edges.set(key, (e = { u: Math.min(u, v), v: Math.max(u, v), fwd: 0, back: 0, tris: [], dirs: [] }));
       if (u < v) e.fwd++; else e.back++;
       e.tris.push(t);
+      e.dirs.push(u < v ? 1 : -1);
     }
   }
   const open = [];
+  const bodyOf = cfg.bodies ?? null;
   for (const e of edges.values()) {
+    if (bodyOf) {
+      // each body's triangles on the edge: one is open, two a seam (flipped when they run the same way), more non-manifold
+      const count = new Map(), turn = new Map();
+      e.tris.forEach((t, i) => { const b = bodyOf[t]; count.set(b, (count.get(b) ?? 0) + 1); turn.set(b, (turn.get(b) ?? 0) + e.dirs[i]); });
+      let opened = false, many = false, flipped = false;
+      for (const [b, n] of count) {
+        if (n === 1) opened = true;
+        else if (n > 2) many = true;
+        else if (Math.abs(turn.get(b)) === 2) flipped = true;
+      }
+      if (opened) open.push(e);
+      if (many) mesh.nonmanifoldEdges++;
+      else if (flipped) mesh.flippedEdges++;
+      continue;
+    }
     const m = e.tris.length;
     if (m === 1) open.push(e);
     else if (m > 2) mesh.nonmanifoldEdges++;
