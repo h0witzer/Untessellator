@@ -80,3 +80,22 @@ function writeNamed(oc, shape, names, part) {
   try { doc.get().Close(); } catch { /* not bound in every build */ }
   return text;
 }
+
+/** A shape as OCCT BRep text: how the export worker posts each finished body (knitSolid's onBody). */
+export function brepText(oc, shape) {
+  const path = `/tmp/body-${Date.now()}-${Math.random().toString(36).slice(2)}.brep`;
+  oc.BRepTools.Write_3(shape, path, new oc.Message_ProgressRange_1());
+  const text = oc.FS.readFile(path, { encoding: 'utf8' });
+  try { oc.FS.unlink(path); } catch { /* the file is in memory; nothing to clean */ }
+  return text;
+}
+
+/** The shape BRep text holds (brepText's). */
+export function readBrep(oc, text) {
+  const path = `/tmp/body-${Date.now()}-${Math.random().toString(36).slice(2)}.brep`;
+  oc.FS.writeFile(path, text);
+  const shape = new oc.TopoDS_Shape();
+  oc.BRepTools.Read_2(shape, path, new oc.BRep_Builder(), new oc.Message_ProgressRange_1());
+  try { oc.FS.unlink(path); } catch { /* the file is in memory; nothing to clean */ }
+  return shape;
+}

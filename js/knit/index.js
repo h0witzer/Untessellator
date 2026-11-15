@@ -15,13 +15,14 @@
 import { KnitMesh } from './mesh.js';
 import { buildRepaired, facetFallback, progressiveRecovery, LOOP, now } from './repair.js';
 import { buildPolyhedral, grade, tidy, better, BUILD } from './build.js';
+import { readBrep } from './occt.js';
 import { buildFacets } from '../meshCore.js';
 import { attachCurvature } from '../curvature.js';
 import { fitRegionAs } from '../gaussMap.js';
 import { fitPieces } from '../freeformFit.js';
 import { shareAxes } from './axes.js';
 
-export { loadOcct, writeStep } from './occt.js';
+export { loadOcct, writeStep, brepText, readBrep } from './occt.js';
 export { BUILD } from './build.js';
 
 const TYPES = ['plane', 'cylinder', 'cone', 'sphere', 'torus'];
@@ -61,9 +62,9 @@ export const FREEFORM_MIN_FACETS = 4;
  * into mesh.F; a piece still failing keeps a label of its own and goes out as facets. Adds to `surfaces`;
  * returns counts.
  */
-export function addFreeform(mesh, surfaces, onProgress = null, { split = true } = {}) {
+export function addFreeform(mesh, surfaces, onProgress = null, { split = true, firstLabel = 0 } = {}) {
   const byLabel = new Map();
-  let next = 0;
+  let next = firstLabel;                         // new labels from here up (knitSolid's bodies: unique across them)
   for (let t = 0; t < mesh.T.length; t++) {
     const g = mesh.F[t];
     next = Math.max(next, g + 1);
@@ -107,13 +108,26 @@ export function addFreeform(mesh, surfaces, onProgress = null, { split = true } 
  * starts (a running OCCT call cannot be stopped, so callers that must bound the time also need a hard stop,
  * as the studio's worker timeout). mode 'faceted': the mesh as a polyhedral solid only.
  */
-export function knitSolid(oc, { positions, labels, surfaces }, { fallback = true, onProgress = null, deadline = Infinity,
+export function knitSolid(oc, { positions, labels, surfaces, bodies = null, names = null, oriented = false }, options = {}) {
+  const ids = bodies ? [...new Set(bodies)].sort((a, b) => a - b) : [];
+  if (ids.length <= 1) {
+    const r = knitOne(oc, { positions, labels, surfaces, oriented }, options);
+    const id = ids[0] ?? 0, name = names?.[id] ?? null;
+    r.report.bodies = [{ id, name: name ?? 'Body 1', ...bodyRow(r.report) }];
+    // a name is written only when the file says what its bodies are called (3MF/OBJ objects, the Bodies list)
+    return { ...r, names: name !== null ? solidNames(oc, r.solid, [name]) : null };
+  }
+  return knitBodies(oc, { positions, labels, surfaces, bodies, names, oriented, ids }, options);
+}
+
+/** One body (or the whole mesh, as before bodies): knitSolid's build, recovery and facet tiers. */
+function knitOne(oc, { positions, labels, surfaces, oriented = false }, { fallback = true, onProgress = null, deadline = Infinity,
   mode = 'knit', freeform = true, split = true, axes = true, axesOptions = {}, tidy: tidyUp = true, retryPlain = true,
-  progressive = true } = {}) {
+  progressive = true, firstLabel = 0 } = {}) {
   const t0 = performance.now();
   const end = now() + deadline;                  // past it: no plain retry or facet tiers
   progressive &&= fallback;                      // with no facets, the whole-part retries as before (test/reportReplay.mjs)
-  const mesh = new KnitMesh(positions, labels);
+  const mesh = new KnitMesh(positions, labels, { oriented });
   let surfs = surfaces instanceof Map ? surfaces : new Map(Object.entries(surfaces).map(([k, v]) => [Number(k), v]));
   const info = {};
   let shape = null, state = null, out, pieces = null;
@@ -125,7 +139,7 @@ export function knitSolid(oc, { positions, labels, surfaces }, { fallback = true
     return finish(out);
   }
   const unsplit = Int32Array.from(mesh.F);
-  if (freeform) Object.assign(info, addFreeform(mesh, surfs, onProgress, { split }));
+  if (freeform) Object.assign(info, addFreeform(mesh, surfs, onProgress, { split, firstLabel }));
   pieces = piecesOf(unsplit, mesh.F);
   const plainSurfs = new Map(surfs);              // the fits as they came, for the plain retry
   // shared axes and directions made exact (knit/axes.js): coaxial faces meet without a kink
@@ -250,7 +264,7 @@ export function knitSolid(oc, { positions, labels, surfaces }, { fallback = true
     tier: out.tier, bestTier: out.bestTier ?? out.tier, facetTris: out.facetTris, facetArea: out.facetArea,
     closed: !!sc.closed, valid: !!sc.valid, vol_err: sc.vol_err ?? null, free_edges: sc.free_edges ?? null,
     nonmanifold_edges: sc.nonmanifold_edges ?? null, shells: sc.shells ?? null,
-    groups: new Set(mesh.F).size, bodies: mesh.nBodies, triangles: mesh.T.length,
+    groups: new Set(mesh.F).size, meshPieces: mesh.nBodies, triangles: mesh.T.length,
     secs: Math.round((performance.now() - t0) / 100) / 10, info,
     faces: { ...faceOutcomes(labels, surfaces, state, out), pieces: pieces ? [...pieces] : [] },
   };
@@ -266,6 +280,114 @@ export function knitSolid(oc, { positions, labels, surfaces }, { fallback = true
  * ('all' when the result is the mesh itself). Group ids are the labels the knitter was given; a freeform
  * group split into pieces adds labels above them (knitSolid's report.faces.pieces: [piece, group]).
  */
+const TIERS = ['analytic', 'hybrid', 'planar', 'faceted', 'none'];
+
+/** A body's line in report.bodies. */
+function bodyRow(r) {
+  return { tier: r.tier, bestTier: r.bestTier, facetTris: r.facetTris, facetArea: r.facetArea, closed: r.closed, valid: r.valid,
+    vol_err: r.vol_err, triangles: r.triangles, groups: r.groups, secs: r.secs };
+}
+
+/** The solids of a shape, in its order. */
+function solidsIn(oc, shape) {
+  const out = [];
+  if (!shape) return out;
+  for (const ex = new oc.TopExp_Explorer_2(shape, oc.TopAbs_ShapeEnum.TopAbs_SOLID, oc.TopAbs_ShapeEnum.TopAbs_SHAPE); ex.More(); ex.Next()) out.push(ex.Current());
+  return out;
+}
+
+/** A name per solid of `shape` for one body's: its name, numbered when it came out as several solids. */
+function solidNames(oc, shape, [name]) {
+  const n = solidsIn(oc, shape).length;
+  return n > 1 ? Array.from({ length: n }, (_, k) => `${name} ${k + 1}`) : [name];
+}
+
+/**
+ * MULTIBODY (payload bodies: a body id per triangle, a void's the body around it): each body built and judged on its
+ * own (knitOne), so one body's failure or time sends no other to facets, with its share of what is left of the
+ * deadline by triangles. The solid is one compound of every body's solids, names one per solid (the payload's, else
+ * Body 1..n) for writeStep; report.bodies a line per body, report.tier the worst. onBody({id, name, solid, report})
+ * as each is done (the export worker posts it, so a hard stop keeps the finished ones); keep: Map id -> {brep,
+ * report} of bodies already built (the worker's earlier run), read instead of built.
+ */
+function knitBodies(oc, { positions, labels, surfaces, bodies, names, oriented, ids }, options) {
+  const { deadline = Infinity, onProgress = null, onBody = null, keep = null } = options;
+  const t0 = performance.now();
+  const end = now() + deadline;
+  const surfMap = surfaces instanceof Map ? surfaces : new Map(Object.entries(surfaces).map(([k, v]) => [Number(k), v]));
+  const trisOf = new Map(ids.map((id) => [id, []]));
+  for (let t = 0; t < labels.length; t++) trisOf.get(bodies[t]).push(t);
+  let next = 0;
+  for (const l of labels) next = Math.max(next, l + 1);
+  let left = labels.length;
+  const builder = new oc.BRep_Builder(), comp = new oc.TopoDS_Compound();
+  builder.MakeCompound(comp);
+  const rows = [], reports = [], solidNamesOut = [], areas = [];
+  ids.forEach((id, i) => {
+    const tris = trisOf.get(id), name = names?.[id] ?? `Body ${i + 1}`;
+    const pos = new Float64Array(tris.length * 9), lab = new Int32Array(tris.length);
+    tris.forEach((t, k) => { for (let j = 0; j < 9; j++) pos[k * 9 + j] = positions[t * 9 + j]; lab[k] = labels[t]; });
+    let area = 0;
+    for (let k = 0; k < tris.length; k++) {
+      const o = k * 9, u = [pos[o + 3] - pos[o], pos[o + 4] - pos[o + 1], pos[o + 5] - pos[o + 2]], v = [pos[o + 6] - pos[o], pos[o + 7] - pos[o + 1], pos[o + 8] - pos[o + 2]];
+      area += 0.5 * Math.hypot(u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]);
+    }
+    areas.push(area);
+    let solid, report;
+    const kept = keep?.get(id);
+    if (kept) {
+      solid = readBrep(oc, kept.brep);
+      report = kept.report;
+    } else {
+      const present = new Set(lab);
+      const sf = new Map([...surfMap].filter(([g]) => present.has(g)));
+      const share = deadline === Infinity ? Infinity : Math.max(0, end - now()) * tris.length / Math.max(left, 1);
+      ({ solid, report } = knitOne(oc, { positions: pos, labels: lab, surfaces: sf, oriented },
+        { ...options, deadline: share, firstLabel: next, onProgress: onProgress && ((p) => onProgress({ ...p, body: id })) }));
+      onBody?.({ id, name, solid, report });
+    }
+    for (const [piece] of report.faces?.pieces ?? []) next = Math.max(next, piece + 1);
+    left -= tris.length;
+    reports.push(report);
+    rows.push({ id, name, ...bodyRow(report) });
+    const ss = solidsIn(oc, solid);
+    if (!ss.length && solid) builder.Add(comp, solid);           // no solid (tier none): the best attempt, unnamed
+    ss.forEach((sh, k) => { builder.Add(comp, sh); solidNamesOut.push(ss.length > 1 ? `${name} ${k + 1}` : name); });
+  });
+  const report = mergeReports(reports, rows, areas, trisOf, ids, labels);
+  report.secs = Math.round((performance.now() - t0) / 100) / 10;
+  return { solid: comp, report, names: solidNamesOut };
+}
+
+/** knitBodies' report: the bodies' summed, report.tier the worst, report.bodies a line each. */
+function mergeReports(reports, rows, areas, trisOf, ids, labels) {
+  const worst = (k) => TIERS[Math.max(...reports.map((r) => TIERS.indexOf(r[k] ?? r.tier)))];
+  const sum = (k) => reports.reduce((s, r) => s + (r[k] ?? 0), 0);
+  const total = areas.reduce((s, a) => s + a, 0);
+  const info = { bodies: reports.length };
+  for (const r of reports) for (const [k, v] of Object.entries(r.info ?? {})) {
+    if (typeof v === 'number') info[k] = (info[k] ?? 0) + v;
+    else if (!(k in info)) info[k] = v;
+  }
+  const faces = { problems: {}, moves: [], absorbed: [], retyped: [], final: [], demoted: [], pieces: [] };
+  const allFaceted = reports.every((r) => r.faces?.demoted === 'all');
+  reports.forEach((r, i) => {
+    const f = r.faces ?? {};
+    for (const [k, v] of Object.entries(f.problems ?? {})) faces.problems[k] = [...(faces.problems[k] ?? []), ...v];
+    for (const k of ['moves', 'absorbed', 'retyped', 'final', 'pieces']) faces[k].push(...(f[k] ?? []));
+    if (!allFaceted) faces.demoted.push(...(f.demoted === 'all' ? [...new Set(trisOf.get(ids[i]).map((t) => labels[t]))] : f.demoted ?? []));
+  });
+  if (allFaceted) faces.demoted = 'all';
+  return {
+    tier: worst('tier'), bestTier: worst('bestTier'), facetTris: sum('facetTris'),
+    facetArea: Math.round((reports.reduce((s, r, i) => s + (r.facetArea ?? 0) * areas[i], 0) / Math.max(total, 1e-300)) * 1e4) / 1e4,
+    closed: reports.every((r) => r.closed), valid: reports.every((r) => r.valid),
+    vol_err: Math.max(...reports.map((r) => r.vol_err ?? 0)), free_edges: sum('free_edges'), nonmanifold_edges: sum('nonmanifold_edges'),
+    shells: sum('shells'), groups: new Set(labels).size, meshPieces: sum('meshPieces'), triangles: sum('triangles'),
+    info, faces, bodies: rows,
+  };
+}
+
 function faceOutcomes(labels, surfaces, state, out) {
   const ids = (s) => [...s].sort((a, b) => a - b);
   const faces = {
@@ -314,10 +436,10 @@ function piecesOf(before, after) {
  * Returns {ok, labels (per input triangle), surfaces (Map group -> [type, params]: the input's, retypes
  * applied, emptied groups gone), moves, info, problems}.
  */
-export function repairGroups(oc, { positions, labels, surfaces }, { budget = LOOP.BUDGET_S, maxBuilds = LOOP.MAX_BUILDS,
+export function repairGroups(oc, { positions, labels, surfaces, oriented = false }, { budget = LOOP.BUDGET_S, maxBuilds = LOOP.MAX_BUILDS,
   onProgress = null, onMove = null, split = true, axes = true, axesOptions = {} } = {}) {
   const t0 = performance.now();
-  const mesh = new KnitMesh(positions, labels);
+  const mesh = new KnitMesh(positions, labels, { oriented });          // voids as voids (one loop over every body)
   const surfs = surfaces instanceof Map ? new Map(surfaces) : new Map(Object.entries(surfaces).map(([k, v]) => [Number(k), v]));
   const out = { labels: Int32Array.from(labels), surfaces: new Map(surfs) };
   const info = {};

@@ -54,8 +54,11 @@ export class KnitMesh {
   /**
    * @param {ArrayLike<number>} positions  flat triangle soup, 9 per triangle
    * @param {ArrayLike<number>} labels     patch label per soup triangle (-1: unpainted)
+   * @param {{oriented?: boolean}} options oriented: the winding is final (material behind every normal, a void's
+   *                                       skin facing into it, js/bodies.js), so no piece is turned outward
    */
-  constructor(positions, labels) {
+  constructor(positions, labels, { oriented = false } = {}) {
+    this.oriented = oriented;
     const nSoup = Math.floor(positions.length / 9);
     const keys = new Map();
     const V = [];
@@ -163,7 +166,8 @@ export class KnitMesh {
   }
 
   _orient(T0) {
-    // Consistent winding across paired triangles, then outward (positive signed volume) per piece.
+    // Consistent winding across paired triangles, then outward (positive signed volume) per piece; with oriented
+    // input the piece keeps its winding (a void's skin faces into it, so its signed volume is negative).
     const T = T0.map((t) => t.slice());
     const seen = new Uint8Array(T.length);
     const V = this.V;
@@ -190,7 +194,7 @@ export class KnitMesh {
         const [a, b, c] = T[t];
         vol += dot(V[a], cross(V[b], V[c]));
       }
-      if (vol < 0) for (const t of comp) T[t].reverse();
+      if (vol < 0 && !this.oriented) for (const t of comp) T[t].reverse();
     }
     return T;
   }

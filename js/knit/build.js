@@ -1085,6 +1085,44 @@ export function offMeshFaces(oc, shape, mesh) {
   return faces;
 }
 
+/**
+ * The shells as solids to build: [{shell, voids}]. With oriented input (KnitMesh), a shell inside out on its own (its
+ * faces toward its inside) is a void, given to the smallest other shell that holds one of its vertices; otherwise, and
+ * for a void nothing holds, every shell is a solid of its own, turned outward as before.
+ */
+function voidsOf(oc, builder, shells, oriented) {
+  const units = shells.map((shell) => ({ shell, voids: [] }));
+  if (!oriented || shells.length < 2) return units;
+  const IN = oc.TopAbs_State.TopAbs_IN, ON = oc.TopAbs_State.TopAbs_ON;
+  const raw = shells.map((shell) => {
+    const solid = new oc.TopoDS_Solid();
+    builder.MakeSolid(solid);
+    builder.Add(solid, shell);
+    const cls = new oc.BRepClass3d_SolidClassifier_2(solid);
+    cls.PerformInfinitePoint(1e-7);
+    const g = new oc.GProp_GProps_1();
+    oc.BRepGProp.VolumeProperties_1(solid, g, false, false, false);
+    return { solid, inside: cls.State() === IN, volume: Math.abs(g.Mass()) };
+  });
+  const isVoid = new Set();
+  raw.forEach((r, i) => {
+    if (!r.inside) return;
+    const ex = new oc.TopExp_Explorer_2(shells[i], oc.TopAbs_ShapeEnum.TopAbs_VERTEX, oc.TopAbs_ShapeEnum.TopAbs_SHAPE);
+    if (!ex.More()) return;
+    const p = oc.BRep_Tool.Pnt(oc.TopoDS.Vertex_1(ex.Current()));
+    let best = -1;
+    raw.forEach((o, j) => {
+      if (j === i || o.inside || (best >= 0 && raw[best].volume <= o.volume)) return;
+      const cls = new oc.BRepClass3d_SolidClassifier_2(o.solid);
+      cls.Perform(p, 1e-7);
+      const st = cls.State();
+      if (st === IN || st === ON) best = j;
+    });
+    if (best >= 0) { units[best].voids.push(shells[i]); isVoid.add(i); }
+  });
+  return units.filter((_, i) => !isVoid.has(i));
+}
+
 export function score(oc, shape, mesh) {
   const E = enumOf(oc);
   const out = {};
@@ -1117,10 +1155,11 @@ export function score(oc, shape, mesh) {
     // A shape with a free or non-manifold edge is no valid solid, whatever its shells' repair does: checking
     // it costs as much as a build and changes nothing but the volume tiebreak (grade), so it is not checked.
     const check = out.closed;
-    const solidOf = (shell) => {
+    const solidOf = (shell, voids = []) => {
       let solid = new oc.TopoDS_Solid();
       builder.MakeSolid(solid);
       builder.Add(solid, shell);
+      for (const v of voids) builder.Add(solid, v);
       const cls = new oc.BRepClass3d_SolidClassifier_2(solid);
       let tc = performance.now();
       cls.PerformInfinitePoint(1e-7);
@@ -1132,9 +1171,22 @@ export function score(oc, shape, mesh) {
       tick('brepcheck', tc);
       return [solid, okv, ana];
     };
+    // A void (a cavity, its skin facing into it: KnitMesh oriented) is a shell of the solid around it, not a solid of
+    // its own: each shell inside out on its own is a void, and goes into the smallest of the others holding it.
+    const units = voidsOf(oc, builder, shells, mesh.oriented);
     // each shell's check as built, which patchProblems reads its faces from (one check per build, not two)
     out.analyzers = [];
-    for (const sh of shells) {
+    for (const { shell: sh, voids } of units) {
+      if (voids.length) {
+        const [solid, ok, ana] = solidOf(sh, voids);
+        if (ana) out.analyzers.push([solid, ana]);
+        valid = valid && ok;
+        const g = new oc.GProp_GProps_1();
+        oc.BRepGProp.VolumeProperties_1(solid, g, false, false, false);
+        total += g.Mass();
+        builder.Add(comp, solid);
+        continue;
+      }
       // The shell as built first: its faces follow the mesh winding, made consistent by KnitMesh, so it
       // usually needs nothing. ml/solid_rebuild.py runs ShapeFix_Shell's whole Perform, but in this
       // kernel (OCCT 7.6) its per-face pass can make a valid shell unorientable (00032949_19 gmsh: valid
