@@ -58,8 +58,13 @@ def main(argv=None) -> int:
                          "when this set trains a model that fill_eval will score)")
     args = ap.parse_args(argv)
 
-    variants = dict(pair.split("=", 1) for pair in args.variants.split(","))
-    variants = {k: Path(v) for k, v in variants.items()}
+    # name=bake_dir, or name=bake_dir@density to read that bake at its own density (SolidCraft's
+    # default "standard" export quality is stored as coarse, and is already 4x native medium's size)
+    variants, densities = {}, {}
+    for pair in args.variants.split(","):
+        name, spec = pair.split("=", 1)
+        root, _, dens = spec.partition("@")
+        variants[name], densities[name] = Path(root), dens or args.density
     args.out.mkdir(parents=True, exist_ok=True)
 
     val, train = val_split(args.bake)
@@ -72,7 +77,6 @@ def main(argv=None) -> int:
     rng = np.random.default_rng(args.seed)
     pick = [cands[i] for i in sorted(rng.choice(len(cands), size=min(args.n, len(cands)), replace=False))]
 
-    key = f"{args.density}_positions"
     manifest = []
     for f in pick:
         rel = f.relative_to(args.bake)
@@ -80,9 +84,10 @@ def main(argv=None) -> int:
         entry = {"part": f.stem, "variants": {}}
         for name, root in variants.items():
             d = np.load(root / rel)
+            key = f"{densities[name]}_positions"
             if key not in d.files or len(d[key]) > args.max_tris:
                 continue
-            fid = d[f"{args.density}_face_id"].astype(np.int32)
+            fid = d[f"{densities[name]}_face_id"].astype(np.int32)
             stem = f"{f.stem}_{name}"
             d[key].astype(np.float32).tofile(args.out / f"{stem}.pos")
             fid.tofile(args.out / f"{stem}.fid")
@@ -92,7 +97,8 @@ def main(argv=None) -> int:
             manifest.append(entry)
 
     (args.out / "manifest.json").write_text(json.dumps(
-        {"variants": list(variants), "density": args.density, "parts": manifest}, indent=1))
+        {"variants": list(variants), "density": args.density, "densities": densities, "parts": manifest},
+        indent=1))
     per = sum(len(e["variants"]) for e in manifest) / max(len(manifest), 1)
     print(f"{len(cands):,} {args.split} parts present in all of {', '.join(variants)}"
           f"{f' after excluding {len(skip)}' if skip else ''}; "

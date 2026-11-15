@@ -94,6 +94,12 @@ def main() -> int:
                     help="which half of the parts trains; the other half validates and sets the "
                          "thresholds. A second model trained on the odd half gives the even parts "
                          "held-out scores too (test/growEval.mjs --edge-wall-even)")
+    ap.add_argument("--extra-prefix", nargs="*", default=[],
+                    help="further dumps whose every row also trains, e.g. real CAD tessellators' meshes "
+                         "(test/edgeScreen.mjs on an export_fill_eval.py --split train set); same columns")
+    ap.add_argument("--report-prefix", nargs="*", default=[],
+                    help="dumps scored per mesher after each epoch FOR INFORMATION ONLY: they choose no "
+                         "model and set no threshold, so a held-out test set can be watched safely")
     args = ap.parse_args()
 
     hdr = json.load(open(args.prefix + ".json"))
@@ -129,6 +135,24 @@ def main() -> int:
         train = M[:, 0] % 2 == (0 if args.train_parity == "even" else 1)
         xtr_np, xva_np = load_cols(args.prefix, hdr["ncol"], train), load_cols(args.prefix, hdr["ncol"], ~train)
         MT, MVa = M[train], M[~train]
+    for p in args.extra_prefix:
+        eh = json.load(open(p + ".json"))
+        if eh["columns"] != hdr["columns"]:
+            ap.error(f"--extra-prefix {p} has different columns")
+        EM = np.fromfile(p + ".meta", np.int32).reshape(-1, 5)
+        # Without --val-prefix the main dump trains on one parity of parts (a cross-fitted pair of
+        # models, e.g. for the refiner's training rows), so the extra dump keeps that half too.
+        keep = None if args.val_prefix else EM[:, 0] % 2 == (0 if args.train_parity == "even" else 1)
+        xtr_np = np.concatenate([xtr_np, load_cols(p, eh["ncol"], keep)])
+        MT = np.concatenate([MT, EM if keep is None else EM[keep]])
+        print(f"  + {p}: {len(EM) if keep is None else int(keep.sum()):,} training edges ({', '.join(eh['meshers'])})")
+    reports = []
+    for p in args.report_prefix:
+        rh = json.load(open(p + ".json"))
+        if rh["columns"] != hdr["columns"]:
+            ap.error(f"--report-prefix {p} has different columns")
+        RM = np.fromfile(p + ".meta", np.int32).reshape(-1, 5)
+        reports.append((rh["meshers"], load_cols(p, rh["ncol"]), RM[:, 1], RM[:, 2].astype(np.float32), RM[:, 4] < 300))
     ytr_np = MT[:, 2].astype(np.float32)
     va_mesher, va_y, va_smooth = MVa[:, 1], MVa[:, 2].astype(np.float32), MVa[:, 4] < 300
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -178,6 +202,17 @@ def main() -> int:
             line.append(f"{m} {auc(scores[sel], va_y[sel]):.3f}/{rec:.0%}/{sm:.0%}")
         print(f"  epoch {epoch:>2}  loss {total / len(xtr):.4f}  val AUC {overall:.4f}   "
               + "  ".join(line), flush=True)
+        for meshers, rx, rmesher, ry, rsmooth in reports:
+            with torch.no_grad():
+                rs = torch.cat([net(torch.from_numpy(rx[s:s + 65536]).to(dev))
+                                for s in range(0, len(rx), 65536)]).cpu().numpy()
+            cells = []
+            for i, m in enumerate(meshers):
+                sel = rmesher == i
+                if sel.any():
+                    _thr, rec, sm = operating(rs[sel], ry[sel], rsmooth[sel], args.fpr)
+                    cells.append(f"{m} {auc(rs[sel], ry[sel]):.3f}/{rec:.0%}/{sm:.0%}")
+            print(f"            report  " + "  ".join(cells), flush=True)
         if overall > best:
             best = overall
             torch.save({"model": net.state_dict(), "columns": names, "args": vars(args),

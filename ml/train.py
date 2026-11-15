@@ -341,6 +341,9 @@ def main(argv=None) -> int:
                          "TRAINING-split parts are added to training, never validation")
     ap.add_argument("--extra-frac", type=float, default=0.5,
                     help="fraction of training files drawn from --extra-bake, all dirs together")
+    ap.add_argument("--extra-repeat", type=int, nargs="*", default=[],
+                    help="per --extra-bake dir, how many times its copies enter the draw (default 1 each): "
+                         "oversamples small sets, such as the real CAD tessellators' (real_mesh/)")
     ap.add_argument("--no-curvature", action="store_true",
                     help="zero the two curvature columns. The control arm: any gain from "
                          "curvature has to be measured against an otherwise identical run, "
@@ -437,12 +440,13 @@ def main(argv=None) -> int:
     n_extra = {}
     if args.extra_bake and args.extra_frac > 0:
         real_train = [f for f in train_files if args.bake in f.parents]
+        repeat = list(args.extra_repeat) + [1] * (len(args.extra_bake) - len(args.extra_repeat))
         pool = []
-        for extra in args.extra_bake:
+        for extra, rep in zip(args.extra_bake, repeat):
             got = [extra / f.relative_to(args.bake) for f in real_train]
             got = [g for g in got if g.exists()]
             n_extra[str(extra)] = len(got)
-            pool.extend(got)
+            pool.extend(got * rep)
         rng.shuffle(pool)
         want = int(len(train_files) * args.extra_frac / max(1e-9, 1 - args.extra_frac))
         pool = pool[:want]

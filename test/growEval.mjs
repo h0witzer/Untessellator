@@ -315,6 +315,17 @@ function score(method, mesher, part, seed, T, F, region, truth) {
 }
 
 // ── leak anatomy ─────────────────────────────────────────────────────────────────────────────────
+/** Smallest corner angle of triangle t under 5 degrees (P holds 9 floats per triangle, unwelded). */
+function isSliver(P, t) {
+  const o = 9 * t;
+  const len = (i, j) => Math.hypot(P[o + 3 * i] - P[o + 3 * j], P[o + 3 * i + 1] - P[o + 3 * j + 1], P[o + 3 * i + 2] - P[o + 3 * j + 2]);
+  const a = len(1, 2), b = len(0, 2), c = len(0, 1);
+  const s = [a, b, c].sort((p, q) => p - q);
+  if (s[2] === 0) return true;
+  const cosMin = (s[1] * s[1] + s[2] * s[2] - s[0] * s[0]) / (2 * s[1] * s[2]);
+  return cosMin > Math.cos(5 * Math.PI / 180);
+}
+
 function leakAnatomy(ctx, row, region, truth, wallPred, finalFit, type) {
   const { facets, adjacency, F, T, seed, mesher } = ctx;
   const creaseDeg = creaseFor(creaseTableFor(adjacency), type);
@@ -379,25 +390,39 @@ function leakAnatomy(ctx, row, region, truth, wallPred, finalFit, type) {
     const lowPoly = lowPolyDefaults(adjacency);
     const tolD = (lowPoly.tolScale ?? 0.5) * medianFacetSize(facets);
     const cosTol = Math.cos((lowPoly.angleTol ?? 15) * Math.PI / 180);
+    // The same counts for stop edges whose far facet is a SLIVER (smallest angle under 5 degrees, the
+    // exporter-fingerprint definition): do fills stop at the long, thin triangles CAD exports are full of?
+    const S = { crease: 0, wall: 0, misfit: 0, other: 0 };
     let crease = 0, wall = 0, misfit = 0, other = 0;
     for (const t of region) {
       if (!truth.has(t)) continue;
       for (const e of adjacency.get(t) || []) {
         const b = e.neighbor;
         if (!truth.has(b) || region.has(b)) continue;
-        if (e.angle >= creaseDeg) crease++;
-        else if (wallPred && (!wallPred.types || wallPred.types.includes(type)) && wallPred(t, e)) wall++;
+        let why;
+        if (e.angle >= creaseDeg) { crease++; why = 'crease'; }
+        else if (wallPred && (!wallPred.types || wallPred.types.includes(type)) && wallPred(t, e)) { wall++; why = 'wall'; }
         else if (ev) {
           const c = [facets.centroids[b * 3], facets.centroids[b * 3 + 1], facets.centroids[b * 3 + 2]];
           const nb = [facets.normals[b * 3], facets.normals[b * 3 + 1], facets.normals[b * 3 + 2]];
           const fitsB = Math.abs(ev.distance(c)) <= tolD && Math.abs(dot(nb, ev.normal(c))) >= cosTol;
-          if (!fitsB) misfit++; else other++;
-        } else other++;
+          if (!fitsB) { misfit++; why = 'misfit'; } else { other++; why = 'other'; }
+        } else { other++; why = 'other'; }
+        if (isSliver(ctx.P, b)) S[why]++;
       }
     }
     const reached = [...truth].filter((t) => region.has(t)).length;
+    // Facets of the true face left out, and how many of them (and of the face) are slivers, by count and area.
+    let truthSliver = 0, missed = 0, missedSliver = 0, areaTruth = 0, areaMissed = 0;
+    for (const t of truth) {
+      const sl = isSliver(ctx.P, t);
+      if (sl) truthSliver++;
+      areaTruth += facets.areas[t];
+      if (!region.has(t)) { missed++; if (sl) missedSliver++; areaMissed += facets.areas[t]; }
+    }
     stopRows.push({ mesher, type: row.truthType, crease, wall, misfit, other, recall: row.recall,
-                    faceSize: row.faceSize, reached });
+                    faceSize: row.faceSize, reached, sliverStops: S, truthSliver, missed, missedSliver,
+                    areaRecall: 1 - areaMissed / (areaTruth || 1) });
   }
 }
 
@@ -678,7 +703,7 @@ for (const [partIndex, entry] of manifest.parts.entries()) {
         const row = score(spec, mesher, partIndex, seed, T, F, out.region, truth);
         if (VERIFIER) row.vf = regionFeatures(out.region, tf, facets, adjacency, graph, thresholds.prob('fpr2'));
         if (LEAKS === spec) {
-          leakAnatomy({ facets, adjacency, F, T, seed, mesher, byFace }, row, out.region, truth,
+          leakAnatomy({ facets, adjacency, F, T, P, seed, mesher, byFace }, row, out.region, truth,
                       wallPred ?? wallFor('wall'), out.params, tf);
         }
       }
@@ -765,6 +790,22 @@ if (LEAKS) {
     console.log(`  ${mesher.padEnd(8)} ${S.length} fills; edges crease ${pc(sum('crease') / all)} wall ${pc(sum('wall') / all)}` +
       ` misfit ${pc(sum('misfit') / all)} other ${pc(sum('other') / all)}; dominant per fill ${
         [...dom].map(([k, n]) => `${k} ${pc(n / S.length)}`).join(', ')}`);
+  }
+  console.log(`\nSLIVERS (smallest angle < 5 deg) in incomplete fills: their share of the true faces' facets, of the`
+    + ` facets left out, and of the stop edges by reason (stops into slivers / all stops of that reason)`);
+  for (const mesher of manifest.variants) {
+    for (const type of ['all', 'Plane', 'Cylinder', 'Cone', 'Sphere', 'Torus']) {
+      const S = stopRows.filter((r) => r.mesher === mesher && (type === 'all' || r.type === type));
+      if (!S.length) continue;
+      const sum = (f) => S.reduce((s, r) => s + f(r), 0);
+      const why = ['crease', 'wall', 'misfit', 'other'].map((k) => {
+        const n = sum((r) => r[k]);
+        return `${k} ${n ? pc(sum((r) => r.sliverStops[k]) / n) : '   -'} of ${String(n).padStart(5)}`;
+      }).join('  ');
+      console.log(`  ${`${mesher} ${type}`.padEnd(20)} ${String(S.length).padStart(4)} fills  slivers: face ${
+        pc(sum((r) => r.truthSliver) / sum((r) => r.faceSize))}  left out ${pc(sum((r) => r.missedSliver) / sum((r) => r.missed))}` +
+        `  area recall p50 ${pc(med(S.map((r) => r.areaRecall)))}  | ${why}`);
+    }
   }
 }
 if (JSON_OUT) {
