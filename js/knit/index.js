@@ -13,7 +13,7 @@
  */
 
 import { KnitMesh } from './mesh.js';
-import { buildRepaired, facetFallback, LOOP, now } from './repair.js';
+import { buildRepaired, facetFallback, progressiveRecovery, LOOP, now } from './repair.js';
 import { buildPolyhedral, grade, tidy, better, BUILD } from './build.js';
 import { buildFacets } from '../meshCore.js';
 import { attachCurvature } from '../curvature.js';
@@ -99,15 +99,20 @@ export function addFreeform(mesh, surfaces, onProgress = null, { split = true } 
  * face on a fitted surface), hybrid / planar (some patches as facets: report.facetTris triangles,
  * report.facetArea of the area), faceted (the mesh itself), or none (no closed, valid solid of the
  * mesh's volume; the best attempt is still returned, and report says how it fails). freeform: groups with
- * no surface get a fitted B-spline first (addFreeform). No group changes type or gives facets to another:
- * that is repairGroups, which the studio runs in view. `deadline` (s): past it no plain retry or facet tier
+ * no surface get a fitted B-spline first (addFreeform). A build that is not fully analytic is mended where it
+ * fails (repair.js progressiveRecovery: other edge methods there, then facets, each place rebuilt alone while it
+ * is tried), then the planar and faceted tiers; progressive false: the whole part rebuilt plain and from the
+ * mesh's points, then the facet tiers, as before 2026-11-15. No group changes type or gives facets to another:
+ * that is repairGroups, which the studio runs in view. `deadline` (s): past it no retry, trial or facet tier
  * starts (a running OCCT call cannot be stopped, so callers that must bound the time also need a hard stop,
  * as the studio's worker timeout). mode 'faceted': the mesh as a polyhedral solid only.
  */
 export function knitSolid(oc, { positions, labels, surfaces }, { fallback = true, onProgress = null, deadline = Infinity,
-  mode = 'knit', freeform = true, split = true, axes = true, axesOptions = {}, tidy: tidyUp = true, retryPlain = true } = {}) {
+  mode = 'knit', freeform = true, split = true, axes = true, axesOptions = {}, tidy: tidyUp = true, retryPlain = true,
+  progressive = true } = {}) {
   const t0 = performance.now();
   const end = now() + deadline;                  // past it: no plain retry or facet tiers
+  progressive &&= fallback;                      // with no facets, the whole-part retries as before (test/reportReplay.mjs)
   const mesh = new KnitMesh(positions, labels);
   let surfs = surfaces instanceof Map ? surfaces : new Map(Object.entries(surfaces).map(([k, v]) => [Number(k), v]));
   const info = {};
@@ -131,10 +136,13 @@ export function knitSolid(oc, { positions, labels, surfaces }, { fallback = true
     Object.assign(info, r.info, { axes_ms: Math.round(performance.now() - ta) });
   }
   // each build's time (ms_clean, ms_plain, ms_mesh_clean, ms_mesh_plain): where a part's seconds went
+  // (BUILD.PROF: each build's problems too, probs_<name>)
   const attempt = (sf, name) => {
     const t = performance.now();
     try {
-      return buildRepaired(oc, mesh, sf, { maxBuilds: 1, onProgress });
+      const r = buildRepaired(oc, mesh, sf, { maxBuilds: 1, onProgress });
+      if (BUILD.PROF && r?.state) info[`probs_${name}`] = Object.fromEntries(Object.entries(r.state.problems).map(([k, v]) => [k, [...v].sort((x, y) => x - y)]));
+      return r;
     } catch (err) {
       info.exception = String(err?.message ?? err).slice(0, 120);
       if (globalThis.process?.env?.KNIT_DEBUG) info.exception_stack = String(err?.stack ?? '').split(/\r?\n/).slice(0, 8).join(' | ');
@@ -149,7 +157,8 @@ export function knitSolid(oc, { positions, labels, surfaces }, { fallback = true
   // time budget: clean 250, plain 254, 8 one way and 5 the other). So a clean build that is not fully
   // analytic is retried plain, time permitting, and the plain one is kept if it is.
   const clean = axes || BUILD.EXACT_EDGES || BUILD.CONTACT;
-  if (clean && retryPlain && !(r?.state?.ok) && now() < end - (deadline === Infinity ? 0 : deadline / 4)) {
+  // progressive (repair.js progressiveRecovery): those methods are tried where the part fails, not on all of it
+  if (!progressive && clean && retryPlain && !(r?.state?.ok) && now() < end - (deadline === Infinity ? 0 : deadline / 4)) {
     const saved = { ...BUILD };
     BUILD.EXACT_EDGES = false; BUILD.CONTACT = false;
     let r2 = null;
@@ -164,7 +173,7 @@ export function knitSolid(oc, { positions, labels, surfaces }, { fallback = true
   // parts need the mesh's, 2026-11-01). So a part that is still not fully analytic is built again from the points
   // the mesh has, clean then plain, time permitting, and that build is kept when it is fully analytic.
   const timeLeft = () => now() < end - (deadline === Infinity ? 0 : deadline / 4);
-  if (BUILD.SSI && !(r?.state?.ok) && timeLeft()) {
+  if (!progressive && BUILD.SSI && !(r?.state?.ok) && timeLeft()) {
     const saved = { ...BUILD };
     BUILD.SSI = false;
     let r3 = null;
@@ -181,6 +190,37 @@ export function knitSolid(oc, { positions, labels, surfaces }, { fallback = true
   if (r) { shape = r.shape; state = r.state; Object.assign(info, r.info); }
   if (state && (state.ok || !fallback)) {
     out = { shape, sc: state.sc, tier: state.ok ? 'analytic' : 'none', facetTris: 0, facetArea: 0 };
+  } else if (state && progressive && !openMesh(mesh)) {
+    const state0 = state;
+    // each place that fails mended on its own (other edge methods, then facets); the planar and faceted tiers only
+    // when no whole build of what it chose is a valid solid. The planar tier's facets: every patch but the planes.
+    let planarArea = 0, totalArea = 0;
+    for (let t = 0; t < mesh.T.length; t++) { totalArea += mesh.area[t]; if (state.surfaces.get(state.labels[t])?.[0] !== 'plane') planarArea += mesh.area[t]; }
+    const planarShare = planarArea / Math.max(totalArea, 1e-300);
+    const t = performance.now();
+    // its trials stop where the whole-part retries did, a quarter of the deadline early, to leave its whole build time
+    const recover = (maxFacetArea) => progressiveRecovery(oc, mesh, state0, shape, state0.surfaces, plainSurfs, info,
+      end - (deadline === Infinity ? 0 : deadline / 4), onProgress, { methodsMs: 4 * (info.ms_clean ?? Infinity), maxFacetArea });
+    let p = recover(planarShare);
+    info.ms_progressive = Math.round(performance.now() - t);
+    if (p.tier) { out = { shape: p.shape, sc: p.sc, tier: p.tier, facetTris: p.facetTris, facetArea: p.facetArea, demoted: p.demoted }; state = p.state; }
+    // a hybrid with more of its area as facets than the planar tier would have is the worse export: planar is tried
+    // too, and kept if it is recreated (00002311_011: 0.5% facets planar, 83% hybrid)
+    if (p.tier === 'hybrid' && p.facetArea > planarShare + 1e-4) {
+      const f = facetFallback(oc, mesh, shape, state0, info, end, { hybrid: false, faceted: false });
+      if (f.tier === 'planar' && f.facetArea < p.facetArea) { out = f; state = state0; info.planar_beat_hybrid = 1; }
+    }
+    if (!p.tier && p.overPlanar) {
+      // stopped where its facets passed the planar tier's: that tier, and if it is no solid, recovery without the bar
+      const f = facetFallback(oc, mesh, shape, state0, info, end, { hybrid: false, faceted: false });
+      if (f.tier === 'planar') out = f;
+      else {
+        info.progressive_rerun = 1;
+        p = recover(Infinity);
+        if (p.tier) { out = { shape: p.shape, sc: p.sc, tier: p.tier, facetTris: p.facetTris, facetArea: p.facetArea, demoted: p.demoted }; state = p.state; }
+      }
+    }
+    if (!p.tier && !out) out = facetFallback(oc, mesh, p.shape, p.state, info, end, { hybrid: false });
   } else if (state) {
     out = facetFallback(oc, mesh, shape, state, info, end);
   } else if (fallback) {
@@ -239,6 +279,15 @@ function faceOutcomes(labels, surfaces, state, out) {
     if (was && was !== s[0]) faces.retyped.push([g, was, s[0]]);
   }
   return faces;
+}
+
+/**
+ * Whether the mesh has a boundary (a triangle side with no partner): no build of it is a closed solid, so progressive
+ * recovery cannot find one either (all 7 of the 275 Onshape parts that are never recreated, 2 to 6,118 open sides).
+ */
+function openMesh(mesh) {
+  for (let t = 0; t < mesh.T.length; t++) for (let k = 0; k < 3; k++) if (mesh.across(t, mesh.T[t][k], mesh.T[t][(k + 1) % 3]) < 0) return true;
+  return false;
 }
 
 /** The labels addFreeform made (a split group's later pieces and its unfitted rest): Map label -> its group. */

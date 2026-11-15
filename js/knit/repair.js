@@ -9,14 +9,17 @@
  * runs it: the studio's Repair does (knit/index.js repairGroups), and each move it keeps becomes an edit
  * the user sees and can undo, so the export builds only what the view shows.
  *
- * The fallback, tried only when the loop's best is not recreated:
- *   hybrid   the patches still failing (and surfaceless ones) as facets, the rest analytic
+ * The export's own recovery, when its build is not recreated: progressiveRecovery (below) mends each place that
+ * fails on its own, other edge methods there and then facets, and only then the facet tiers:
+ *   hybrid   the patches still failing (and surfaceless ones) as facets, the rest analytic (knitSolid's
+ *            progressive false only: progressiveRecovery makes its hybrids place by place)
  *   planar   only plane patches analytic
  *   faceted  the mesh as a polyhedral solid
  */
 
-import { buildTopo, buildPolyhedral, patchProblems, grade, better, score } from './build.js';
+import { buildTopo, buildPolyhedral, patchProblems, regionProblems, grade, better, score, VARIANTS } from './build.js';
 import { distNormal, unit, sub, cross } from './geometry.js';
+import { meshTopology } from './mesh.js';
 
 export const LOOP = {
   SMALL_GROUP: 3,            // facets; a failing group this small is absorbed, never refit
@@ -271,7 +274,7 @@ function buildWithFacets(oc, mesh, labels, surfaces, demote) {
  * skipped and only the polyhedral solid is tried. Returns {shape, sc, tier, facetTris, facetArea}: tier is analytic, hybrid, planar,
  * faceted, or none (no tier recreated the part; the best of them is still returned).
  */
-export function facetFallback(oc, mesh, shape, state, info = {}, deadline = Infinity) {
+export function facetFallback(oc, mesh, shape, state, info = {}, deadline = Infinity, { hybrid = true, faceted = true } = {}) {
   const t0 = now();
   const { labels, surfaces } = state;
   const present = new Set(labels);
@@ -307,7 +310,7 @@ export function facetFallback(oc, mesh, shape, state, info = {}, deadline = Infi
   const demote = new Set();
   for (const k of KINDS) for (const g of state.problems[k] ?? []) if (present.has(g)) demote.add(g);
   for (const g of present) if (!surfaces.has(g)) demote.add(g);
-  for (let round = 0; round < FALLBACK.ROUNDS; round++) {
+  for (let round = 0; hybrid && round < FALLBACK.ROUNDS; round++) {
     const r = attempt('hybrid', demote);
     if (!r || r.g[0]) break;
     let grew = false;
@@ -315,7 +318,7 @@ export function facetFallback(oc, mesh, shape, state, info = {}, deadline = Infi
     if (!grew) break;
   }
   if (!best.g[0]) attempt('planar', new Set([...present].filter((g) => surfaces.get(g)?.[0] !== 'plane')));
-  if (!best.g[0]) {
+  if (!best.g[0] && faceted) {
     bump(info, 'fallback_faceted_tried');
     try {
       const { shape: sh } = buildPolyhedral(oc, mesh);
@@ -328,4 +331,339 @@ export function facetFallback(oc, mesh, shape, state, info = {}, deadline = Infi
   info.fallback_secs = Math.round((now() - t0) * 10) / 10;
   return { shape: best.shape, sc: best.sc, tier: best.g[0] ? best.tier : 'none', bestTier: best.tier,
            facetTris: best.n, facetArea: Math.round(best.area * 1e4) / 1e4, demoted: [...(best.demote ?? [])] };
+}
+
+// ── progressive recovery ─────────────────────────────────────────────────────────────────────────────
+//
+// The part is judged as a whole, but it fails in places: the median failing Onshape part flagged 15 of its 64
+// groups (2026-11-04). So instead of rebuilding the whole part with another edge method (plain, then the mesh's
+// own points) and then as facets, each place that fails is mended on its own, and only the places are rebuilt
+// while they are tried (buildTopo's only, judged by regionProblems). Each pass:
+//   1. edge methods: each other method (VARIANTS) on each place's groups, then on them and their neighbours; each
+//      place keeps the one that leaves the least area to facets, and a whole build judges them (undone if no better);
+//   2. facets for what that build still flags, grown round by round by the neighbours they break; a whole build
+//      judges again, and what it still flags starts the next pass (PASSES).
+// A place is problem groups that touch (share a mesh vertex); its region is them and every group touching them, so
+// every edge and corner that can change is inside it. Every place is tried in the same trial: they do not touch.
+
+export const PROGRESSIVE = { ROUNDS: 8, PASSES: 3 };
+
+/** Groups sharing a mesh vertex with each group. */
+function touching(mesh, labels) {
+  const at = new Map();
+  for (let t = 0; t < labels.length; t++) for (const v of mesh.T[t]) {
+    let s = at.get(v);
+    if (!s) at.set(v, (s = new Set()));
+    s.add(labels[t]);
+  }
+  const adj = new Map();
+  for (const s of at.values()) {
+    if (s.size < 2) continue;
+    for (const a of s) {
+      let n = adj.get(a);
+      if (!n) adj.set(a, (n = new Set()));
+      for (const b of s) if (b !== a) n.add(b);
+    }
+  }
+  return adj;
+}
+
+/** The groups of `set` in pieces that touch. */
+function piecesOfSet(set, adj) {
+  const left = new Set(set), out = [];
+  while (left.size) {
+    const [g0] = left;
+    left.delete(g0);
+    const c = [g0];
+    for (let i = 0; i < c.length; i++) for (const n of adj.get(c[i]) ?? []) if (left.has(n)) { left.delete(n); c.push(n); }
+    out.push(new Set(c));
+  }
+  return out;
+}
+
+const grown = (set, adj) => { const r = new Set(set); for (const g of set) for (const n of adj.get(g) ?? []) r.add(n); return r; };
+const problemCount = (probs) => { let n = 0; for (const v of Object.values(probs)) n += v.size; return n; };
+// breakage a whole build cannot be recreated with (a face off its mesh area or an orient clash sometimes can)
+const severe = (probs) => (probs.missing?.size ?? 0) + (probs.invalid?.size ?? 0) + (probs.open?.size ?? 0);
+const problemGroups = (probs) => { const s = new Set(); for (const k of KINDS) for (const g of probs[k] ?? []) s.add(g); return s; };
+// what to make facets of: the patches that fail themselves first. An orient flag is a pair's (one face uses the
+// edge the wrong way, so both are flagged) and mostly follows a broken neighbour: the planes around a broken
+// torus (00000890_001) went to facets with it. So orient-only patches are taken when nothing else is left, and of
+// them the ones that clash on the largest share of their edges (patchProblems' orientShare: the turned face, not
+// the neighbours around it; 00002468_000's four planes and three cylinders all flagged, one turned).
+const culprits = (probs, keep = () => true) => {
+  const s = new Set();
+  for (const k of KINDS) if (k !== 'orient') for (const g of probs[k] ?? []) if (keep(g)) s.add(g);
+  if (s.size) return s;
+  const flagged = [...(probs.orient ?? [])].filter(keep);
+  const share = probs.orientShare;
+  const top = share ? Math.max(0, ...flagged.map((g) => share.get(g) ?? 0)) : 0;
+  for (const g of flagged) if (!share || (share.get(g) ?? 0) >= 0.5 * top) s.add(g);
+  return s;
+};
+
+/** labels with every triangle of the groups in `demote` a facet label of its own (above every group). */
+function facetize(labels, surfaces, demote) {
+  if (!demote.size) return { lab: labels, sf: surfaces, facetLabels: null, base: Infinity };
+  const lab = Int32Array.from(labels);
+  let base = -Infinity;
+  for (const l of lab) base = Math.max(base, l);
+  base += 1;
+  const facetLabels = new Set();
+  let next = base;
+  for (let t = 0; t < lab.length; t++) if (demote.has(lab[t])) { lab[t] = next; facetLabels.add(next); next++; }
+  return { lab, sf: new Map([...surfaces].filter(([g]) => !demote.has(g))), facetLabels, base };
+}
+
+/**
+ * Mend the part `state` (buildRepaired's, not fully analytic) as progressive recovery does (above). surfaces are
+ * the build's; plainSurfaces the fits as they came (no shared axes), which a group mended by a plain method gets.
+ * Returns {shape, sc, state, tier (analytic, hybrid, or null when no whole build was a valid solid of the mesh's
+ * volume), facetTris, facetArea, demoted, variants, overPlanar (stopped at maxFacetArea)} with the best whole build,
+ * and counts in info. onProgress gets
+ * {builds} (the trials and whole builds so far, after the first) as buildRepaired's does. methodsMs: the time the
+ * edge-method trials of a pass may take before the rest are skipped (knitSolid: four of its first build, about what the
+ * whole-part retries cost; a place touching big planes is the whole part, 00004062_001's 1,821 groups). maxFacetArea:
+ * the share of the area past which facets are not worth it (knitSolid: the planar tier's), where recovery stops.
+ */
+export function progressiveRecovery(oc, mesh, state, shape, surfaces, plainSurfaces, info = {}, deadline = Infinity, onProgress = null,
+  { methodsMs = Infinity, maxFacetArea = Infinity } = {}) {
+  const t0 = now();
+  let builds = 1;                              // the build that failed, then every trial and whole build here
+  const labels = state.labels;
+  const adj = touching(mesh, labels);
+  let totalArea = 0;
+  const areaOf = new Map();
+  for (let t = 0; t < labels.length; t++) { totalArea += mesh.area[t]; areaOf.set(labels[t], (areaOf.get(labels[t]) ?? 0) + mesh.area[t]); }
+  // a trial's cost: the area its failing patches would take to facets (culprits), then how many problems it has
+  const cost = (r) => {
+    if (!r) return [Infinity, Infinity];
+    let a = 0;
+    for (const g of culprits(r.probs)) a += areaOf.get(g) ?? 0;
+    return [a, r.n];
+  };
+  const less = (x, y) => x[0] < y[0] - 1e-12 * totalArea || (Math.abs(x[0] - y[0]) <= 1e-12 * totalArea && x[1] < y[1]);
+  const variantOf = new Map();                 // group -> its edge method, where not BUILD's own
+  const demote = new Set();                    // groups built as facets
+  const plainish = (v) => v === 'plain' || v === 'mesh_plain';
+  const surfacesFor = (vOf, dem) => {
+    const sf = new Map(surfaces);
+    for (const [g, v] of vOf) if (plainish(v) && plainSurfaces.has(g) && !dem.has(g)) sf.set(g, plainSurfaces.get(g));
+    return sf;
+  };
+  // the mesh's topology for each set of facets, and ssi's curves for each pair, shared by every build here
+  const topos = new Map(), ssiCache = new Map();
+  const topoFor = (work, facetLabels, dem) => {
+    const key = [...dem].sort((x, y) => x - y).join(',');
+    if (!topos.has(key)) {
+      if (topos.size > 8) topos.clear();
+      topos.set(key, meshTopology(work, facetLabels ? [...work.F.keys()].filter((t) => facetLabels.has(work.F[t])) : null));
+    }
+    return topos.get(key);
+  };
+  // a trial of one region: its analytic faces built alone with the choices so far plus the trial's. Facets stay
+  // out (a plane through its own corners needs no check): the edges to them are the chords they make.
+  const trial = (region, vOf, dem) => {
+    const { lab, sf, facetLabels, base } = facetize(labels, surfacesFor(vOf, dem), dem);
+    const only = new Set([...region].filter((g) => !dem.has(g)));
+    if (!only.size) return { probs: {}, n: 0, base };
+    bump(info, 'progressive_trials');
+    onProgress?.({ builds: ++builds, ok: false });
+    try {
+      const work = mesh.withLabels(lab);
+      const r = buildTopo(oc, work, sf, { facetLabels, only, variantOf: vOf.size ? vOf : null, topo: topoFor(work, facetLabels, dem), ssiCache });
+      const probs = regionProblems(oc, r, only);
+      return { probs, n: problemCount(probs), base };
+    } catch {
+      bump(info, 'progressive_trial_exception');
+      return null;
+    }
+  };
+  // the whole part with every choice so far, judged as every build is
+  const whole = () => {
+    const { lab, sf, facetLabels, base } = facetize(labels, surfacesFor(variantOf, demote), demote);
+    const work = mesh.withLabels(lab);
+    bump(info, 'progressive_builds');
+    onProgress?.({ builds: ++builds, ok: false });
+    const r = buildTopo(oc, work, sf, { facetLabels, variantOf: variantOf.size ? variantOf : null, topo: topoFor(work, facetLabels, demote), ssiCache });
+    const checked = score(oc, r.shape, work);
+    const probs = patchProblems(oc, r.shape, r.faceOf, lab, r.ratios, checked.analyzers);
+    const { g, sc } = grade(oc, r.shape, work, probs, checked);
+    // the problems in the input's groups too (a facet's is its group's), for the conversion report
+    const groupOf = new Map();
+    if (facetLabels) for (let t = 0; t < lab.length; t++) if (lab[t] >= base) groupOf.set(lab[t], labels[t]);
+    const asGroups = Object.fromEntries(Object.entries(probs).map(([k, v]) => [k, new Set([...v].map((x) => groupOf.get(x) ?? x))]));
+    return { g, sc, shape: r.shape, probs, asGroups, base, arcs: r.info.facet_arcs ?? 0 };
+  };
+
+  const timeUp = () => now() > deadline;
+  const debug = globalThis.process?.env?.KNIT_DEBUG_PROGRESSIVE ? (...a) => console.error(`[progressive ${(now() - t0).toFixed(1)} s]`, ...a) : null;
+  const typeOf = (g) => surfaces.get(g)?.[0] ?? 'none';
+  const show = (probs) => Object.entries(probs).filter(([, v]) => v.size).map(([k, v]) => `${k}:${[...v].map((g) => `${g}${typeOf(g)[0]}`).join(',')}`).join(' ');
+
+  let best = { g: state.g, sc: state.sc, shape, demoted: new Set(), variants: new Map(), probs: state.problems, asGroups: state.problems };
+  let probs = state.problems, base = Infinity;
+  const names = (set) => [...set].map((g) => `${g}${typeOf(g)[0]}`).join(',');
+  // the groups to mend: flagged groups that are not facets yet, and groups with no surface (always facets)
+  const flaggedNow = () => {
+    const out = new Set([...problemGroups(probs)].filter((g) => g < base && !demote.has(g)));
+    for (const g of new Set(labels)) if (!surfaces.has(g) && !demote.has(g)) out.add(g);
+    return out;
+  };
+  const chosen = () => `${[...demote].sort((x, y) => x - y)}|${[...variantOf].sort((x, y) => x[0] - y[0]).join(';')}`;
+  // the part as a whole with everything chosen so far: true when it is recreated
+  let lastJudged = chosen();
+  const judge = (stage) => {
+    lastJudged = chosen();
+    let w;
+    try { w = whole(); } catch { bump(info, 'progressive_exception'); return null; }
+    debug?.(`whole build (${stage}): g ${JSON.stringify(w.g)} ${show(w.asGroups)}`);
+    if (better(w.g, best.g)) best = { ...w, demoted: new Set(demote), variants: new Map(variantOf) };
+    probs = w.probs;
+    base = w.base;
+    return !!w.g[0];
+  };
+  const within = (p, set) => {
+    const q = Object.fromEntries(Object.entries(p).map(([k, v]) => [k, new Set([...v].filter((g) => set.has(g)))]));
+    if (p.orientShare) Object.defineProperty(q, 'orientShare', { value: p.orientShare });
+    return q;
+  };
+  const triedMethods = new Set();               // groups whose edge methods were tried
+  let overPlanar = false;
+  debug?.(`start: g ${JSON.stringify(state.g)} ${show(state.problems)}`);
+  for (let pass = 0; pass < PROGRESSIVE.PASSES && !best.g[0] && !timeUp(); pass++) {
+    // 1. edge methods. Every place at once (places do not touch, so one trial over all their regions judges each in
+    // its own): BUILD's own as the regions stand, then each variant on the places' groups, then on the places and
+    // every group touching them; each place keeps what left it the least. Then the whole part judges them all, as a
+    // build with a patch still flagged can be recreated (00000715_004: built plain, one plane off its mesh area,
+    // was analytic).
+    const prevVariants = new Map(variantOf);
+    let uniform = null;                         // the one method that left the least breakage over every place
+    let places = piecesOfSet(flaggedNow(), adj).map((place) => ({ place, mine: [...place].filter((g) => surfaces.has(g)) }))
+      .filter(({ mine }) => mine.length && !mine.every((g) => triedMethods.has(g)));
+    bump(info, 'progressive_places', places.length);
+    const methodsEnd = now() + methodsMs / 1000;
+    const methodsUp = () => timeUp() || now() > methodsEnd;
+    if (places.length && !timeUp()) {
+      const dem = new Set(demote);
+      const all = new Set();
+      for (const p of places) {
+        for (const g of p.mine) triedMethods.add(g);
+        for (const g of p.place) if (!surfaces.has(g)) dem.add(g);
+        p.region = grown(p.place, adj);
+        for (const g of p.region) all.add(g);
+      }
+      const ref = trial(all, variantOf, dem);
+      debug?.(`pass ${pass}: ${places.length} places in ${all.size} groups; clean: ${ref?.n} ${ref ? show(ref.probs) : 'threw'}`);
+      const consider = (r, v, wide) => { if (r && severe(r.probs) < (uniform?.severe ?? severe(ref.probs))) uniform = { v, wide, severe: severe(r.probs) }; };
+      if (ref) {
+        for (const p of places) { const q = within(ref.probs, p.region); p.cost = cost({ probs: q, n: problemCount(q) }); p.n = problemCount(q); }
+        let open = places.filter((p) => p.n > 0);
+        for (const v of VARIANTS) {
+          if (!open.length || methodsUp()) break;
+          const vOf = new Map(variantOf);
+          for (const p of open) for (const g of p.mine) vOf.set(g, v);
+          const r = trial(all, vOf, dem);
+          debug?.(`  ${v}: ${r?.n} ${r ? show(r.probs) : 'threw'}`);
+          if (!r) continue;
+          consider(r, v, false);
+          for (const p of open) {
+            const q = within(r.probs, p.region), c = cost({ probs: q, n: problemCount(q) });
+            if (less(c, p.cost)) { p.cost = c; p.n = problemCount(q); p.choice = v; }
+          }
+          open = open.filter((p) => p.n > 0);
+        }
+        // ...and on the places with every group touching them, built one ring further out: what breaks a place can
+        // be its neighbours' surfaces (shared axes adjusted all 32 of 00009274_009's; its planes 8 and 9 failed under
+        // every method of their own and the whole part built plain was fully analytic). Kept for a place when its own
+        // region then has no problem (the whole build judges the rest: 00003838_001's two places wanted plain and
+        // wide mesh_plain, and each one's ring held the other).
+        const outerAll = new Set();
+        for (const p of open) { p.outer = grown(p.region, adj); for (const g of p.outer) outerAll.add(g); }
+        for (const v of VARIANTS) {
+          if (!open.length || methodsUp()) break;
+          const vOf = new Map(variantOf);
+          for (const p of open) for (const g of p.region) if (!dem.has(g)) vOf.set(g, v);
+          const r = trial(outerAll, vOf, dem);
+          debug?.(`  wide ${v} (${outerAll.size}): ${r?.n} ${r ? show(r.probs) : 'threw'}`);
+          if (!r) continue;
+          consider(r, v, true);
+          for (const p of open) if (!problemCount(within(r.probs, p.region))) { p.wide = v; p.n = 0; }
+          open = open.filter((p) => p.n > 0);
+        }
+        for (const p of places) {
+          if (p.wide) { for (const g of p.region) if (!dem.has(g)) variantOf.set(g, p.wide); bump(info, `progressive_wide_${p.wide}`); }
+          else if (p.choice) { for (const g of p.mine) variantOf.set(g, p.choice); bump(info, `progressive_${p.choice}`); }
+        }
+      }
+    }
+    // the methods chosen stay only if the whole part is better for them (a method can trade a failing face for orient
+    // flags that the whole build still fails on, and its facets then go elsewhere: mesh_clean on 00002299_000)
+    // Undone, the method that left the least breakage over every place is tried on them all alike (00003456_007:
+    // its places chose apart and the whole build got worse; built from the mesh's points it was recreated, every
+    // flag left a face off its area)
+    const undo = (was) => {
+      variantOf.clear();
+      for (const [g, v] of prevVariants) variantOf.set(g, v);
+      probs = was.probs;
+      base = was.base ?? Infinity;
+      lastJudged = chosen();
+    };
+    let done = false;
+    if (chosen() !== lastJudged) {
+      const was = best;
+      if (judge('methods')) break;
+      if (best === was) {
+        bump(info, 'progressive_methods_undone');
+        debug?.('  methods undone');
+        undo(was);
+        if (uniform && !timeUp()) {
+          for (const p of places) for (const g of uniform.wide ? p.region : p.mine) if (surfaces.has(g) && !demote.has(g)) variantOf.set(g, uniform.v);
+          debug?.(`  every place ${uniform.wide ? 'wide ' : ''}${uniform.v}`);
+          if (chosen() !== lastJudged) {
+            done = judge('one method');
+            if (!done && best === was) { bump(info, 'progressive_methods_undone'); undo(was); }
+            else bump(info, `progressive_uniform_${uniform.v}`);
+          }
+        }
+      }
+    }
+    if (done) break;
+    if (timeUp()) break;
+    // 2. facets for what the whole build still flags (patches that fail themselves first), grown round by round by
+    // the neighbours they break, judged in each round's region: every place at once too
+    const flagged = flaggedNow();
+    if (!flagged.size) break;
+    const fix = new Set([...flagged].filter((g) => !surfaces.has(g)));
+    for (const g of culprits(probs, (x) => flagged.has(x))) fix.add(g);
+    // more of the area as facets than the planar tier would make: no hybrid of these is the better export, and the
+    // facet builds are the slow ones (curved faces bounded by hundreds of facet sides: 33 s a build on 00009079_017)
+    const facetShare = () => { let x = 0; for (const g of new Set([...demote, ...fix])) x += areaOf.get(g) ?? 0; return x / Math.max(totalArea, 1e-300); };
+    let over = false;
+    for (let round = 0; fix.size && round < PROGRESSIVE.ROUNDS && !timeUp(); round++) {
+      if (facetShare() > maxFacetArea) { over = true; break; }
+      const dem = new Set([...demote, ...fix]);
+      const r = trial(grown(fix, adj), variantOf, dem);
+      bump(info, 'progressive_facet_rounds');
+      debug?.(`  facets ${names(fix)}: ${r?.n} ${r ? show(r.probs) : 'threw'}`);
+      if (!r || r.n === 0) break;
+      let more = false;
+      for (const g of culprits(r.probs, (x) => x < r.base && !dem.has(x))) { fix.add(g); more = true; }
+      if (!more) break;
+    }
+    if (over || facetShare() > maxFacetArea) { overPlanar = true; bump(info, 'progressive_over_planar'); debug?.('  facets past the planar tier'); break; }
+    for (const g of fix) { demote.add(g); variantOf.delete(g); }
+    // nothing new chosen: the whole build would be the last one again
+    if (chosen() === lastJudged) { bump(info, 'progressive_stalled'); break; }
+    if (judge('facets')) break;
+  }
+  let n = 0, a = 0;
+  for (let t = 0; t < labels.length; t++) if (best.demoted.has(labels[t])) { n++; a += mesh.area[t]; }
+  info.progressive_secs = Math.round((now() - t0) * 10) / 10;
+  if (best.arcs) info.progressive_facet_arcs = best.arcs;
+  if (best.variants.size) info.progressive_variant_groups = best.variants.size;
+  // every triangle a facet (a part of one group) is the faceted tier, as the old fallback called it
+  return { shape: best.shape, sc: best.sc, tier: best.g[0] ? (n === labels.length ? 'faceted' : n ? 'hybrid' : 'analytic') : null, overPlanar,
+    facetTris: n, facetArea: Math.round((a / Math.max(totalArea, 1e-300)) * 1e4) / 1e4, demoted: [...best.demoted], variants: best.variants,
+    state: { ...state, problems: best.asGroups, ok: !!best.g[0] && !n, g: best.g, sc: best.sc } };
 }

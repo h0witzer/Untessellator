@@ -9,9 +9,46 @@
  */
 
 import { cross, sub, unit, dot } from './geometry.js';
+import { weldQuantum } from '../meshCore.js';
 
 export const BODY_STRIDE = 2 ** 20;           // corner key = vertex * BODY_STRIDE + body
 const PK = 2 ** 26;                           // partner key = triangle * PK + edge id
+
+/**
+ * Open seams closed: where welding by exact coordinates leaves edges with one triangle, their vertices within the
+ * painter's weld distance of another such vertex (meshCore.js weldQuantum, a millionth of the diagonal) are made one
+ * (idx rewritten in place). A generated ring's seam differs in the last bits (cos 2 pi against cos 0): every fixture
+ * in test/fixtures was open, and no tier, the faceted one included, could make it a solid. Only open edges' vertices:
+ * welding every vertex that near merged 6 sliver triangles of 00001002_004 and opened a closed mesh.
+ */
+function sealSeams(V, idx, positions) {
+  const count = new Map();
+  const ek = (a, b) => (a < b ? a * 2 ** 26 + b : b * 2 ** 26 + a);
+  for (let t = 0; t < idx.length; t += 3) for (let k = 0; k < 3; k++) {
+    const key = ek(idx[t + k], idx[t + (k + 1) % 3]);
+    count.set(key, (count.get(key) ?? 0) + 1);
+  }
+  const open = new Set();
+  for (const [key, n] of count) if (n === 1) { open.add(Math.floor(key / 2 ** 26)); open.add(key % 2 ** 26); }
+  if (!open.size) return;
+  const tol = 1 / weldQuantum(positions);
+  const cell = (x) => Math.floor(x / tol);
+  const grid = new Map();
+  const to = new Map();
+  for (const v of [...open].sort((x, y) => x - y)) {
+    const [cx, cy, cz] = V[v].map(cell);
+    let hit = -1;
+    for (let dx = -1; dx <= 1 && hit < 0; dx++) for (let dy = -1; dy <= 1 && hit < 0; dy++) for (let dz = -1; dz <= 1 && hit < 0; dz++) {
+      for (const u of grid.get(`${cx + dx},${cy + dy},${cz + dz}`) ?? []) {
+        if (Math.hypot(V[u][0] - V[v][0], V[u][1] - V[v][1], V[u][2] - V[v][2]) <= tol) { hit = u; break; }
+      }
+    }
+    if (hit >= 0) { to.set(v, hit); continue; }
+    const key = `${cx},${cy},${cz}`;
+    (grid.get(key) ?? grid.set(key, []).get(key)).push(v);
+  }
+  if (to.size) for (let i = 0; i < idx.length; i++) idx[i] = to.get(idx[i]) ?? idx[i];
+}
 
 export class KnitMesh {
   /**
@@ -36,6 +73,7 @@ export class KnitMesh {
         idx[t * 3 + k] = i;
       }
     }
+    sealSeams(V, idx, positions);
     this.V = V;
     const T0 = [], F = [], src = [];
     for (let t = 0; t < nSoup; t++) {

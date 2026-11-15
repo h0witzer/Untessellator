@@ -4,7 +4,7 @@
  *
  * Usage:  node test/knit.mjs <mesh dir> <patch dir> <stem> [--out row.json] [--step out.step]
  *                            [--repair] [--no-fallback] [--budget 300] [--deadline s] [--faceted] [--no-split] [--no-axes]
- *                            [--no-tidy] [--no-exact-edges] [--no-contact] [--no-ssi] [--no-pinch] [--no-pcurves] [--fix-facets] [--dump-kernel dir] [--facet-audit] [--max-tol] [--no-retry]
+ *                            [--no-tidy] [--no-exact-edges] [--no-contact] [--no-ssi] [--no-pinch] [--no-pcurves] [--fix-facets] [--no-facet-arcs] [--dump-kernel dir] [--facet-audit] [--max-tol] [--no-retry] [--no-progressive] [--prof]
  *                            [--axes-opts '{"TANGENT_DEG":0}']
  *
  *   <mesh dir>   <stem>.pos (float32 triangle soup)
@@ -34,6 +34,7 @@ const NO_SPLIT = bool('--no-split');
 const NO_AXES = bool('--no-axes');
 const NO_TIDY = bool('--no-tidy');
 const NO_RETRY = bool('--no-retry');          // no plain retry of a clean build that is not analytic
+const NO_PROGRESSIVE = bool('--no-progressive');   // the whole-part retries and facet tiers, as before 2026-11-15
 const AXES_OPTS = JSON.parse(flag('--axes-opts', '{}'));
 const NO_EXACT_EDGES = bool('--no-exact-edges');
 const NO_CONTACT = bool('--no-contact');
@@ -45,12 +46,15 @@ if (NO_CONTACT) BUILD.CONTACT = false;
 if (NO_SSI) BUILD.SSI = false;
 if (NO_PINCH) BUILD.PINCH = false;
 if (NO_PCURVES) BUILD.PCURVES = false;
-if (bool('--fix-facets')) BUILD.FIX_FACETS = true;   // facets through ShapeFix with the rest, as before 2026-11-03
+if (bool('--fix-facets')) BUILD.FIX_FACETS = true;
+if (bool('--no-facet-arcs')) BUILD.FACET_ARCS = false;   // facets meet curved faces in chords, as before 2026-11-15   // facets through ShapeFix with the rest, as before 2026-11-03
 // every build's shell as handed to the kernel, before ShapeFix: <stem>.<seq>.brep (the shell), .step (it as a
 // solid) and .json (mesh volume), for test/kernelBench.mjs
 const DUMP_KERNEL = flag('--dump-kernel', null);
 // every facet of the result against its own corners and its mesh triangle (test/facetAudit.mjs): row.audit
 const FACET_AUDIT = bool('--facet-audit');
+const PROF = bool('--prof');         // row.prof: ms per build stage (build.js tick), summed over the part's builds
+if (PROF) BUILD.PROF = {};
 const MAX_TOL = bool('--max-tol');   // row.max_tol: the result's largest vertex and edge tolerance (mm)
 const NO_FALLBACK = bool('--no-fallback');
 const DEADLINE = Number(flag('--deadline', 'Infinity'));
@@ -102,7 +106,7 @@ if (DUMP_KERNEL) {
 const loadSecs = (performance.now() - t0) / 1000;
 let row;
 try {
-  const options = { fallback: !NO_FALLBACK, deadline: DEADLINE, mode: FACETED ? 'faceted' : 'knit', split: !NO_SPLIT, axes: !NO_AXES, axesOptions: AXES_OPTS, tidy: !NO_TIDY, retryPlain: !NO_RETRY };
+  const options = { fallback: !NO_FALLBACK, deadline: DEADLINE, mode: FACETED ? 'faceted' : 'knit', split: !NO_SPLIT, axes: !NO_AXES, axesOptions: AXES_OPTS, tidy: !NO_TIDY, retryPlain: !NO_RETRY, progressive: !NO_PROGRESSIVE };
   let { solid, report } = knitSolid(oc, { positions, labels, surfaces }, options);
   row = { stem: STEM, ...report, load_secs: Math.round(loadSecs * 10) / 10 };
   if (REPAIR && !FACETED && report.tier !== 'analytic') {
@@ -114,6 +118,7 @@ try {
   if (FACET_AUDIT && solid) row.audit = (await import('./facetAudit.mjs')).facetAudit(oc, solid, positions);
   if (MAX_TOL && solid) row.max_tol = (await import('./facetAudit.mjs')).maxTolerance(oc, solid);
   if (STEP && solid) writeFileSync(STEP, writeStep(oc, solid));
+  if (PROF) row.prof = Object.fromEntries(Object.entries(BUILD.PROF).map(([k, v]) => [k, Math.round(v)]));
 } catch (err) {
   row = { stem: STEM, tier: 'none', closed: false, valid: false, exception: String(err?.stack ?? err).slice(0, 300) };
 }
