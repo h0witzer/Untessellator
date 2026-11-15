@@ -436,15 +436,107 @@ function piecesOf(before, after) {
  * Returns {ok, labels (per input triangle), surfaces (Map group -> [type, params]: the input's, retypes
  * applied, emptied groups gone), moves, info, problems}.
  */
-export function repairGroups(oc, { positions, labels, surfaces, oriented = false }, { budget = LOOP.BUDGET_S, maxBuilds = LOOP.MAX_BUILDS,
-  onProgress = null, onMove = null, split = true, axes = true, axesOptions = {} } = {}) {
+export function repairGroups(oc, { positions, labels, surfaces, bodies = null, oriented = false }, options = {}) {
+  const ids = bodies ? [...new Set(bodies)].sort((a, b) => a - b) : [];
+  if (ids.length <= 1) return repairOne(oc, { positions, labels, surfaces, oriented }, options);
+  return repairBodies(oc, { positions, labels, surfaces, bodies, oriented, ids }, options);
+}
+
+/**
+ * Repair BODY BY BODY (the default with several bodies; bodies merge only when the user joins them): each body's
+ * loop alone, with its share of what is left of the budget by triangles, so no move reaches across bodies. A group
+ * painted across bodies is that group in the first body holding it and a group of its own in each other (a fresh
+ * label), split off in the studio only when a retype would otherwise reach across: a retype of a fresh part carries
+ * its triangles (a label the studio does not know is a new group), and before a retype of the original group each
+ * part still in it is split off by a retype to the type it has ({move: 'retype', split: true, group, from, to,
+ * params, changes}). Absorbs move triangles by name and need no split. Moves, labels and problems come back in the
+ * input's terms; onProgress gets body: id.
+ */
+function repairBodies(oc, { positions, labels, surfaces, bodies, oriented, ids }, options) {
+  const { budget = LOOP.BUDGET_S, onProgress = null, onMove = null } = options;
   const t0 = performance.now();
-  const mesh = new KnitMesh(positions, labels, { oriented });          // voids as voids (one loop over every body)
+  const surfMap = surfaces instanceof Map ? surfaces : new Map(Object.entries(surfaces).map(([k, v]) => [Number(k), v]));
+  const trisOf = new Map(ids.map((id) => [id, []]));
+  for (let t = 0; t < labels.length; t++) trisOf.get(bodies[t]).push(t);
+  let next = 0;
+  for (const l of labels) next = Math.max(next, l + 1);
+  for (const g of surfMap.keys()) next = Math.max(next, g + 1);
+  // groups painted across bodies: a fresh label in every body after the first that holds them
+  const firstBody = new Map(), fresh = new Map();          // fresh: `${body}|${group}` -> label
+  const runLabels = Int32Array.from(labels), freshTris = new Map(), freshOf = new Map();   // label -> [input tris], label -> group
+  for (const id of ids) for (const t of trisOf.get(id)) {
+    const g = labels[t];
+    if (g < 0) continue;
+    if (!firstBody.has(g)) firstBody.set(g, id);
+    if (firstBody.get(g) === id) continue;
+    const key = `${id}|${g}`;
+    if (!fresh.has(key)) { fresh.set(key, next); freshOf.set(next, g); freshTris.set(next, []); next++; }
+    runLabels[t] = fresh.get(key);
+    freshTris.get(fresh.get(key)).push(t);
+  }
+  const shown = new Set();                                // fresh labels the studio has been told about
+  const out = { labels: Int32Array.from(runLabels), surfaces: new Map(surfMap) };
+  for (const [f, g] of freshOf) if (surfMap.has(g)) out.surfaces.set(f, surfMap.get(g));
+  const moves = [], problems = {}, info = { bodies: ids.length }, rows = [];
+  let ok = true, left = labels.length;
+  for (const id of ids) {
+    const tris = trisOf.get(id);
+    const pos = new Float64Array(tris.length * 9), lab = new Int32Array(tris.length);
+    tris.forEach((t, k) => { for (let j = 0; j < 9; j++) pos[k * 9 + j] = positions[t * 9 + j]; lab[k] = runLabels[t]; });
+    const present = new Set(lab);
+    const sf = new Map([...out.surfaces].filter(([g]) => present.has(g)));
+    const share = Math.max(0, budget - (performance.now() - t0) / 1000) * tris.length / Math.max(left, 1);
+    const emit = (m) => { for (let i = 0; i < m.changes.length; i += 2) out.labels[m.changes[i]] = m.changes[i + 1]; onMove?.(m); };
+    const splitOff = (f) => {
+      shown.add(f);
+      const changes = [];
+      for (const t of freshTris.get(f)) if (out.labels[t] === freshOf.get(f) || out.labels[t] === f) changes.push(t, f);
+      return changes;
+    };
+    const onBodyMove = (m) => {
+      const changes = [];
+      if (m.move === 'retype' && freshTris.has(m.group) && !shown.has(m.group)) changes.push(...splitOff(m.group));
+      if (m.move === 'retype' && !freshTris.has(m.group)) {
+        for (const [f, g] of freshOf) {
+          if (g !== m.group || shown.has(f)) continue;
+          const [type, params] = out.surfaces.get(f) ?? out.surfaces.get(g) ?? [];
+          emit({ move: 'retype', split: true, group: f, from: type, to: type, params, changes: splitOff(f) });
+        }
+      }
+      for (let i = 0; i < m.changes.length; i += 2) changes.push(tris[m.changes[i]], m.changes[i + 1]);
+      emit({ ...m, changes });
+    };
+    const r = repairOne(oc, { positions: pos, labels: lab, surfaces: sf, oriented }, { ...options, budget: share, firstLabel: next,
+      onProgress: onProgress && ((p) => onProgress({ ...p, body: id })), onMove: onBodyMove });
+    tris.forEach((t, k) => { out.labels[t] = r.labels[k]; next = Math.max(next, r.labels[k] + 1); });
+    for (const g of sf.keys()) if (!r.surfaces.has(g)) out.surfaces.delete(g);
+    for (const [g, v] of r.surfaces) { out.surfaces.set(g, v); next = Math.max(next, g + 1); }
+    moves.push(...r.moves);
+    for (const [k, v] of Object.entries(r.problems)) problems[k] = [...new Set([...(problems[k] ?? []), ...v])].sort((a, b) => a - b);
+    for (const [k, v] of Object.entries(r.info)) if (typeof v === 'number') info[k] = (info[k] ?? 0) + v;
+    ok &&= r.ok;
+    left -= tris.length;
+    rows.push({ id, ok: r.ok, moves: r.moves.length, secs: r.info.secs });
+  }
+  // a fresh label no move touched is still its group
+  for (const [f, g] of freshOf) if (!shown.has(f)) {
+    for (const t of freshTris.get(f)) if (out.labels[t] === f) out.labels[t] = g;
+    out.surfaces.delete(f);
+  }
+  info.secs = Math.round((performance.now() - t0) / 100) / 10;
+  return { ok, labels: out.labels, surfaces: out.surfaces, moves, info, problems, bodies: rows };
+}
+
+/** One body's repair (or the whole mesh's, as before bodies): repairGroups' loop. */
+function repairOne(oc, { positions, labels, surfaces, oriented = false }, { budget = LOOP.BUDGET_S, maxBuilds = LOOP.MAX_BUILDS,
+  onProgress = null, onMove = null, split = true, axes = true, axesOptions = {}, firstLabel = 0 } = {}) {
+  const t0 = performance.now();
+  const mesh = new KnitMesh(positions, labels, { oriented });          // voids as voids
   const surfs = surfaces instanceof Map ? new Map(surfaces) : new Map(Object.entries(surfaces).map(([k, v]) => [Number(k), v]));
   const out = { labels: Int32Array.from(labels), surfaces: new Map(surfs) };
   const info = {};
   const unsplit = Int32Array.from(mesh.F);
-  Object.assign(info, addFreeform(mesh, surfs, onProgress, { split }));
+  Object.assign(info, addFreeform(mesh, surfs, onProgress, { split, firstLabel }));
   const pieces = piecesOf(unsplit, mesh.F);
   // Every build gets its shared axes from the groups and fits as they stand, as the export will make them:
   // the loop used to build a retype on its own fit, which the export never would (00000270_015)

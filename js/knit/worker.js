@@ -13,7 +13,8 @@
  *               mode 'faceted' for the rest); then {type: 'done', step, report, preview} or {type: 'error', message}; preview is the
  *               solid tessellated for the studio to show before saving (knit/preview.js), or null. With repair: no STEP;
  *               {type: 'move', move} for each move the loop keeps (knit/index.js repairGroups), then
- *               {type: 'done', repair: {ok, labels, surfaces: [[id, [type, params]], ...], moves, info, problems}}.
+ *               {type: 'done', repair: {ok, labels, surfaces: [[id, [type, params]], ...], moves, info, problems,
+ *               bodies?}}: with several bodies each is repaired alone (knit/index.js repairGroups), bodies a line each.
  */
 
 import { loadOcct, knitSolid, repairGroups, writeStep, brepText } from './index.js';
@@ -33,7 +34,7 @@ self.onmessage = async ({ data }) => {
     const onProgress = (p) => self.postMessage({ type: 'progress', ...p });
     if (repair) {
       self.postMessage({ type: 'status', text: 'Building the solid to find what fails…' });
-      const r = repairGroups(oc, { positions, labels, surfaces: new Map(surfaces), oriented },
+      const r = repairGroups(oc, { positions, labels, surfaces: new Map(surfaces), bodies, oriented },
         { ...options, onProgress, onMove: (move) => self.postMessage({ type: 'move', move }) });
       self.postMessage({ type: 'done', repair: { ...r, surfaces: [...r.surfaces] } });
       return;
