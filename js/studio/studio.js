@@ -618,6 +618,7 @@ async function openFile(file) {
     legend.hidden = !settings.deviation;
     empty.hidden = true;
     zoomFit();
+    for (const sel of PANEL_SCROLLERS) panelEl.querySelector(sel)?.scrollTo(0, 0);   // a new file's lists start at the top
     refreshPanel();
     const fixed = repair ? repairChanges(repair) : [];
     const left = repair ? repairLeft(repair, model.nonManifoldEdges.length) : null;
@@ -3448,6 +3449,9 @@ const groupRgb = (r) => (r.type === 'skip' ? SKIP_RGB : settings.deviation === '
   : settings.deviation === 'fit' || settings.deviation === 'deviation' ? VERDICTS[r.verdict].rgb : r.group.colour);
 
 /** The top bar, the status line and the face-group table with its fixes and inspector. */
+/** The panel's parts that scroll on their own (workbench.css: overflow auto). */
+const PANEL_SCROLLERS = ['.wb-blist', '.wb-tablewrap', '.wb-inspector'];
+
 function refreshPanel() {
   const hasMesh = !!mesh;
   const store = mesh?.store;
@@ -3544,7 +3548,7 @@ function refreshPanel() {
       ...(p.halfAngle != null ? [['Half-angle', `${((p.halfAngle * 180) / Math.PI).toFixed(2)}°`]] : []),
       ...(p.majorRadius != null ? [['Radii', `${shortLength(p.majorRadius)}, ${shortLength(p.minorRadius)}`]] : []),
     ];
-    below = `<div class="wb-inspector">
+    below = `<div class="wb-inspector" data-inspects="${r.id}">
       <h3>${typeIcon(r.type, groupRgb(r), 18)}${esc(r.name)}</h3>
       <dl class="wb-kv"><dt>Fit as</dt><dd><select id="fit-as" aria-label="Fit ${esc(r.name)} as">${fitOptions(r.type ?? 'freeform')}</select></dd>
         ${params.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('')}
@@ -3561,7 +3565,12 @@ function refreshPanel() {
   }
 
   const caret = document.activeElement?.id === 'search' ? document.activeElement.selectionStart : null;
-  const scroll = panelEl.querySelector('.wb-tablewrap')?.scrollTop ?? 0;
+  // The panel is drawn anew on most changes: each scrolled part keeps its place (the Bodies list, the group table,
+  // and the inspector while it shows the same group), so a click never sends a list back to its top.
+  const scrolled = PANEL_SCROLLERS.map((sel) => {
+    const el = panelEl.querySelector(sel);
+    return el && { top: el.scrollTop, left: el.scrollLeft, inspects: el.dataset.inspects };
+  });
   panelEl.innerHTML = `${bodiesHtml()}
     <div class="wb-phead">
       <div class="wb-ptitle"><h2>Face groups</h2><span class="wb-count">${bodySel.size ? `${rows.length.toLocaleString()} in ${esc(bodySel.size === 1 ? mesh.bodyNames[[...bodySel][0]] : `${bodySel.size} bodies`)}` : all.length.toLocaleString()}</span><span class="wb-spacer"></span>
@@ -3578,8 +3587,12 @@ function refreshPanel() {
       <thead><tr>${[['name', 'Group'], ['type', 'Type'], ['count', 'Tris', 'wb-num'], ['area', 'Area', 'wb-num wb-col-area'], ['fit', 'Fit · worst']].map(([k, l, cls]) => `<th class="${cls ?? ''}"><button type="button" data-sort="${k}">${l}${arrow(k)}</button></th>`).join('')}</tr></thead>
       <tbody>${body || '<tr><td colspan="5" class="wb-lnote">No groups yet: paint, or Auto-paint (P).</td></tr>'}</tbody></table></div>
     ${picked.length === 1 ? below : ''}`;
-  const wrap = panelEl.querySelector('.wb-tablewrap');
-  if (wrap) wrap.scrollTop = scroll;
+  PANEL_SCROLLERS.forEach((sel, i) => {
+    const el = panelEl.querySelector(sel), was = scrolled[i];
+    if (!el || !was || el.dataset.inspects !== was.inspects) return;   // another group in the inspector starts at its top
+    el.scrollTop = was.top;
+    el.scrollLeft = was.left;
+  });
   if (caret !== null) { const s = document.getElementById('search'); s.focus(); s.setSelectionRange(caret, caret); }
   const naming = panelEl.querySelector('input.wb-bname');
   if (naming) { naming.focus(); naming.setSelectionRange(naming.value.length, naming.value.length); }
