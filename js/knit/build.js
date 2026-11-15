@@ -965,6 +965,96 @@ const SHELL_FIX_MAX_FACES = 3000;
  * Closed (no free or non-manifold edges), BRepCheck-valid, and the volume against the mesh's: one solid
  * per shell, turned outward. `solid` is the compound of solids to export.
  */
+// ── on the mesh ──────────────────────────────────────────────────────────────────────────────────────
+//
+// A build can be a closed, valid solid of the mesh's volume and still not be the part: 00110180_0 (Plasticity) went
+// out hybrid with an edge 328 mm long between corners 36 mm apart, 128 mm off the mesh, under a 138 mm tolerance. Its
+// vertices and points along its edges must lie within OFF_MESH x diagonal of the mesh (score's off_mesh, grade), and
+// the faces of any that do not are flagged invalid (patchProblems), so recovery and the facet tiers rebuild them.
+export const OFF_MESH = 1e-2;
+const meshGrids = new WeakMap();
+
+/** The mesh's triangles in a grid of cells OFF_MESH x diagonal wide, for nearMesh. */
+function meshGrid(mesh) {
+  let grid = meshGrids.get(mesh.T);
+  if (grid) return grid;
+  const { V, T } = mesh, h = OFF_MESH * mesh.diag, cells = new Map();
+  const key = (i, j, k) => `${i},${j},${k}`;
+  T.forEach((tri, t) => {
+    const lo = [0, 1, 2].map((a) => Math.floor(Math.min(...tri.map((v) => V[v][a])) / h));
+    const hi = [0, 1, 2].map((a) => Math.floor(Math.max(...tri.map((v) => V[v][a])) / h));
+    for (let i = lo[0]; i <= hi[0]; i++) for (let j = lo[1]; j <= hi[1]; j++) for (let k = lo[2]; k <= hi[2]; k++) {
+      const c = key(i, j, k);
+      let l = cells.get(c);
+      if (!l) cells.set(c, (l = []));
+      l.push(t);
+    }
+  });
+  grid = { h, cells, key };
+  meshGrids.set(mesh.T, grid);
+  return grid;
+}
+
+/** Distance from p to triangle abc (Ericson's closest point). */
+function triangleDistance(p, a, b, c) {
+  const ab = sub(b, a), ac = sub(c, a), ap = sub(p, a);
+  const d1 = dot(ab, ap), d2 = dot(ac, ap);
+  if (d1 <= 0 && d2 <= 0) return norm(ap);
+  const bp = sub(p, b), d3 = dot(ab, bp), d4 = dot(ac, bp);
+  if (d3 >= 0 && d4 <= d3) return norm(bp);
+  const vc = d1 * d4 - d3 * d2;
+  if (vc <= 0 && d1 >= 0 && d3 <= 0) return norm(sub(ap, scale(ab, d1 / (d1 - d3))));
+  const cp = sub(p, c), d5 = dot(ab, cp), d6 = dot(ac, cp);
+  if (d6 >= 0 && d5 <= d6) return norm(cp);
+  const vb = d5 * d2 - d1 * d6;
+  if (vb <= 0 && d2 >= 0 && d6 <= 0) return norm(sub(ap, scale(ac, d2 / (d2 - d6))));
+  const va = d3 * d6 - d5 * d4;
+  if (va <= 0 && d4 - d3 >= 0 && d5 - d6 >= 0) return norm(sub(bp, scale(sub(c, b), (d4 - d3) / ((d4 - d3) + (d5 - d6)))));
+  const den = 1 / (va + vb + vc);
+  return norm(sub(ap, add(scale(ab, vb * den), scale(ac, vc * den))));
+}
+
+/** Whether p is within OFF_MESH x diagonal of the mesh. */
+function nearMesh(mesh, p) {
+  const { h, cells, key } = meshGrid(mesh), { V, T } = mesh;
+  const c = p.map((x) => Math.floor(x / h));
+  for (let i = -1; i <= 1; i++) for (let j = -1; j <= 1; j++) for (let k = -1; k <= 1; k++) {
+    for (const t of cells.get(key(c[0] + i, c[1] + j, c[2] + k)) ?? []) {
+      const [a, b, d] = T[t];
+      if (triangleDistance(p, V[a], V[b], V[d]) <= h) return true;
+    }
+  }
+  return false;
+}
+
+/** The faces of `shape` with a vertex or a point along an edge (a quarter, half and three quarters) off the mesh. */
+export function offMeshFaces(oc, shape, mesh) {
+  const E = enumOf(oc);
+  const m = new oc.TopTools_IndexedDataMapOfShapeListOfShape_1();
+  oc.TopExp.MapShapesAndAncestors(shape, E.EDGE, E.FACE, m);
+  const faces = [];
+  for (let i = 1; i <= m.Extent(); i++) {
+    const e = oc.TopoDS.Edge_1(m.FindKey(i));
+    if (oc.BRep_Tool.Degenerated(e)) continue;
+    const ad = new oc.BRepAdaptor_Curve_2(e);
+    const t0 = ad.FirstParameter(), t1 = ad.LastParameter();
+    let off = false;
+    for (const f of [0, 0.25, 0.5, 0.75, 1]) {
+      const q = ad.Value(t0 + f * (t1 - t0));
+      off ||= !nearMesh(mesh, [q.X(), q.Y(), q.Z()]);
+      q.delete();
+      if (off) break;
+    }
+    ad.delete();
+    if (!off) continue;
+    const lst = m.FindFromIndex(i);
+    if (lst.Size() >= 1) faces.push(lst.First_1());                 // an edge of a valid solid has one or two faces
+    if (lst.Size() >= 2) faces.push(lst.Last_1());
+  }
+  m.delete();
+  return faces;
+}
+
 export function score(oc, shape, mesh) {
   const E = enumOf(oc);
   const out = {};
@@ -1048,6 +1138,13 @@ export function score(oc, shape, mesh) {
     }
     out.valid = valid && shells.length >= 1;
     out.volume = total;
+    // on the mesh (OFF_MESH): only a solid that would otherwise pass is worth the look
+    if (out.closed && out.valid) {
+      const to = performance.now();
+      out.offFaces = offMeshFaces(oc, shape, mesh);
+      out.off_mesh = out.offFaces.length;
+      tick('off_mesh', to);
+    }
     const mv = mesh.volume();
     out.vol_err = mv ? Math.abs(total - mv) / Math.abs(mv) : null;
     out.solid = comp;
@@ -1066,7 +1163,7 @@ export const LOOP_AREA_RATIO = 1.25;   // a face this far from its patch's mesh 
  * per shell; analyzer: one check holding every face (regionProblems); boundary: edges that are no free edge
  * though only one face here uses them (a region's edges to patches outside it).
  */
-export function patchProblems(oc, result, faceOf, labels, ratios, analyzers = null, { analyzer = null, boundary = null } = {}) {
+export function patchProblems(oc, result, faceOf, labels, ratios, analyzers = null, { analyzer = null, boundary = null, offFaces = null } = {}) {
   const E = enumOf(oc);
   const tpp = performance.now();
   const ownMap = new oc.TopTools_IndexedMapOfShape_1();
@@ -1101,6 +1198,8 @@ export function patchProblems(oc, result, faceOf, labels, ratios, analyzers = nu
       invalid.add(f);
     }
   }
+  // faces with an edge off the mesh (score's offFaces): valid, but not the part
+  for (const fc of offFaces ?? []) { const f = ownerOf(fc); if (f !== undefined) invalid.add(f); }
   const edgeMap = new oc.TopTools_IndexedMapOfShape_1();
   const use = [];
   for (const fc of faces) {
@@ -1165,7 +1264,7 @@ export function regionProblems(oc, r, region) {
 export function grade(oc, shape, mesh, problems, sc = score(oc, shape, mesh)) {
   const solid = !!(sc.closed && sc.valid);
   const ve = sc.vol_err;
-  const ok = solid && ve !== null && ve < 0.01;
+  const ok = solid && ve !== null && ve < 0.01 && !sc.off_mesh;
   let nprob = 0;
   for (const v of Object.values(problems)) nprob += v.size;
   return { g: [ok ? 1 : 0, solid ? 1 : 0, -nprob, -(sc.free_edges ?? 0), -(ve ?? 1e9)], sc };
@@ -1190,7 +1289,7 @@ export const TIDY = { SMALL_FACE: 8e-4 };
 export function tidy(oc, shape, mesh, info, { smallFaces = true } = {}) {
   const E = enumOf(oc);
   const nFaces = (sh) => subShapes(oc, sh, E.FACE).length;
-  const good = (sc) => sc.closed && sc.valid && sc.vol_err !== null && sc.vol_err < 0.01;
+  const good = (sc) => sc.closed && sc.valid && sc.vol_err !== null && sc.vol_err < 0.01 && !sc.off_mesh;
   const nEdges = (sh) => subShapes(oc, sh, E.EDGE).length;
   // A pass is kept only if it loosens nothing: removing a sliver or joining edges covers the gap it leaves with
   // tolerance, 1e-5 -> 0.254 mm on 00000034_014 for one sliver, 0.004 -> 0.049 mm on 00008869_006 for 16 joined edges.

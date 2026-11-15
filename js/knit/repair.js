@@ -140,7 +140,7 @@ export function buildRepaired(oc, mesh, surfaces, { fitCandidates = null, maxBui
       const work = mesh.withLabels(labels);
       const r = buildTopo(oc, work, prepare ? prepare(labels, surfs) : surfs);
       const checked = score(oc, r.shape, work);
-      const probs = patchProblems(oc, r.shape, r.faceOf, labels, r.ratios, checked.analyzers);
+      const probs = patchProblems(oc, r.shape, r.faceOf, labels, r.ratios, checked.analyzers, { offFaces: checked.offFaces });
       const { g, sc } = grade(oc, r.shape, work, probs, checked);
       return { g, shape: r.shape, info: r.info, probs, labels, surfs, sc };
     } catch (err) {
@@ -263,7 +263,7 @@ function buildWithFacets(oc, mesh, labels, surfaces, demote) {
   const work = mesh.withLabels(lab);
   const r = buildTopo(oc, work, sf, { facetLabels });
   const checked = score(oc, r.shape, work);
-  const probs = patchProblems(oc, r.shape, r.faceOf, lab, r.ratios, checked.analyzers);
+  const probs = patchProblems(oc, r.shape, r.faceOf, lab, r.ratios, checked.analyzers, { offFaces: checked.offFaces });
   const { g, sc } = grade(oc, r.shape, work, probs, checked);
   return { g, sc, shape: r.shape, probs, base };
 }
@@ -488,7 +488,7 @@ export function progressiveRecovery(oc, mesh, state, shape, surfaces, plainSurfa
     onProgress?.({ builds: ++builds, ok: false });
     const r = buildTopo(oc, work, sf, { facetLabels, variantOf: variantOf.size ? variantOf : null, topo: topoFor(work, facetLabels, demote), ssiCache });
     const checked = score(oc, r.shape, work);
-    const probs = patchProblems(oc, r.shape, r.faceOf, lab, r.ratios, checked.analyzers);
+    const probs = patchProblems(oc, r.shape, r.faceOf, lab, r.ratios, checked.analyzers, { offFaces: checked.offFaces });
     const { g, sc } = grade(oc, r.shape, work, probs, checked);
     // the problems in the input's groups too (a facet's is its group's), for the conversion report
     const groupOf = new Map();
