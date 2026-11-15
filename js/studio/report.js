@@ -50,9 +50,12 @@ function browserName() {
  *   check       the export check's last flags ({ groups: [[id, reasons]], mesh }), or null
  *   exported    the knitter's report from the last export, { failed } when it threw, or null
  *   groupRepair the last Repair of the groups ({ ok, kept, stopped, secs, moves }), or null
+ *   since       edits to the groups since each of those ({ check, exported, repair }): a result made before the groups
+ *               last changed is said to describe earlier groups
  */
 export function conversionNumbers({ triangles, repaired, model, settings, autoPaint, groups, painted, check, exported,
-  groupRepair = null }) {
+  groupRepair = null, since = {} }) {
+  const older = (k) => (since[k] > 0 ? ` [before the last ${n(since[k])} edit${since[k] === 1 ? '' : 's'}: it describes earlier groups]` : '');
   const lines = [`browser: ${browserName()}`];
   if (!triangles) return [...lines, 'mesh: none open'].join('\n');
   lines.push(`mesh: ${n(triangles)} triangles${repaired.length ? `; repaired: ${repaired.join(', ')}` : ''}`);
@@ -74,15 +77,15 @@ export function conversionNumbers({ triangles, repaired, model, settings, autoPa
   lines.push(`groups: ${n(groups.length)}${types ? ` (${types})` : ''}; ${n(single)} of one triangle; ` +
     `${n(painted)} of ${n(triangles)} triangles painted`);
   if (check) lines.push(`export check: ${check.groups.length ? `${n(check.groups.length)} groups flagged` : 'no groups flagged'}` +
-    `${check.mesh ? `; mesh: ${check.mesh}` : ''}`);
+    `${check.mesh ? `; mesh: ${check.mesh}` : ''}${older('check')}`);
   if (!exported) lines.push('export: not run');
-  else if (exported.failed && !exported.tier) lines.push(`export: failed (${exported.failed})`);
+  else if (exported.failed && !exported.tier) lines.push(`export: failed (${exported.failed})${older('exported')}`);
   else {
     const facets = exported.facetTris ? `, ${n(exported.facetTris)} facet triangles (${pct(exported.facetArea ?? 0)} of the area)` : '';
     const open = exported.free_edges ? `, ${n(exported.free_edges)} open edges` : '';
     const why = exported.timedOut ? ', timed out' : exported.failed ? `, build failed (${exported.failed})` : '';
     lines.push(`export: tier ${exported.tier}${exported.bestTier && exported.bestTier !== exported.tier ? ` (best ${exported.bestTier})` : ''}` +
-      `${facets}${open}${why}, ${exported.secs} s`);
+      `${facets}${open}${why}, ${exported.secs} s${older('exported')}`);
     const f = exported.faces;
     if (exported.timedOut || exported.failed) {
       // the faceted rebuild ran in a fresh worker: the analytic build's verdicts went with the one it replaced
@@ -95,7 +98,7 @@ export function conversionNumbers({ triangles, repaired, model, settings, autoPa
   }
   if (groupRepair) {
     lines.push(`repair: ${groupRepair.stopped ? 'stopped' : groupRepair.ok ? 'closed solid' : 'not a solid yet'} after ` +
-      `${groupRepair.secs} s, kept ${groupRepair.kept} of ${groupRepair.moves ? groupRepair.moves.length : '?'} moves`);
+      `${groupRepair.secs} s, kept ${groupRepair.kept} of ${groupRepair.moves ? groupRepair.moves.length : '?'} moves${older('repair')}`);
   }
   return lines.join('\n');
 }
@@ -161,7 +164,7 @@ export async function fingerprint(floats) {
  * the last Repair of the groups.
  */
 export function reportJson({ page, settings, model, triangles, repair, fingerprint: print, includesMesh, autoPaint,
-  groups, placed, origins, check, exported, groupRepair = null }) {
+  groups, placed, origins, check, exported, groupRepair = null, since = {} }) {
   const flags = new Map(check?.groups ?? []);
   return {
     format: 'untessellator-report/1',
@@ -174,20 +177,22 @@ export function reportJson({ page, settings, model, triangles, repair, fingerpri
     check: check ? { mesh: check.mesh, flagged: check.groups.length } : null,
     export: exported ?? null,
     groupRepair,
+    // edits to the groups since the check, the export and the Repair: above zero, that result is of earlier groups
+    editsSince: { check: since.check ?? 0, export: since.exported ?? 0, repair: since.repair ?? 0 },
     groups: groups.map((g) => ({
       id: g.id,
       type: g.type ?? null,
       ...(placed.get(g.id) ?? {}),
       fit: g.fit ? (g.fit.params ? { residual: g.fit.relResidual ?? null } : { failed: g.fit.reason }) : null,
       origin: origins.get(g.id) ?? null,
-      flagged: flags.get(g.id) ?? null,
+      flagged: since.check > 0 ? null : flags.get(g.id) ?? null,   // a check older than the groups flags none of them
     })),
   };
 }
 
 /** The prefilled issue form: the title says the outcome, the numbers go in the form's `numbers` field. */
-export function reportUrl(numbers, { tier, groups } = {}) {
-  const outcome = tier ? `tier ${tier}` : 'not exported';
+export function reportUrl(numbers, { tier, groups, editedSince = false } = {}) {
+  const outcome = tier ? `tier ${tier}${editedSince ? ' before later edits' : ''}` : 'not exported';
   const title = `Conversion report: ${outcome}${groups ? `, ${groups} groups` : ''}`;
   const q = new URLSearchParams({ template: TEMPLATE, title, numbers });
   return `${REPORT_REPO}/issues/new?${q}`;

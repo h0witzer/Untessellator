@@ -580,6 +580,9 @@ async function openFile(file) {
              // per group its farthest triangle and its verdict ('on', 'maybe', 'off' or 'none')
              deviation: new Float32Array(model.count).fill(NaN), levels: new Float32Array(model.count * 3).fill(NO_LEVEL),
              refitted: new Set(), groupWorst: new Map(), verdicts: new Map(),
+             // edits to the groups so far: the export check, an export and a Repair remember the count they were made
+             // at, so a result older than the groups is never passed off as theirs (the report says so)
+             edits: 0,
              // how each group came to be, for the conversion report (report.js): group id -> origin
              origins: new Map() };
     active = null;
@@ -1241,6 +1244,7 @@ function refit(id, tris = null) {
   const { store } = mesh;
   const group = store.groups.get(id);
   mesh.flags.delete(id);   // a changed group is no longer the one the export check flagged
+  groupsEdited(null, id);
   if (!group || !prepared) return;
   // the deviation view recolors the group against its new surface (in the frame loop, once per frame)
   if (settings.deviation) mesh.refitted.add(id);
@@ -1252,11 +1256,23 @@ function refit(id, tris = null) {
     : { reason: result.reason ?? 'the fit failed' };
 }
 
+/**
+ * The groups changed (triangles `tris`, or group `id`'s type or fit): what was reported before describes groups that
+ * are gone. The edit count moves on (the report marks older results), and an open result card closes: its verdicts
+ * and its Save were for the build before.
+ */
+function groupsEdited(tris = null, id = null) {
+  if (!mesh) return;
+  mesh.edits++;
+  if (!resultEl.hidden) hideResult();
+}
+
 /** Push changed triangles' colours to the GPU and mark the edges for a rebuild. */
 function flushChanged() {
   if (!mesh) return;
   const changed = mesh.store.takeChanged();
   if (!changed.size) return;
+  groupsEdited(changed);
   recolor(changed);
   edgesDirty = true;
 }
@@ -1407,6 +1423,7 @@ const meshRedo = () => !!mesh?.redoMesh && mesh.redoMesh.mark === mesh.store.und
 function afterHistory() {
   // Group colours are fixed per id, but a restored group needs its triangles recoloured.
   flushChanged();
+  groupsEdited();       // an undone retype may move no triangle: still an edit, of groups anywhere
   // a restored group has its old surface back, so in the deviation view all of its triangles change
   if (settings.deviation) recolor();
   mesh.flags.clear();   // the export check's flags were for the groups as they were
@@ -1447,7 +1464,7 @@ async function exportStep({ checked = false } = {}) {
       progress('Checking the groups…');
       await new Promise((resolve) => setTimeout(resolve, 0));
       const doubts = exportDoubts(payload);
-      current.lastCheck = { groups: [...doubts.groups], mesh: doubts.mesh ?? null };   // for the conversion report
+      current.lastCheck = { groups: [...doubts.groups], mesh: doubts.mesh ?? null, edits: current.edits };   // for the conversion report
       if (doubts.groups.size || doubts.mesh) { busy.end(); offerDoubts(doubts); return; }
     }
     let result;
@@ -1470,6 +1487,7 @@ async function exportStep({ checked = false } = {}) {
     }
     const { step, report } = result;
     current.lastExport = report;                  // for the conversion report (report.js)
+    current.lastExportEdits = current.edits;
     if (!step) throw new Error('no shape came out of the build');
     // every face built on its surface: an earlier export's rejections and the check's doubts no longer hold
     // (left in place, the list kept calling groups of a finished solid rejected)
@@ -1486,7 +1504,7 @@ async function exportStep({ checked = false } = {}) {
   } catch (error) {
     if (error.name === 'AbortError') { say('Export stopped: nothing was saved'); return; }
     console.error(error);
-    current.lastExport ??= { failed: error.message };
+    if (!current.lastExport) { current.lastExport = { failed: error.message }; current.lastExportEdits = current.edits; }
     const why = failureText(error.message);
     say(`Export failed: ${why}`, true);
     showResult({
@@ -1702,7 +1720,11 @@ async function sendReport({ picture = false, withMesh = false } = {}) {
   const current = mesh;
   const { store } = current ?? {};
   const modelLabel = MODELS.find((m) => m.url === settings.model)?.label ?? settings.model;
+  // edits made since each result: a result older than the groups is reported as such, never as theirs
+  const after = (at) => (current && at != null ? current.edits - at : 0);
+  const since = { check: after(current?.lastCheck?.edits), exported: after(current?.lastExportEdits), repair: after(current?.lastRepair?.edits) };
   const numbers = conversionNumbers({
+    since,
     triangles: current?.model.count ?? 0,
     repaired: current?.repair ? repairChanges(current.repair) : [],
     model: modelLabel,
@@ -1714,7 +1736,7 @@ async function sendReport({ picture = false, withMesh = false } = {}) {
     exported: current?.lastExport ?? null,
     groupRepair: current?.lastRepair ?? null,
   });
-  const issue =(extra = '') => reportUrl(numbers + extra, { tier: current?.lastExport?.tier, groups: store?.list().length ?? 0 });
+  const issue = (extra = '') => reportUrl(numbers + extra, { tier: current?.lastExport?.tier, groups: store?.list().length ?? 0, editedSince: since.exported > 0 });
   if (!current) {
     window.open(issue(), '_blank', 'noopener');
     say('Opened a conversion report on GitHub');
@@ -1729,7 +1751,7 @@ async function sendReport({ picture = false, withMesh = false } = {}) {
       repair: current.repair, fingerprint: await fingerprint(current.geometry.attributes.position.array),
       includesMesh: withMesh, autoPaint: current.autoPaint, groups: store.list(),
       placed: placeGroups(payload.positions, payload.labels), origins: current.origins,
-      check: current.lastCheck, exported: current.lastExport, groupRepair: current.lastRepair ?? null,
+      check: current.lastCheck, exported: current.lastExport, groupRepair: current.lastRepair ?? null, since,
     });
     const files = {
       'report.json': strToU8(JSON.stringify(json, null, 1)),
@@ -2610,7 +2632,7 @@ async function repairInView() {
     warmKernel();                                 // the next build's kernel loads now
     autoRun = null;
     current.lastRepair = { ok: !!result?.ok, kept, stopped: !result, secs: Math.round((performance.now() - started) / 100) / 10,
-                           moves: result?.moves ?? null };        // for the conversion report
+                           moves: result?.moves ?? null, edits: current.edits };        // for the conversion report
     if (result) { current.flags = kernelFlags(result.problems, idOf, current.store); current.showFlags = false; }
     busy.end();
     setActive(null);
@@ -2976,7 +2998,7 @@ function replaceMesh(positions, src, label) {
     synthetic: Uint8Array.from(src, (s) => (s < 0 || old.synthetic?.[s] ? 1 : 0)),   // caps, the repair's or the edit's
     flags: new Map(), showFlags: false,
     deviation: new Float32Array(model.count).fill(NaN), levels: new Float32Array(model.count * 3).fill(NO_LEVEL),
-    refitted: new Set(), groupWorst: new Map(), verdicts: new Map(), origins: new Map(old.origins),
+    refitted: new Set(), groupWorst: new Map(), verdicts: new Map(), origins: new Map(old.origins), edits: 0,
     before: old, label,
   };
   for (let m = next, depth = 0; m; m = m.before, depth++) if (depth === MESH_UNDO) { m.before = null; break; }
