@@ -1425,18 +1425,21 @@ function groupMenu(id, event, body = -1) {
 const withRule = (items) => (items.length ? [{ separator: true }, ...items] : []);
 
 /**
- * The view items for body `b` (-1: none under the pointer) on a part of several bodies: hide it, show only it, show
- * every hidden one. View only: hidden bodies are still exported.
+ * The items for body `b` (-1: none under the pointer) on a part of several bodies: hide (or show) it, show only it,
+ * show every hidden one, and delete it. Hiding is view only (hidden bodies are still exported); Delete takes the
+ * body out of the mesh, one undo step.
  */
 function bodyItems(b) {
   if (!mesh || mesh.model.bodies.length < 2) return [];
   const items = [];
   if (b >= 0) {
     const name = mesh.bodyNames[b];
-    items.push({ id: 'body-hide', label: `Hide ${name} (Y)`, onSelect: () => hideBodies([b]) });
+    if (mesh.hiddenBodies.has(b)) items.push({ id: 'body-show', label: `Show ${name}`, onSelect: () => toggleBody(b, false) });
+    else items.push({ id: 'body-hide', label: `Hide ${name} (Y)`, onSelect: () => hideBodies([b]) });
     items.push({ id: 'body-only', label: `Show only ${name}`, onSelect: () => toggleBody(b, true) });
   }
   if (mesh.hiddenBodies.size) items.push({ id: 'body-showall', label: 'Show all bodies (Shift+Y)', onSelect: () => showAllBodies() });
+  if (b >= 0) items.push({ separator: true }, { id: 'body-delete', label: `Delete ${mesh.bodyNames[b]}`, onSelect: () => deleteBodies([b]) });
   return items;
 }
 
@@ -3256,6 +3259,24 @@ function finishRename(keep) {
   refreshPanel();
 }
 
+/**
+ * Delete bodies `ids` from the mesh, their triangles and the groups on them, as one undo step (a mesh edit: the
+ * export result and every check go with the mesh before). The last body cannot go.
+ */
+function deleteBodies(ids) {
+  if (!mesh || !ids.length) return;
+  if (stroke || autoRun) { say('Finish or cancel (Esc) the stroke or auto-paint first', true); return; }
+  if (busy.onStop) { say('Stop the export first (Esc), or let it finish', true); return; }
+  const { model } = mesh;
+  if (ids.length >= model.bodies.length) { say('That is every body: keep at least one (open another file to start over)', true); return; }
+  const names = ids.map((b) => mesh.bodyNames[b]);
+  const doomed = new Set();
+  for (let t = 0; t < model.count; t++) if (ids.includes(model.bodyOf[t])) doomed.add(t);
+  const what = names.length <= 3 ? names.join(', ') : `${names.length} bodies`;
+  deleteTriangles(doomed, `Delete ${what}`);
+  say(`Deleted ${what} (one undo step: Ctrl+Z brings ${names.length === 1 ? 'it' : 'them'} back)`);
+}
+
 /** Union bodies `ids` into one (Manifold, in the mesh fix worker), as one undo step. */
 async function joinBodies(ids) {
   if (!mesh || stroke || autoRun || ids.length < 2) return;
@@ -3319,6 +3340,9 @@ function bodiesHtml() {
       <button type="button" class="wb-btn wb-small" data-act="body-zoom">Zoom to</button>
       <button type="button" class="wb-btn wb-small" data-act="body-solo" title="Hide every other body (view only)">Show only</button>
       ${picked.length > 1 ? '<button type="button" class="wb-btn wb-small" data-act="body-join" title="Union them into one body; one undo step">Join</button>' : ''}
+      ${picked.length < model.bodies.length
+        ? `<button type="button" class="wb-btn wb-small" data-act="body-delete" title="Take ${picked.length === 1 ? 'it' : 'them'} out of the mesh, with ${picked.length === 1 ? 'its' : 'their'} groups (Delete); one undo step">Delete</button>`
+        : '<button type="button" class="wb-btn wb-small" disabled title="Every body is picked: keep at least one">Delete</button>'}
       <button type="button" class="wb-btn wb-small" data-act="body-clear">Clear</button></div>` : '';
   return `<div class="wb-bodies">
     <div class="wb-ptitle"><h2>Bodies</h2><span class="wb-count">${model.bodies.length}</span><span class="wb-spacer"></span>
@@ -3592,6 +3616,7 @@ panelEl.addEventListener('click', (event) => {
   else if (d.act === 'body-solo') { mesh.hiddenBodies = new Set(mesh.model.bodies.map((_, b) => b).filter((b) => !bodySel.has(b))); applyHidden(); refreshPanel(); }
   else if (d.act === 'body-showall') showAllBodies();
   else if (d.act === 'body-join') joinBodies([...bodySel].sort((a, b) => a - b));
+  else if (d.act === 'body-delete') deleteBodies([...bodySel].sort((a, b) => a - b));
   else if (d.act === 'body-clear') { bodySel = new Set(); edgesDirty = true; requestRender(); refreshPanel(); }
   else if (d.act === 'fix-find') findFixes();
   else if (d.act === 'mfix-apply') applyMeshFixes();
@@ -3632,6 +3657,8 @@ panelEl.addEventListener('dblclick', (event) => {
   zoomTo(new Set([id]));
 });
 panelEl.addEventListener('contextmenu', (event) => {
+  const bodyRow = event.target.closest('li.wb-b');
+  if (bodyRow && mesh && !event.target.closest('input')) { event.preventDefault(); bodyMenu(Number(bodyRow.dataset.body), event); return; }
   const tr = event.target.closest('tr.wb-g');
   if (!tr || !mesh) return;
   event.preventDefault();
@@ -3864,6 +3891,7 @@ window.addEventListener('keydown', (event) => {
   }
   else if (event.key === ' ') { event.preventDefault(); setActive(null); }
   else if ((event.key === 'Delete' || event.key === 'Backspace') && active !== null) deleteGroup(active);
+  else if ((event.key === 'Delete' || event.key === 'Backspace') && bodySel.size && mesh) deleteBodies([...bodySel].sort((a, b) => a - b));   // no active group: the bodies picked in the list
   else if (event.key === '[' || event.key === ']') {
     settings.brushPx = Math.min(64, Math.max(3, Math.round(settings.brushPx * (event.key === ']' ? 1.25 : 0.8))));
     refreshPanel();
