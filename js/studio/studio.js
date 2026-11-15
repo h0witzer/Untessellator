@@ -1402,7 +1402,8 @@ function merge(from, into) {
   });
 }
 
-function groupMenu(id, event) {
+/** The right-click menu on group `id`, in body `body` (the triangle clicked): its fit, merge and delete, then the body's view items. */
+function groupMenu(id, event, body = -1) {
   const { store } = mesh;
   const group = store.groups.get(id);
   if (!group) return;
@@ -1417,7 +1418,32 @@ function groupMenu(id, event) {
     { id: 'merge', label: canMerge ? `Merge into ${store.name(active)}` : 'Merge into the active group', disabled: !canMerge, onSelect: () => merge(id, active) },
     { separator: true },
     { id: 'delete', label: 'Delete group', onSelect: () => deleteGroup(id) },
+    ...withRule(bodyItems(body)),
   ], { at: { x: event.clientX, y: event.clientY }, compact: true });
+}
+
+const withRule = (items) => (items.length ? [{ separator: true }, ...items] : []);
+
+/**
+ * The view items for body `b` (-1: none under the pointer) on a part of several bodies: hide it, show only it, show
+ * every hidden one. View only: hidden bodies are still exported.
+ */
+function bodyItems(b) {
+  if (!mesh || mesh.model.bodies.length < 2) return [];
+  const items = [];
+  if (b >= 0) {
+    const name = mesh.bodyNames[b];
+    items.push({ id: 'body-hide', label: `Hide ${name} (Y)`, onSelect: () => hideBodies([b]) });
+    items.push({ id: 'body-only', label: `Show only ${name}`, onSelect: () => toggleBody(b, true) });
+  }
+  if (mesh.hiddenBodies.size) items.push({ id: 'body-showall', label: 'Show all bodies (Shift+Y)', onSelect: () => showAllBodies() });
+  return items;
+}
+
+/** The right-click menu off the groups: on an unpainted face or on empty space, the body's view items. */
+function bodyMenu(b, event) {
+  const items = bodyItems(b);
+  if (items.length) ui.openMenu(items, { at: { x: event.clientX, y: event.clientY }, compact: true });
 }
 
 function undo() {
@@ -3156,6 +3182,43 @@ function toggleBody(b, only) {
   say(only ? `Showing only ${name}` : mesh.hiddenBodies.has(b) ? `${name} hidden: it is still exported` : `${name} shown`);
 }
 
+/** Hide bodies `ids` (view only): from the viewport's menu and Y. */
+function hideBodies(ids) {
+  ids = ids.filter((b) => !mesh.hiddenBodies.has(b));
+  if (!ids.length) return;
+  for (const b of ids) mesh.hiddenBodies.add(b);
+  applyHidden();
+  setHover(null);         // the hover outline may be on a body now hidden
+  refreshPanel();
+  const what = ids.length === 1 ? `${mesh.bodyNames[ids[0]]} hidden` : `${ids.length} bodies hidden`;
+  say(`${what}: still exported; Shift+Y shows every hidden body`);
+}
+
+/** Show every hidden body: the list's Show all, the viewport's menu and Shift+Y. */
+function showAllBodies() {
+  const n = mesh.hiddenBodies.size;
+  if (!n) { say('No body is hidden'); return; }
+  mesh.hiddenBodies = new Set();
+  applyHidden();
+  refreshPanel();
+  say(n === 1 ? 'The hidden body is shown' : `${n} hidden bodies shown`);
+}
+
+/**
+ * Y hides the body under the pointer (away from the part: the bodies picked in the list); Shift+Y shows every hidden
+ * body. Only on a part of several bodies, and not in the STEP preview or during a stroke or auto-paint.
+ */
+function bodyKey(show) {
+  if (!mesh || stroke || autoRun) return;
+  if (mesh.model.bodies.length < 2) { say('This part is one body: Y and Shift+Y hide and show bodies on parts with several'); return; }
+  if (previewing) { say('This is the STEP preview: go back to editing (Esc) to hide or show bodies'); return; }
+  if (show) { showAllBodies(); return; }
+  const under = cursor ? renderer.pick(cursor.x * dpr(), cursor.y * dpr(), 0).centre : -1;
+  const ids = under >= 0 ? [mesh.model.bodyOf[under]] : [...bodySel];
+  if (!ids.some((b) => !mesh.hiddenBodies.has(b))) { say('Point at a body and press Y to hide it; Shift+Y shows every hidden body'); return; }
+  hideBodies(ids);
+}
+
 /** A click on a body's row: pick it (again: unpick); with Ctrl, Cmd or Shift, add or remove it. */
 function pickBody(b, event) {
   if (event.ctrlKey || event.metaKey || event.shiftKey) { if (bodySel.has(b)) bodySel.delete(b); else bodySel.add(b); }
@@ -3248,7 +3311,7 @@ function bodiesHtml() {
       ? `<input class="wb-bname" value="${esc(bodyRename.draft)}" aria-label="Name of ${esc(name)}" spellcheck="false">`
       : `<span class="wb-bn" data-rename="${b}" title="Double-click to rename">${esc(name)}</span>`;
     return `<li class="wb-b${hidden ? ' wb-b--hidden' : ''}" data-body="${b}" aria-selected="${bodySel.has(b)}" title="${esc(`${name}: ${what}`)}">
-      <button type="button" class="wb-eye" data-eye="${b}" aria-pressed="${!hidden}" aria-label="${hidden ? 'Show' : 'Hide'} ${esc(name)}" title="${hidden ? 'Show' : 'Hide'} ${esc(name)} (Alt-click: show only this one). Hidden bodies are still exported">${ui.iconMarkup(hidden ? 'eyeOff' : 'eye', { className: 'wb-ticon' })}</button>
+      <button type="button" class="wb-eye" data-eye="${b}" aria-pressed="${!hidden}" aria-label="${hidden ? 'Show' : 'Hide'} ${esc(name)}" title="${hidden ? 'Show' : 'Hide'} ${esc(name)} (Alt-click: show only this one). In the view, Y hides the body under the pointer and Shift+Y shows every hidden one. Hidden bodies are still exported">${ui.iconMarkup(hidden ? 'eyeOff' : 'eye', { className: 'wb-ticon' })}</button>
       ${label}<span class="wb-bc">${plural(s.groups.size, 'group')} · ${pct}% painted</span><span class="wb-br">${bodyResultCell(results.get(b))}</span></li>`;
   });
   const picked = [...bodySel];
@@ -3259,7 +3322,7 @@ function bodiesHtml() {
       <button type="button" class="wb-btn wb-small" data-act="body-clear">Clear</button></div>` : '';
   return `<div class="wb-bodies">
     <div class="wb-ptitle"><h2>Bodies</h2><span class="wb-count">${model.bodies.length}</span><span class="wb-spacer"></span>
-      ${mesh.hiddenBodies.size ? `<button type="button" class="wb-btn wb-small" data-act="body-showall">Show all</button>` : ''}</div>
+      ${mesh.hiddenBodies.size ? `<button type="button" class="wb-btn wb-small" data-act="body-showall" title="Show every hidden body (Shift+Y)">Show all</button>` : ''}</div>
     <ul class="wb-blist">${rows.join('')}</ul>${bar}</div>`;
 }
 
@@ -3527,7 +3590,7 @@ panelEl.addEventListener('click', (event) => {
   else if (el.matches('tr.wb-g')) selectGroup(Number(d.group), event);
   else if (d.act === 'body-zoom') zoomToBodies([...bodySel]);
   else if (d.act === 'body-solo') { mesh.hiddenBodies = new Set(mesh.model.bodies.map((_, b) => b).filter((b) => !bodySel.has(b))); applyHidden(); refreshPanel(); }
-  else if (d.act === 'body-showall') { mesh.hiddenBodies = new Set(); applyHidden(); refreshPanel(); }
+  else if (d.act === 'body-showall') showAllBodies();
   else if (d.act === 'body-join') joinBodies([...bodySel].sort((a, b) => a - b));
   else if (d.act === 'body-clear') { bodySel = new Set(); edgesDirty = true; requestRender(); refreshPanel(); }
   else if (d.act === 'fix-find') findFixes();
@@ -3764,7 +3827,9 @@ canvas.addEventListener('pointerup', (event) => {
     if (press.moved <= 4 && mesh && !previewing) {
       const point = devicePoint(event);
       const { centre } = renderer.pick(point.x, point.y, 0);
-      if (centre >= 0 && mesh.store.owner[centre] >= 0) groupMenu(mesh.store.owner[centre], event);
+      const body = centre >= 0 ? mesh.model.bodyOf[centre] : -1;
+      if (centre >= 0 && mesh.store.owner[centre] >= 0) groupMenu(mesh.store.owner[centre], event, body);
+      else bodyMenu(body, event);
     }
     return;
   }
@@ -3812,6 +3877,7 @@ window.addEventListener('keydown', (event) => {
   else if (key === 'e' && !mod) setTool('erase');
   else if (key === 'd' && !mod) setTool('delete');
   else if (key === 'p' && !mod) runAutoPaint();
+  else if (key === 'y' && !mod) bodyKey(event.shiftKey);
   else if (!mod && event.key >= '1' && event.key <= String(FILL_TYPES.length)) setType(FILL_TYPES[Number(event.key) - 1]);
   else if (event.key === 'Alt') event.preventDefault();   // keep Alt from reaching a browser menu
 });
