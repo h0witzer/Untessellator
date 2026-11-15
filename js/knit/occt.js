@@ -36,8 +36,13 @@ export function loadOcct({ onStatus } = {}) {
   return loading;
 }
 
-/** STEP AP214 text for a shape. */
-export function writeStep(oc, shape) {
+/**
+ * STEP AP214 text for a shape. names: one per solid of `shape` (in its order): the file is then one product, `part`,
+ * with each solid a MANIFOLD_SOLID_BREP of that name (XCAF sub-shape names, which CAD programs show as body names).
+ * Without names, the plain writer, as before.
+ */
+export function writeStep(oc, shape, { names = null, part = 'Part' } = {}) {
+  if (names) return writeNamed(oc, shape, names, part);
   const writer = new oc.STEPControl_Writer_1();
   const st = writer.Transfer(shape, oc.STEPControl_StepModelType.STEPControl_AsIs, true, new oc.Message_ProgressRange_1());
   if (st !== oc.IFSelect_ReturnStatus.IFSelect_RetDone) throw new Error('STEP transfer failed');
@@ -46,5 +51,32 @@ export function writeStep(oc, shape) {
   const text = oc.FS.readFile(path, { encoding: 'utf8' });
   try { oc.FS.unlink(path); } catch { /* the file is in memory; nothing to clean */ }
   writer.delete();
+  return text;
+}
+
+function writeNamed(oc, shape, names, part) {
+  const solids = [];
+  for (const ex = new oc.TopExp_Explorer_2(shape, oc.TopAbs_ShapeEnum.TopAbs_SOLID, oc.TopAbs_ShapeEnum.TopAbs_SHAPE); ex.More(); ex.Next()) solids.push(ex.Current());
+  // the sub-shape names are written only when this is set before the document and the writer exist
+  oc.STEPCAFControl_Controller.Init();
+  oc.Interface_Static.SetIVal('write.stepcaf.subshapes.name', 1);
+  const doc = new oc.Handle_TDocStd_Document_2(new oc.TDocStd_Document(new oc.TCollection_ExtendedString_1()));
+  const tool = oc.XCAFDoc_DocumentTool.ShapeTool(doc.get().Main()).get();
+  const top = tool.AddShape(shape, false, false);
+  oc.TDataStd_Name.Set_1(top, new oc.TCollection_ExtendedString_2(part, true));
+  solids.forEach((s, i) => {
+    const label = tool.AddSubShape_1(top, s);
+    if (!label.IsNull()) oc.TDataStd_Name.Set_1(label, new oc.TCollection_ExtendedString_2(names[i] ?? `Body ${i + 1}`, true));
+  });
+  const writer = new oc.STEPCAFControl_Writer_1();
+  writer.SetNameMode(true);
+  // multi null: one file (an empty string writes each product to a file of its own)
+  if (!writer.Transfer_1(doc, oc.STEPControl_StepModelType.STEPControl_AsIs, null, new oc.Message_ProgressRange_1())) throw new Error('STEP transfer failed');
+  const path = `/tmp/knit-${Date.now()}.step`;
+  if (writer.Write(path) !== oc.IFSelect_ReturnStatus.IFSelect_RetDone) throw new Error('STEP write failed');
+  const text = oc.FS.readFile(path, { encoding: 'utf8' });
+  try { oc.FS.unlink(path); } catch { /* the file is in memory; nothing to clean */ }
+  writer.delete();
+  try { doc.get().Close(); } catch { /* not bound in every build */ }
   return text;
 }
