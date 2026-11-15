@@ -969,7 +969,7 @@ const SHELL_FIX_MAX_FACES = 3000;
 //
 // A build can be a closed, valid solid of the mesh's volume and still not be the part: 00110180_0 (Plasticity) went
 // out hybrid with an edge 328 mm long between corners 36 mm apart, 128 mm off the mesh, under a 138 mm tolerance. Its
-// vertices and points along its edges must lie within OFF_MESH x diagonal of the mesh (score's off_mesh, grade), and
+// vertices, points along its edges and points inside its faces must lie within OFF_MESH x diagonal of the mesh (score's off_mesh, grade), and
 // the faces of any that do not are flagged invalid (patchProblems), so recovery and the facet tiers rebuild them.
 export const OFF_MESH = 1e-2;
 const meshGrids = new WeakMap();
@@ -1027,7 +1027,12 @@ function nearMesh(mesh, p) {
   return false;
 }
 
-/** The faces of `shape` with a vertex or a point along an edge (a quarter, half and three quarters) off the mesh. */
+/**
+ * The faces of `shape` with a vertex or a point along an edge (a quarter, half and three quarters) off the mesh, or a
+ * point inside them: a 3 x 3 grid over the face's (u, v) bounds, the points the face holds. A face can bulge between
+ * good edges (00129368_1's torus 11: every edge on the mesh, half of it up to 2.2 mm off on a 55 mm part). Facets
+ * (planes of three edges, through mesh corners) are not sampled inside.
+ */
 export function offMeshFaces(oc, shape, mesh) {
   const E = enumOf(oc);
   const m = new oc.TopTools_IndexedDataMapOfShapeListOfShape_1();
@@ -1052,6 +1057,31 @@ export function offMeshFaces(oc, shape, mesh) {
     if (lst.Size() >= 2) faces.push(lst.Last_1());
   }
   m.delete();
+  const PLANE = oc.GeomAbs_SurfaceType.GeomAbs_Plane;
+  for (const fc of subShapes(oc, shape, E.FACE)) {
+    const face = oc.TopoDS.Face_1(fc);
+    const sa = new oc.BRepAdaptor_Surface_2(face, true);
+    if (sa.GetType() === PLANE && subShapes(oc, face, E.EDGE).length <= 3) { sa.delete(); continue; }
+    const u0 = sa.FirstUParameter(), u1 = sa.LastUParameter(), v0 = sa.FirstVParameter(), v1 = sa.LastVParameter();
+    const cls = new oc.BRepTopAdaptor_FClass2d(face, 1e-9);
+    let off = false;
+    for (const fu of [0.25, 0.5, 0.75]) {
+      for (const fv of [0.25, 0.5, 0.75]) {
+        const uv = new oc.gp_Pnt2d_3(u0 + fu * (u1 - u0), v0 + fv * (v1 - v0));
+        if (cls.Perform(uv, false) === E.IN) {
+          const p = sa.Value(uv.X(), uv.Y());
+          off = !nearMesh(mesh, [p.X(), p.Y(), p.Z()]);
+          p.delete();
+        }
+        uv.delete();
+        if (off) break;
+      }
+      if (off) break;
+    }
+    cls.delete();
+    sa.delete();
+    if (off) faces.push(fc);
+  }
   return faces;
 }
 
