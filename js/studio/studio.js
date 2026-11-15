@@ -1274,12 +1274,20 @@ function refit(id, tris = null) {
 /**
  * The groups changed (triangles `tris`, or group `id`'s type or fit): what was reported before describes groups that
  * are gone. The edit count moves on (the report marks older results), and an open result card closes: its verdicts
- * and its Save were for the build before.
+ * and its Save were for the build before. The bodies the change touches lose their export result.
  */
 function groupsEdited(tris = null, id = null) {
   if (!mesh) return;
   mesh.edits++;
   if (!resultEl.hidden) hideResult();
+  if (mesh.bodyResults && !tris && id === null) mesh.bodyResults = null;   // where unknown: every body's
+  else if (mesh.bodyResults) {
+    const { bodyOf } = mesh.model;
+    const touched = new Set();
+    if (tris) for (const t of tris) touched.add(bodyOf[t]);
+    if (id !== null) for (const t of mesh.store.triangles(id)) touched.add(bodyOf[t]);
+    mesh.bodyResults = mesh.bodyResults.filter((r) => !touched.has(r.id));
+  }
 }
 
 /** Push changed triangles' colours to the GPU and mark the edges for a rebuild. */
