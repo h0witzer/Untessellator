@@ -616,7 +616,7 @@ async function openFile(file) {
     zoomFit();
     refreshPanel();
     const fixed = repair ? repairChanges(repair) : [];
-    const left = repair ? repairLeft(repair) : null;
+    const left = repair ? repairLeft(repair, model.nonManifoldEdges.length) : null;
     say([`${file.name}: ${model.count.toLocaleString()} triangles`, ...(fixed.length ? [`repaired: ${fixed.join(', ')}`] : []),
       ...(left ? [left] : [])].join(' · '), !!left);
     // The geometry kernel starts loading in a worker now, so the first export doesn't wait for it.
@@ -642,7 +642,7 @@ function repairChanges(r) {
   const n = (x) => x.toLocaleString();
   const out = [];
   if (r.dup_same) out.push(`${n(r.dup_same)} duplicate triangles removed`);
-  if (r.dup_walls) out.push(`${n(r.dup_walls)} walls between touching bodies removed`);
+  if (r.dup_walls) out.push(`${n(r.dup_walls)} walls of no thickness inside the part removed`);
   if (r.collapsed + r.needles) out.push(`${n(r.collapsed + r.needles)} zero-area triangles removed`);
   if (r.zipped) out.push(`${n(r.zipped)} cracks closed`);
   if (r.holes_capped) out.push(`${n(r.holes_capped)} hole${r.holes_capped > 1 ? 's' : ''} capped`);
@@ -651,10 +651,10 @@ function repairChanges(r) {
   return out;
 }
 
-/** What repairMesh could not fix and the export will meet, or null. */
-function repairLeft(r) {
+/** What repairMesh could not fix and the export will meet, or null (`tangled`: edges on 3+ triangles left unpaired). */
+function repairLeft(r, tangled = 0) {
   const parts = [];
-  if (r.nonmanifold_edges) parts.push(`${plural(r.nonmanifold_edges, 'edge')} shared by 3 or more triangles (bodies touching)`);
+  if (tangled) parts.push(`${plural(tangled, 'edge')} shared by 3 or more triangles`);
   if (r.holes_left) parts.push(`${r.holes_left} hole${r.holes_left > 1 ? 's' : ''} it could not cap`);
   return parts.length ? `the mesh still has ${parts.join(' and ')}: the export may not be a closed solid (Fix bad areas closes it)` : null;
 }
@@ -1483,8 +1483,10 @@ async function exportStep({ checked = false } = {}) {
       if (doubts.groups.size || doubts.mesh) { busy.end(); offerDoubts(doubts); return; }
     }
     let result;
+    const finished = new Map();                   // bodies the worker finished: kept if the rest is stopped
     try {
-      result = await knitInWorker({ ...payload, options: { deadline: EXPORT_DEADLINE_S } }, progress, EXPORT_HARD_STOP_S, run);
+      result = await knitInWorker({ ...payload, options: { deadline: EXPORT_DEADLINE_S } }, progress, EXPORT_HARD_STOP_S, run,
+        (b) => finished.set(b.id, { brep: b.brep, report: b.report }));
     } catch (error) {
       if (error.name === 'AbortError') throw error;
       // A single OCCT repair on badly fitting surfaces can run for most of an hour and cannot be
@@ -1492,11 +1494,15 @@ async function exportStep({ checked = false } = {}) {
       // can leave the kernel's memory corrupt (its fallback then fails too: "table index is out of bounds"),
       // so that too gets a fresh worker for the faceted solid.
       const timedOut = error.name === 'TimeoutError';
+      // the bodies that finished stay as built; only the rest go out as facets
+      const keep = [...finished];
+      const rest = keep.length ? `the ${plural(payload.names.length - keep.length, 'body', 'bodies')} still building` : 'the mesh';
       say(timedOut
-        ? `The surfaces took over ${Math.round(EXPORT_HARD_STOP_S / 60)} minutes to join; exporting the mesh as a faceted solid…`
-        : `The solid build failed (${failureText(error.message)}); exporting the mesh as a faceted solid…`, true);
-      busy.step(timedOut ? 'The surfaces took too long to join: building the mesh as flat facets…' : 'The build failed: building the mesh as flat facets…');
-      result = await knitInWorker({ ...payload, options: { mode: 'faceted' } }, progress, Infinity, run);
+        ? `The surfaces took over ${Math.round(EXPORT_HARD_STOP_S / 60)} minutes to join; exporting ${rest} as a faceted solid…`
+        : `The solid build failed (${failureText(error.message)}); exporting ${rest} as a faceted solid…`, true);
+      busy.step(timedOut ? `The surfaces took too long to join: building ${rest} as flat facets…` : `The build failed: building ${rest} as flat facets…`);
+      result = await knitInWorker({ ...payload, options: { mode: 'faceted', ...(keep.length ? { keep } : {}) } }, progress, Infinity, run);
+      if (keep.length) result.report.keptBodies = keep.length;
       if (timedOut) result.report.timedOut = true;
       else result.report.failed = error.message;
     }
@@ -1716,7 +1722,7 @@ async function knitPayload(current) {
   // Bodies (js/bodies.js): one solid each, voids as inner shells; the windings are final (every body faces out, every
   // void in), so the knitter keeps them. One body takes the file's name.
   const names = model.bodies.length === 1 ? [current.name] : current.bodyNames.slice();
-  return { positions: kept, labels, surfaces: shiftedSurfaces, bodies, names, oriented: true, ...(source ? { source } : {}) };
+  return { positions: kept, labels, surfaces: shiftedSurfaces, bodies, names, oriented: true, part: current.name, ...(source ? { source } : {}) };
 }
 
 /**
@@ -1808,8 +1814,8 @@ function captureView() {
 const DOUBT = { DEV: 1e-3, SEAM: 1e-3, ARC: 10 };
 
 /** What the export check doubts: Map group -> reasons, and the mesh's own problem (or null). */
-function exportDoubts({ positions, labels, surfaces }) {
-  const pf = preflight(positions, labels, new Map(surfaces), DOUBT);
+function exportDoubts({ positions, labels, surfaces, bodies }) {
+  const pf = preflight(positions, labels, new Map(surfaces), { ...DOUBT, bodies });   // edges judged body by body
   const size = (x) => format(x * pf.diag);
   const groups = new Map();
   for (const [id, r] of pf.groups) {
@@ -2488,7 +2494,11 @@ function takeWorker() {
  * with the share done (0..1) where it is known. `run.abort` is set to stop it: the worker goes and the promise
  * rejects with AbortError.
  */
-function knitInWorker(payload, onStatus, limitS = Infinity, run = {}) {
+/**
+ * Build in the export worker. With several bodies the worker posts each body as it finishes ({type: 'body', id, brep,
+ * report}): `onBody` keeps them, so a hard stop can keep the finished bodies and facet only the rest.
+ */
+function knitInWorker(payload, onStatus, limitS = Infinity, run = {}, onBody = null) {
   return new Promise((resolve, reject) => {
     const worker = takeWorker();
     let timer = null;
@@ -2508,10 +2518,12 @@ function knitInWorker(payload, onStatus, limitS = Infinity, run = {}) {
       reject(error);
     };
     worker.onmessage = ({ data }) => {
-      if (data.type === 'status') onStatus(data.text);
+      const who = data.body != null && payload.names?.length > 1 ? `${payload.names[data.body]}: ` : '';
+      if (data.type === 'status') onStatus(`${who}${data.text}`);
+      else if (data.type === 'body') onBody?.(data);
       else if (data.type === 'progress') {
-        if (data.freeform) onStatus(`Fitting freeform surfaces… ${data.freeform} of ${data.of}`, data.freeform / data.of);
-        else onStatus(`Building the solid… attempt ${data.builds}`);
+        if (data.freeform) onStatus(`${who}Fitting freeform surfaces… ${data.freeform} of ${data.of}`, data.freeform / data.of);
+        else onStatus(`${who}Building the solid… attempt ${data.builds}`);
       }
       else {
         finish();
@@ -2528,9 +2540,11 @@ function knitInWorker(payload, onStatus, limitS = Infinity, run = {}) {
 function exportSummary(file, report, unpainted) {
   const pct = (x) => `${(100 * x).toFixed(x < 0.01 ? 1 : 0)}%`;
   const parts = [];
-  if (report.tier === 'analytic') parts.push(`Exported ${file}: a closed solid, every face on its fitted surface`);
+  const n = Array.isArray(report.bodies) ? report.bodies.length : 1;
+  const solids = n > 1 ? `${n} closed solids` : 'a closed solid';
+  if (report.tier === 'analytic') parts.push(`Exported ${file}: ${solids}, every face on its fitted surface`);
   else if (report.tier === 'hybrid' || report.tier === 'planar') {
-    parts.push(`Exported ${file}: a closed solid; ${report.facetTris.toLocaleString()} triangles (${pct(report.facetArea)} of the area) ` +
+    parts.push(`Exported ${file}: ${solids}; ${report.facetTris.toLocaleString()} triangles (${pct(report.facetArea)} of the area) ` +
       `went out as flat facets where ${report.tier === 'planar' ? 'the curved' : 'their'} surfaces would not join`);
   } else if (report.tier === 'faceted') {
     parts.push(report.timedOut
@@ -2730,6 +2744,12 @@ function offerAfterRepair(current, ok) {
 /** A repair move in words, as its undo step is named: "Cone 12 as a cylinder", "merge Plane 4 into its neighbors". */
 function repairMoveText(current, m, idOf) {
   const name = (label) => { const id = idOf(label); return id !== null && current.store.groups.has(id) ? current.store.name(id) : 'a freeform piece'; };
+  if (m.move === 'retype' && m.split && m.changes?.length) {
+    // a group painted across bodies: its part in another body becomes a group of its own before the retype
+    const t = m.changes[0], from = current.store.owner[t];
+    const was = from >= 0 && current.store.groups.has(from) ? current.store.name(from) : 'a group';
+    return `split ${was}'s part in ${current.bodyNames?.[current.model.bodyOf[t]] ?? 'another body'} off`;
+  }
   if (m.move === 'retype') return `${name(m.group)} as a ${typeLabel(m.to).toLowerCase()}`;
   if (m.move === 'absorb') return `merge ${name(m.group)} into its neighbors`;
   return `merge ${m.groups.length} sliver${m.groups.length === 1 ? '' : 's'} into their neighbors`;
