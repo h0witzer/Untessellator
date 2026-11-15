@@ -15,7 +15,7 @@
  *   faceted  the mesh as a polyhedral solid
  */
 
-import { buildTopo, buildPolyhedral, patchProblems, grade, better } from './build.js';
+import { buildTopo, buildPolyhedral, patchProblems, grade, better, score } from './build.js';
 import { distNormal, unit, sub, cross } from './geometry.js';
 
 export const LOOP = {
@@ -136,8 +136,9 @@ export function buildRepaired(oc, mesh, surfaces, { fitCandidates = null, maxBui
     try {
       const work = mesh.withLabels(labels);
       const r = buildTopo(oc, work, prepare ? prepare(labels, surfs) : surfs);
-      const probs = patchProblems(oc, r.shape, r.faceOf, labels, r.ratios);
-      const { g, sc } = grade(oc, r.shape, work, probs);
+      const checked = score(oc, r.shape, work);
+      const probs = patchProblems(oc, r.shape, r.faceOf, labels, r.ratios, checked.analyzers);
+      const { g, sc } = grade(oc, r.shape, work, probs, checked);
       return { g, shape: r.shape, info: r.info, probs, labels, surfs, sc };
     } catch (err) {
       // A move that makes OCCT throw is a rejected move, not a lost part.
@@ -258,8 +259,9 @@ function buildWithFacets(oc, mesh, labels, surfaces, demote) {
   const sf = new Map([...surfaces].filter(([g]) => !demote.has(g)));
   const work = mesh.withLabels(lab);
   const r = buildTopo(oc, work, sf, { facetLabels });
-  const probs = patchProblems(oc, r.shape, r.faceOf, lab, r.ratios);
-  const { g, sc } = grade(oc, r.shape, work, probs);
+  const checked = score(oc, r.shape, work);
+  const probs = patchProblems(oc, r.shape, r.faceOf, lab, r.ratios, checked.analyzers);
+  const { g, sc } = grade(oc, r.shape, work, probs, checked);
   return { g, sc, shape: r.shape, probs, base };
 }
 

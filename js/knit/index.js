@@ -130,16 +130,20 @@ export function knitSolid(oc, { positions, labels, surfaces }, { fallback = true
     surfs = r.surfaces;
     Object.assign(info, r.info, { axes_ms: Math.round(performance.now() - ta) });
   }
-  const attempt = (sf) => {
+  // each build's time (ms_clean, ms_plain, ms_mesh_clean, ms_mesh_plain): where a part's seconds went
+  const attempt = (sf, name) => {
+    const t = performance.now();
     try {
       return buildRepaired(oc, mesh, sf, { maxBuilds: 1, onProgress });
     } catch (err) {
       info.exception = String(err?.message ?? err).slice(0, 120);
       if (globalThis.process?.env?.KNIT_DEBUG) info.exception_stack = String(err?.stack ?? '').split(/\r?\n/).slice(0, 8).join(' | ');
       return null;
+    } finally {
+      info[`ms_${name}`] = Math.round(performance.now() - t);
     }
   };
-  let r = attempt(surfs);
+  let r = attempt(surfs, 'clean');
   // The clean build (shared axes, exact edges, contact loci) is not analytic everywhere the plain one is:
   // on 274 Onshape parts each was fully analytic on parts the other was not (deterministic gates, no
   // time budget: clean 250, plain 254, 8 one way and 5 the other). So a clean build that is not fully
@@ -149,7 +153,7 @@ export function knitSolid(oc, { positions, labels, surfaces }, { fallback = true
     const saved = { ...BUILD };
     BUILD.EXACT_EDGES = false; BUILD.CONTACT = false;
     let r2 = null;
-    try { r2 = attempt(plainSurfs); } finally { Object.assign(BUILD, saved); }
+    try { r2 = attempt(plainSurfs, 'plain'); } finally { Object.assign(BUILD, saved); }
     info.plain_retry = 1;
     // the plain build replaces the clean one only when it is fully analytic: otherwise the clean one goes on
     // to the facet tiers (a plain build that grades better but is not analytic fell to facets where the
@@ -165,10 +169,10 @@ export function knitSolid(oc, { positions, labels, surfaces }, { fallback = true
     BUILD.SSI = false;
     let r3 = null;
     try {
-      r3 = attempt(surfs);
+      r3 = attempt(surfs, 'mesh_clean');
       if (clean && retryPlain && !(r3?.state?.ok) && timeLeft()) {
         BUILD.EXACT_EDGES = false; BUILD.CONTACT = false;
-        r3 = attempt(plainSurfs);
+        r3 = attempt(plainSurfs, 'mesh_plain');
       }
     } finally { Object.assign(BUILD, saved); }
     info.mesh_points_retry = 1;
@@ -191,10 +195,11 @@ export function knitSolid(oc, { positions, labels, surfaces }, { fallback = true
 
   function finish(out) {
   const { sc } = out;
-  // slivers out, one face per surface (build.js tidy); a faceted solid is left as it is
+  // slivers out, one face per surface (build.js tidy); a faceted solid is left as it is, and a hybrid or planar one
+  // keeps its small faces (they are facets)
   if (tidyUp && sc.solid && sc.closed && sc.valid && out.tier !== 'faceted' && out.tier !== 'none') {
     const t1 = performance.now();
-    sc.solid = tidy(oc, sc.solid, mesh, info);
+    sc.solid = tidy(oc, sc.solid, mesh, info, { smallFaces: out.tier === 'analytic' });
     info.tidy_ms = Math.round(performance.now() - t1);
   }
   const report = {

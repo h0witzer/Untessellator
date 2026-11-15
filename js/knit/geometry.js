@@ -176,24 +176,28 @@ function lagrangeDerivative(ts, Q, at) {
  *   closed, 3+        periodic in OCCT (C1 at the seam, tangent from the first 4 points, 3 when only 3);
  *                     here the same curve as a clamped one over the closing parameter range: through the
  *                     points, back to the first, with that tangent at both ends
- * Returns {poles, knots, mults, degree}; the parameter runs from 0 to the chain's length.
+ * Returns {poles, knots, mults, degree, t}; the parameter runs from 0 to the chain's length, t[i] at point i (and
+ * the closing point last). Options, for a pcurve through the same parameters as its 3D curve (build.js addPcurves):
+ * t the parameters to take instead of chord lengths, closeWith the closing point instead of the first (a periodic
+ * parameter one period on).
  */
-export function interpolateChain(pts, closed) {
+export function interpolateChain(pts, closed, { t: given = null, closeWith = null } = {}) {
   const n = pts.length;
   const chord = (Q) => {
+    if (given) return given;
     const t = [0];
     for (let i = 1; i < Q.length; i++) t.push(t[i - 1] + norm(sub(Q[i], Q[i - 1])));
     return t;
   };
-  if (!closed && n === 2) return { poles: [pts[0], pts[1]], knots: [0, norm(sub(pts[1], pts[0]))], mults: [2, 2], degree: 1 };
+  if (!closed && n === 2) return { poles: [pts[0], pts[1]], knots: given ? [given[0], given[1]] : [0, norm(sub(pts[1], pts[0]))], mults: [2, 2], degree: 1 };
   if (!closed && n === 3) {
     const t = chord(pts);
     const U = [t[0], t[0], t[0], t[2], t[2], t[2]];
     const A = t.map((u) => basisFuns(findSpan(2, 2, u, U), u, 2, U));    // a quadratic Bezier: 3 x 3
     const sol = [0, 1, 2].map((c) => solveSmall(A.map((r) => [...r]), pts.map((q) => q[c])));
-    return { poles: [0, 1, 2].map((i) => [sol[0][i], sol[1][i], sol[2][i]]), knots: [t[0], t[2]], mults: [3, 3], degree: 2 };
+    return { poles: [0, 1, 2].map((i) => [sol[0][i], sol[1][i], sol[2][i]]), knots: [t[0], t[2]], mults: [3, 3], degree: 2, t };
   }
-  const Q = closed ? [...pts, pts[0]] : pts;
+  const Q = closed ? [...pts, closeWith ?? pts[0]] : pts;
   const t = chord(Q);
   const m = Q.length;
   const k0 = Math.min(4, n);
@@ -220,7 +224,7 @@ export function interpolateChain(pts, closed) {
   P[np - 1] = [...Q[m - 1]];
   const knots = [t[0], ...t.slice(1, m - 1), t[m - 1]];
   const mults = [4, ...t.slice(1, m - 1).map(() => 1), 4];
-  return { poles: P, knots, mults, degree: 3 };
+  return { poles: P, knots, mults, degree: 3, t };
 }
 
 /** Banded A x = b (rows of length n, nonzeros within `bw` of the diagonal); partial pivoting in the band. */

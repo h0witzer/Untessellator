@@ -9,11 +9,12 @@
  *           and along facets)
  *   face    the patch's surface, U-reversed where its natural normal points into the solid, bounded by
  *           its edges in mesh winding
- *   repair  one ShapeFix_Shape over the shell, then natural-bound wires it added are dropped
+ *   repair  one ShapeFix_Shape over the analytic faces, then natural-bound wires it added are dropped; facets
+ *           join after it, with the edges and vertices it replaced
  */
 
 import { distNormal, projectOnto, seamAway, unfoldChain, interpolateChain, unit, sub, add, dot, scale, norm, cross,
-  tangentLocus, ontoLocus, cornerOnLocus, exactCurve } from './geometry.js';
+  tangentLocus, ontoLocus, cornerOnLocus, exactCurve, evalBSpline } from './geometry.js';
 import { meshTopology, BODY_STRIDE } from './mesh.js';
 import { ssiNow } from './ssi.js';
 
@@ -24,7 +25,8 @@ function dir(oc, v) { return new oc.gp_Dir_4(v[0], v[1], v[2]); }
 function enumOf(oc) {
   return {
     FACE: oc.TopAbs_ShapeEnum.TopAbs_FACE, EDGE: oc.TopAbs_ShapeEnum.TopAbs_EDGE, WIRE: oc.TopAbs_ShapeEnum.TopAbs_WIRE,
-    SHELL: oc.TopAbs_ShapeEnum.TopAbs_SHELL, SHAPE: oc.TopAbs_ShapeEnum.TopAbs_SHAPE, REVERSED: oc.TopAbs_Orientation.TopAbs_REVERSED,
+    SHELL: oc.TopAbs_ShapeEnum.TopAbs_SHELL, SHAPE: oc.TopAbs_ShapeEnum.TopAbs_SHAPE, VERTEX: oc.TopAbs_ShapeEnum.TopAbs_VERTEX,
+    REVERSED: oc.TopAbs_Orientation.TopAbs_REVERSED,
     IN: oc.TopAbs_State.TopAbs_IN,
   };
 }
@@ -105,8 +107,9 @@ function bsplineSurface(oc, p) {
 
 const EXACT_EDGE_TOL = 1e-8;
 const CONTACT_TOL = 1e-7;
-/** Switches for experiments (test/knit.mjs): exact line / circle edges, contact loci, ssi's edges, exact pinches. */
-export const BUILD = { EXACT_EDGES: true, CONTACT: true, SSI: true, PINCH: true };
+/** Switches for experiments (test/knit.mjs): exact line / circle edges, contact loci, ssi's edges, exact pinches,
+ * pcurves for spline edges, facets through the repair. */
+export const BUILD = { EXACT_EDGES: true, CONTACT: true, SSI: true, PINCH: true, PCURVES: true, FIX_FACETS: false };
 
 /** An edge on an exact line or circle (exactCurve) from v0 to v1, following the chain's direction. */
 function exactEdge(oc, ex, pts, closed, v0, v1) {
@@ -128,8 +131,9 @@ function exactEdge(oc, ex, pts, closed, v0, v1) {
 }
 
 /** A B-spline edge through `pts` between two vertices. */
-function chainEdge(oc, pts, closed, v0, v1) {
-  const { poles, knots, mults, degree } = interpolateChain(pts, closed);
+function chainEdge(oc, pts, closed, v0, v1, out = null) {
+  const { poles, knots, mults, degree, t } = interpolateChain(pts, closed);
+  if (out) { out.t = t ?? knots; out.curve = { poles, knots, mults, degree }; }
   const P = new oc.TColgp_Array1OfPnt_2(1, poles.length);
   poles.forEach((q, i) => P.SetValue(i + 1, pnt(oc, q)));
   const K = new oc.TColStd_Array1OfReal_2(1, knots.length);
@@ -428,6 +432,7 @@ export function buildTopo(oc, mesh, surfaces, { facetLabels = null } = {}) {
     // mesh edge): a chord where it meets a curved face, which the repair covers by tolerance.
     const straight = bothPlanes || facets.has(a) || facets.has(b);
     const v0 = vertex.get(ck(path[0], bd)), v1 = vertex.get(ck(path[path.length - 1], bd));
+    let pc = null;
     try {
       let mk;
       if (straight && !closed) {
@@ -448,10 +453,10 @@ export function buildTopo(oc, mesh, surfaces, { facetLabels = null } = {}) {
         const ex = BUILD.EXACT_EDGES && ss.length === 2 ? exactCurve(closed ? [...clean, clean[0]] : clean, EXACT_EDGE_TOL * scaleLen) : null;
         mk = ex ? exactEdge(oc, ex, closed ? [...clean, clean[0]] : clean, closed, v0, v1) : null;
         if (mk && mk.IsDone()) bump(info, ex.line ? 'edges_line' : 'edges_circle');
-        else mk = chainEdge(oc, clean, closed, v0, v1);
+        else { pc = { pts: clean, closed }; mk = chainEdge(oc, clean, closed, v0, v1, pc); }
       }
       if (!mk.IsDone()) { bump(info, 'edge_failed'); continue; }
-      edges.push({ a, b, s: ck(path[0], bd), t: ck(path[path.length - 1], bd), e: mk.Edge() });
+      edges.push({ a, b, s: ck(path[0], bd), t: ck(path[path.length - 1], bd), e: mk.Edge(), pc });
     } catch (err) {
       bump(info, 'edge_exception');
     }
@@ -468,6 +473,7 @@ export function buildTopo(oc, mesh, surfaces, { facetLabels = null } = {}) {
   const shell = new oc.TopoDS_Shell();
   builder.MakeShell(shell);
   const faceOf = new Map();
+  const facetFaces = [];
   for (const f of labelsSorted) {
     const tris = patchTris.get(f);
     const sp = surf(f);
@@ -544,21 +550,46 @@ export function buildTopo(oc, mesh, surfaces, { facetLabels = null } = {}) {
     const face = new oc.TopoDS_Face();
     builder.MakeFace_2(face, s, 1e-7);
     for (const w of wires) builder.Add(face, w);
-    builder.Add(shell, face);
+    if (facet && !BUILD.FIX_FACETS) facetFaces.push(face);
+    else builder.Add(shell, face);
     faceOf.set(f, face);
     bump(info, 'faces');
     if (facet) bump(info, 'facet_faces');
   }
 
-  // ONE repair pass over the whole shell: ShapeFix_Shape records every replacement in one context and
-  // applies it to all faces, so shared edges stay shared.
-  const fix = new oc.ShapeFix_Shape_2(shell);
-  fix.Perform(new oc.Message_ProgressRange_1());
-  let result = fix.Shape();
-  const ctx = fix.Context().get();
+  if (BUILD.PCURVES) addPcurves(oc, builder, edges, faceOf, facets, info, scaleLen);
+  BUILD.DUMP?.(oc, shell, mesh);   // the shell as handed to the kernel (test/knit.mjs --dump-kernel)
+
+  // ONE repair pass over the analytic faces: ShapeFix_Shape records every replacement in one context and
+  // applies it to all faces, so shared edges stay shared. Facets stay out of it: a plane through its own three
+  // corners with straight sides needs nothing, and the repair cost as much per facet as per surface (8 ms a
+  // face, 86 s a build of 00005493_012's 10,969 faces) and moved their corners by up to its 1e-7 mm tolerance.
+  // The chords where facets meet curved faces are those faces' edges too, so they are repaired (tolerance,
+  // pcurve) with them; the facets then take whatever the repair replaced.
+  let result = shell, ctx = null;
+  if (subShapes(oc, shell, E.FACE).length) {
+    // with facets out, the analytic faces are islands: ShapeFix_Shell would orient (or split) each on its own, and
+    // the shell with the facets back failed BRepCheck NotConnected (00003840_000). A compound gets the face fixes
+    // only, in one context.
+    let input = shell;
+    if (facetFaces.length) {
+      input = new oc.TopoDS_Compound();
+      builder.MakeCompound(input);
+      for (const fc of subShapes(oc, shell, E.FACE)) builder.Add(input, fc);
+    }
+    const fix = new oc.ShapeFix_Shape_2(input);
+    fix.Perform(new oc.Message_ProgressRange_1());
+    result = fix.Shape();
+    ctx = fix.Context().get();
+  }
+  if (facetFaces.length) {
+    const all = [...subShapes(oc, result, E.FACE), ...facetFaces.map((fc) => (ctx ? ctx.Apply_2(fc, E.SHAPE) : fc))];
+    result = connectedShells(oc, builder, all);
+    bump(info, 'facets_unrepaired', facetFaces.length);
+  }
   const remapped = new Map();
   for (const [f, fc] of faceOf) {
-    const r = ctx.Apply_2(fc, E.SHAPE);
+    const r = ctx ? ctx.Apply_2(fc, E.SHAPE) : fc;
     if (r.IsNull()) { bump(info, 'face_removed_by_repair'); continue; }
     if (r.ShapeType() === E.FACE) remapped.set(f, oc.TopoDS.Face_1(r));
     else if (subShapes(oc, r, E.FACE).length) { remapped.set(f, r); bump(info, 'face_split_by_repair'); }
@@ -576,8 +607,7 @@ export function buildTopo(oc, mesh, surfaces, { facetLabels = null } = {}) {
     if (l.Size() > 2) return true;
     return (l.Size() >= 1 && !l.First_1().IsSame(face)) || (l.Size() === 2 && !l.Last_1().IsSame(face));
   };
-  const cleaned = new oc.TopoDS_Shell();
-  builder.MakeShell(cleaned);
+  const kept = [];
   const replaced = [];
   for (const fc0 of subShapes(oc, result, E.FACE)) {
     const fc = oc.TopoDS.Face_1(fc0);
@@ -588,11 +618,11 @@ export function buildTopo(oc, mesh, surfaces, { facetLabels = null } = {}) {
       builder.MakeFace_2(nf, oc.BRep_Tool.Surface_2(fc), oc.BRep_Tool.Tolerance_1(fc));
       for (const w of keep) builder.Add(nf, w);
       const oriented = oc.TopoDS.Face_1(nf.Oriented(fc.Orientation_1()));
-      builder.Add(cleaned, oriented);
+      kept.push(oriented);
       replaced.push([fc, oriented]);
       bump(info, 'natural_bound_wires_removed', all.length - keep.length);
     } else {
-      builder.Add(cleaned, fc);
+      kept.push(fc);
     }
   }
   if (replaced.length) {
@@ -600,7 +630,7 @@ export function buildTopo(oc, mesh, surfaces, { facetLabels = null } = {}) {
       const hit = replaced.find(([old]) => old.IsSame(fc));
       if (hit) remapped.set(f, hit[1]);
     }
-    result = cleaned;
+    result = connectedShells(oc, builder, kept);
   }
 
   // Area of every patch's final face against the patch's mesh area: a face that took the wrong region
@@ -619,6 +649,116 @@ export function buildTopo(oc, mesh, surfaces, { facetLabels = null } = {}) {
     }
   }
   return { shape: result, faceOf: remapped, info, ratios };
+}
+
+/**
+ * One shell per piece of `faces` joined by shared edges (a compound of them when there are several), as ShapeFix_Shell
+ * splits a shell: one shell over separate pieces fails BRepCheck NotConnected (00003840_000's four).
+ */
+function connectedShells(oc, builder, faces) {
+  const E = enumOf(oc);
+  const byEdge = new oc.TopTools_IndexedMapOfShape_1();
+  const edgesOf = faces.map((fc) => subShapes(oc, fc, E.EDGE).map((e) => byEdge.Add(e)));
+  const parent = faces.map((_, i) => i);
+  const find = (i) => { while (parent[i] !== i) i = parent[i] = parent[parent[i]]; return i; };
+  const first = new Map();
+  edgesOf.forEach((es, i) => {
+    for (const k of es) {
+      if (!first.has(k)) first.set(k, i);
+      else parent[find(i)] = find(first.get(k));
+    }
+  });
+  const pieces = new Map();
+  faces.forEach((fc, i) => { const r = find(i); if (!pieces.has(r)) pieces.set(r, []); pieces.get(r).push(fc); });
+  const shells = [...pieces.values()].map((fs) => {
+    const sh = new oc.TopoDS_Shell();
+    builder.MakeShell(sh);
+    for (const fc of fs) builder.Add(sh, fc);
+    return sh;
+  });
+  if (shells.length === 1) return shells[0];
+  const comp = new oc.TopoDS_Compound();
+  builder.MakeCompound(comp);
+  for (const sh of shells) builder.Add(comp, sh);
+  return comp;
+}
+
+const PCURVE_TOL = 1e-7;
+
+/**
+ * PCURVES for the spline edges: each one's curve in the parameters of both its faces, through the surface's own
+ * (u, v) at the same points and the same parameters as the 3D spline. Without them ShapeFix projects every spline
+ * onto both surfaces, which on a plain build (no exact lines or circles) is most of its time: 31 s against 0.5 s
+ * for the clean build of the same 42 faces, 00000890_001. One that strays from the 3D curve by more than
+ * PCURVE_TOL x diagonal beyond twice the curve's own distance from the surface is left to ShapeFix.
+ */
+function addPcurves(oc, builder, edges, faceOf, facets, info, scaleLen) {
+  const sas = new Map();
+  const analysis = (f, face) => {
+    let a = sas.get(f);
+    if (!a) {
+      const h = oc.BRep_Tool.Surface_2(face);
+      const g = h.get();
+      a = { g, sa: new oc.ShapeAnalysis_Surface(h), up: g.IsUPeriodic() ? g.UPeriod() : 0, vp: g.IsVPeriodic() ? g.VPeriod() : 0 };
+      sas.set(f, a);
+    }
+    return a;
+  };
+  const wrap = (x, ref, period) => (period ? x - period * Math.round((x - ref) / period) : x);
+  for (const { a, b, e, pc } of edges) {
+    if (!pc || a === b) continue;
+    for (const f of [a, b]) {
+      const face = f >= 0 && !facets.has(f) ? faceOf.get(f) : null;
+      if (!face) continue;
+      const { g, sa, up, vp } = analysis(f, face);
+      const uv = [];
+      for (const q of pc.pts) {
+        const gp = pnt(oc, q);
+        const p2 = sa.ValueOfUV(gp, 1e-9);
+        let u = p2.X(), v = p2.Y();
+        gp.delete(); p2.delete();
+        if (uv.length) { const [u0, v0] = uv[uv.length - 1]; u = wrap(u, u0, up); v = wrap(v, v0, vp); }
+        uv.push([u, v, 0]);
+      }
+      let closeWith = null;
+      if (pc.closed) {
+        const [u0, v0] = uv[0], [ul, vl] = uv[uv.length - 1];
+        closeWith = [wrap(u0, ul, up), wrap(v0, vl, vp), 0];
+      }
+      try {
+        const { poles, knots, mults, degree } = interpolateChain(uv, pc.closed, { t: pc.t, closeWith });
+        // Checked halfway between its points, where the two interpolations part most: the pcurve's point must be
+        // as near the 3D curve's as the surface is (the tolerance ShapeFix's projection would give the edge), else
+        // ShapeFix projects it. Interpolated (u, v) strays where the chain is sparse and turns: 5 points round a
+        // cone, 2.8e4 mm off on 00002498_000, which made every check after it crawl.
+        let excess = 0;
+        const c2d = { poles, knots, mults, degree };
+        for (let i = 0; i + 1 < pc.t.length; i++) {
+          const tm = (pc.t[i] + pc.t[i + 1]) / 2;
+          const [u, v] = evalBSpline(c2d, tm);
+          const q = evalBSpline(pc.curve, tm);
+          const sp = g.Value(u, v);
+          const gq = pnt(oc, q);
+          sa.ValueOfUV(gq, 1e-9).delete();
+          excess = Math.max(excess, norm(sub([sp.X(), sp.Y(), sp.Z()], q)) - 2 * sa.Gap());
+          sp.delete(); gq.delete();
+        }
+        if (!(excess <= PCURVE_TOL * scaleLen)) { bump(info, 'pcurve_off'); continue; }
+        const P = new oc.TColgp_Array1OfPnt2d_2(1, poles.length);
+        poles.forEach((q, i) => { const g2 = new oc.gp_Pnt2d_3(q[0], q[1]); P.SetValue(i + 1, g2); g2.delete(); });
+        const K = new oc.TColStd_Array1OfReal_2(1, knots.length);
+        knots.forEach((k, i) => K.SetValue(i + 1, k));
+        const M = new oc.TColStd_Array1OfInteger_2(1, mults.length);
+        mults.forEach((m, i) => M.SetValue(i + 1, m));
+        const c2 = new oc.Geom2d_BSplineCurve_1(P, K, M, degree, false);
+        builder.UpdateEdge_3(e, new oc.Handle_Geom2d_Curve_2(c2), face, 1e-7);
+        bump(info, 'pcurves');
+      } catch {
+        bump(info, 'pcurve_failed');
+      }
+    }
+    builder.SameParameter(e, false);
+  }
 }
 
 /**
@@ -713,6 +853,9 @@ export function score(oc, shape, mesh) {
     const comp = new oc.TopoDS_Compound();
     builder.MakeCompound(comp);
     let valid = true, total = 0;
+    // A shape with a free or non-manifold edge is no valid solid, whatever its shells' repair does: checking
+    // it costs as much as a build and changes nothing but the volume tiebreak (grade), so it is not checked.
+    const check = out.closed;
     const solidOf = (shell) => {
       let solid = new oc.TopoDS_Solid();
       builder.MakeSolid(solid);
@@ -720,8 +863,12 @@ export function score(oc, shape, mesh) {
       const cls = new oc.BRepClass3d_SolidClassifier_2(solid);
       cls.PerformInfinitePoint(1e-7);
       if (cls.State() === E.IN) solid = oc.TopoDS.Solid_1(solid.Reversed());
-      return [solid, new oc.BRepCheck_Analyzer(solid, true, false).IsValid_2()];
+      if (!check) return [solid, false, null];
+      const ana = new oc.BRepCheck_Analyzer(solid, true, false);
+      return [solid, ana.IsValid_2(), ana];
     };
+    // each shell's check as built, which patchProblems reads its faces from (one check per build, not two)
+    out.analyzers = [];
     for (const sh of shells) {
       // The shell as built first: its faces follow the mesh winding, made consistent by KnitMesh, so it
       // usually needs nothing. ml/solid_rebuild.py runs ShapeFix_Shell's whole Perform, but in this
@@ -729,8 +876,9 @@ export function score(oc, shape, mesh) {
       // raw and orientation-fixed, UnorientableShape on 2 faces after Perform; OCCT 7.9 keeps it valid),
       // and its orientation pass is quadratic: 776 s on a 33,802-facet shell. So an invalid shell gets
       // the orientation fix, then Perform, and only up to SHELL_FIX_MAX_FACES faces.
-      let [solid, ok] = solidOf(sh);
-      if (!ok && subShapes(oc, sh, E.FACE).length <= SHELL_FIX_MAX_FACES) {
+      let [solid, ok, ana] = solidOf(sh);
+      if (ana) out.analyzers.push([sh, ana]);
+      if (!ok && check && subShapes(oc, sh, E.FACE).length <= SHELL_FIX_MAX_FACES) {
         const orient = new oc.ShapeFix_Shell_1();
         orient.Init(sh);
         orient.FixFaceOrientation(sh, true, false);
@@ -767,7 +915,7 @@ export const LOOP_AREA_RATIO = 1.25;   // a face this far from its patch's mesh 
  * direction as the face across it), area (off its patch's mesh area by more than LOOP_AREA_RATIO), or
  * open (bounded by a free edge). Faces are checked as they sit in `result`.
  */
-export function patchProblems(oc, result, faceOf, labels, ratios) {
+export function patchProblems(oc, result, faceOf, labels, ratios, analyzers = null) {
   const E = enumOf(oc);
   const ownMap = new oc.TopTools_IndexedMapOfShape_1();
   const owner = [];
@@ -778,9 +926,12 @@ export function patchProblems(oc, result, faceOf, labels, ratios) {
     }
   }
   const ownerOf = (fc) => { const i = ownMap.FindIndex(fc); return i > 0 ? owner[i] : undefined; };
-  const ana = new oc.BRepCheck_Analyzer(result, true, false);
-  const invalid = new Set(), present = new Set();
   const faces = subShapes(oc, result, E.FACE);
+  // score's checks of the shells (as built, so the same faces) when they hold every face; else one of `result`
+  let ana = null;
+  if (analyzers?.length === 1 && subShapes(oc, analyzers[0][0], E.FACE).length === faces.length) ana = analyzers[0][1];
+  ana ??= new oc.BRepCheck_Analyzer(result, true, false);
+  const invalid = new Set(), present = new Set();
   for (const fc of faces) {
     const f = ownerOf(fc);
     if (f === undefined) continue;
@@ -823,8 +974,7 @@ export function patchProblems(oc, result, faceOf, labels, ratios) {
 }
 
 /** (recreated, closed & valid, fewer problems, fewer free edges, smaller volume error), to compare. */
-export function grade(oc, shape, mesh, problems) {
-  const sc = score(oc, shape, mesh);
+export function grade(oc, shape, mesh, problems, sc = score(oc, shape, mesh)) {
   const solid = !!(sc.closed && sc.valid);
   const ve = sc.vol_err;
   const ok = solid && ve !== null && ve < 0.01;
@@ -849,31 +999,55 @@ export function better(a, b) {
 //   ShapeUpgrade_UnifySameDomain   adjacent faces on one surface merged, edges on one line or circle joined
 export const TIDY = { SMALL_FACE: 8e-4 };
 
-export function tidy(oc, shape, mesh, info) {
+export function tidy(oc, shape, mesh, info, { smallFaces = true } = {}) {
   const E = enumOf(oc);
   const nFaces = (sh) => subShapes(oc, sh, E.FACE).length;
   const good = (sc) => sc.closed && sc.valid && sc.vol_err !== null && sc.vol_err < 0.01;
+  const nEdges = (sh) => subShapes(oc, sh, E.EDGE).length;
+  // A pass is kept only if it loosens nothing: removing a sliver or joining edges covers the gap it leaves with
+  // tolerance, 1e-5 -> 0.254 mm on 00000034_014 for one sliver, 0.004 -> 0.049 mm on 00008869_006 for 16 joined edges.
+  const tolOf = (sh) => Math.max(oc.BRep_Tool.MaxTolerance(sh, E.VERTEX), oc.BRep_Tool.MaxTolerance(sh, E.EDGE));
   let cur = shape, faces = nFaces(shape);
-  try {
+  const tol0 = tolOf(shape);
+  const tight = (sh) => tolOf(sh) <= tol0 * 1.01;
+  const copyOf = (sh) => new oc.BRepBuilderAPI_Copy_2(sh, true, false).Shape();
+  // A pass that removed or joined nothing is not checked: a check (score) costs as much as a build, and on most
+  // parts neither pass changes anything (2026-11-01: tidy was 91 of the 399 s on 229 fully analytic parts).
+  // smallFaces false (a solid with facets): FixSmallFace removes a small face by moving its neighbours' vertices
+  // within its 10 x SMALL_FACE tolerance, which tilted facets out of their planes by up to 20 degrees under a
+  // 0.61 mm tolerance (00008335_005, test/facetAudit.mjs) while the volume error stayed the same.
+  if (smallFaces) try {
     const f = new oc.ShapeFix_FixSmallFace();
-    f.Init(cur);
+    f.Init(copyOf(cur));
     f.SetPrecision(TIDY.SMALL_FACE * mesh.diag);
     f.SetMaxTolerance(10 * TIDY.SMALL_FACE * mesh.diag);
     f.Perform();
-    const sc = score(oc, f.FixShape(), mesh);
-    const n = sc.solid ? nFaces(sc.solid) : faces;
-    if (good(sc) && n < faces) { info.tidy_small_faces = faces - n; cur = sc.solid; faces = n; }
+    const fixed = f.FixShape();
+    if (nFaces(fixed) < faces) {
+      const sc = score(oc, fixed, mesh);
+      const n = sc.solid ? nFaces(sc.solid) : faces;
+      if (good(sc) && n < faces) {
+        if (tight(sc.solid)) { info.tidy_small_faces = faces - n; cur = sc.solid; faces = n; }
+        else bump(info, 'tidy_rejected_loose');
+      }
+    }
   } catch (err) { info.tidy_small_error = String(err?.message ?? err).slice(0, 80); }
   try {
-    const u = new oc.ShapeUpgrade_UnifySameDomain_2(cur, true, true, false);
+    const u = new oc.ShapeUpgrade_UnifySameDomain_2(copyOf(cur), true, true, false);
     u.SetLinearTolerance(1e-7 * mesh.diag);
     u.SetAngularTolerance(1e-9);
     u.Build();
-    const sc = score(oc, u.Shape(), mesh);
-    if (good(sc)) {
-      const n = nFaces(sc.solid);
-      if (n < faces) info.tidy_unified_faces = faces - n;
-      cur = sc.solid;
+    const unified = u.Shape();
+    if (nFaces(unified) < faces || nEdges(unified) < nEdges(cur)) {
+      const sc = score(oc, unified, mesh);
+      if (good(sc) && !tight(sc.solid)) bump(info, 'tidy_rejected_loose');
+      else if (good(sc)) {
+        const n = nFaces(sc.solid);
+        if (n < faces) info.tidy_unified_faces = faces - n;
+        const ne = nEdges(sc.solid), ne0 = nEdges(cur);
+        if (ne < ne0) info.tidy_unified_edges = ne0 - ne;
+        cur = sc.solid;
+      }
     }
   } catch (err) { info.tidy_unify_error = String(err?.message ?? err).slice(0, 80); }
   return cur;
