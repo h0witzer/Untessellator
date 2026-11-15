@@ -78,12 +78,18 @@ function solveSmall(A, b) {
  * min-norm steps. Tangent surfaces make the normals nearly parallel; the damped step then moves x onto
  * the shared tangency instead of blowing up.
  */
+const PROJECT_OFF = 1e-4;
+
 export function projectOnto(surfs, x0, scaleLen, iters = 30) {
   let x = [x0[0], x0[1], x0[2]];
   const m = surfs.length;
+  const off = (q) => Math.max(...surfs.map(([k, p]) => Math.abs(distNormal(k, p, q)[0])));
+  let best = x, bestOff = Infinity;
   for (let it = 0; it < iters; it++) {
     const dn = surfs.map(([k, p]) => distNormal(k, p, x));
-    if (Math.max(...dn.map(([d]) => Math.abs(d))) < 1e-12 * scaleLen) break;
+    const r = Math.max(...dn.map(([d]) => Math.abs(d)));
+    if (r < bestOff) { best = x; bestOff = r; }
+    if (r < 1e-12 * scaleLen) break;
     const J = dn.map(([, n]) => n);
     const JJt = J.map((ri, i) => J.map((rj, j) => dot(ri, rj) + (i === j ? 1e-10 : 0)));
     const y = solveSmall(JJt, dn.map(([d]) => d));
@@ -92,6 +98,12 @@ export function projectOnto(surfs, x0, scaleLen, iters = 30) {
     x = sub(x, step);
     if (norm(step) < 1e-13 * scaleLen) break;
   }
+  // Run off: where the fits share no point near x0 (two tori and a cone that miss each other by a little) Gauss-Newton
+  // follows the near-singular direction out of the part (00046240_0's corners went 2.5e5 mm out of a 79 mm part, their
+  // edges hundreds of km long, and OCCT's repair ran for hours on them). Where the last iterate is off its surfaces by
+  // more than PROJECT_OFF x diagonal, the one that was nearest them is the answer. Not below that: taking the nearest
+  // iterate wherever it was not the last made 5 Onshape parts hybrid that had been analytic (00003485_000, 00003838_001).
+  if (off(x) > PROJECT_OFF * scaleLen && bestOff < off(x)) return best;
   return x;
 }
 

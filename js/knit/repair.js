@@ -274,7 +274,7 @@ function buildWithFacets(oc, mesh, labels, surfaces, demote) {
  * skipped and only the polyhedral solid is tried. Returns {shape, sc, tier, facetTris, facetArea}: tier is analytic, hybrid, planar,
  * faceted, or none (no tier recreated the part; the best of them is still returned).
  */
-export function facetFallback(oc, mesh, shape, state, info = {}, deadline = Infinity, { hybrid = true, faceted = true } = {}) {
+export function facetFallback(oc, mesh, shape, state, info = {}, deadline = Infinity, { hybrid = true, planar = true, faceted = true } = {}) {
   const t0 = now();
   const { labels, surfaces } = state;
   const present = new Set(labels);
@@ -317,7 +317,7 @@ export function facetFallback(oc, mesh, shape, state, info = {}, deadline = Infi
     for (const k of KINDS) for (const x of r.probs[k]) if (x < r.base && !demote.has(x)) { demote.add(x); grew = true; }
     if (!grew) break;
   }
-  if (!best.g[0]) attempt('planar', new Set([...present].filter((g) => surfaces.get(g)?.[0] !== 'plane')));
+  if (!best.g[0] && planar) attempt('planar', new Set([...present].filter((g) => surfaces.get(g)?.[0] !== 'plane')));
   if (!best.g[0] && faceted) {
     bump(info, 'fallback_faceted_tried');
     try {
@@ -347,6 +347,7 @@ export function facetFallback(oc, mesh, shape, state, info = {}, deadline = Infi
 // every edge and corner that can change is inside it. Every place is tried in the same trial: they do not touch.
 
 export const PROGRESSIVE = { ROUNDS: 8, PASSES: 3 };
+const WHOLE_VARIANTS = ['plain', 'mesh_plain'];
 
 /** Groups sharing a mesh vertex with each group. */
 function touching(mesh, labels) {
@@ -627,6 +628,20 @@ export function progressiveRecovery(oc, mesh, state, shape, surfaces, plainSurfa
           }
         }
       }
+    }
+    // ...and once, the whole part by one method: every group plain, then from the mesh's points too (00050238_3:
+    // no place's method recreated it, the whole part built plain was fully analytic, as today's main retries it).
+    // Kept only when recreated.
+    for (const v of pass === 0 && !done ? WHOLE_VARIANTS : []) {
+      if (timeUp()) break;
+      const keep = new Map(variantOf), was = { probs, base };
+      for (const g of surfaces.keys()) if (!demote.has(g)) variantOf.set(g, v);
+      if (chosen() === lastJudged) continue;
+      if (judge(`whole part ${v}`)) { done = true; bump(info, `progressive_whole_${v}`); break; }
+      variantOf.clear();
+      for (const [g, x] of keep) variantOf.set(g, x);
+      ({ probs, base } = was);
+      lastJudged = chosen();
     }
     if (done) break;
     if (timeUp()) break;

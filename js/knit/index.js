@@ -210,9 +210,11 @@ export function knitSolid(oc, { positions, labels, surfaces }, { fallback = true
       const f = facetFallback(oc, mesh, shape, state0, info, end, { hybrid: false, faceted: false });
       if (f.tier === 'planar' && f.facetArea < p.facetArea) { out = f; state = state0; info.planar_beat_hybrid = 1; }
     }
+    let planarTried = false;
     if (!p.tier && p.overPlanar) {
       // stopped where its facets passed the planar tier's: that tier, and if it is no solid, recovery without the bar
       const f = facetFallback(oc, mesh, shape, state0, info, end, { hybrid: false, faceted: false });
+      planarTried = true;
       if (f.tier === 'planar') out = f;
       else {
         info.progressive_rerun = 1;
@@ -220,7 +222,9 @@ export function knitSolid(oc, { positions, labels, surfaces }, { fallback = true
         if (p.tier) { out = { shape: p.shape, sc: p.sc, tier: p.tier, facetTris: p.facetTris, facetArea: p.facetArea, demoted: p.demoted }; state = p.state; }
       }
     }
-    if (!p.tier && !out) out = facetFallback(oc, mesh, p.shape, p.state, info, end, { hybrid: false });
+    // nothing recovered: the hybrid tier as before (every flagged patch a facet at once, grown by whole builds;
+    // 00143363_15 was 27% facets there and all facets after recovery), then planar unless tried, then the mesh
+    if (!p.tier && !out) { info.progressive_failed = 1; out = facetFallback(oc, mesh, shape, state0, info, end, { planar: !planarTried }); }
   } else if (state) {
     out = facetFallback(oc, mesh, shape, state, info, end);
   } else if (fallback) {

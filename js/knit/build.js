@@ -147,6 +147,36 @@ function facetArc(q, p0, p1, [kind, prm], scaleLen, k = 6) {
   return pts;
 }
 
+/**
+ * Whether the arc `cut` (facetArc's, from one corner of the facet q to another) crosses the facet's other two sides
+ * or one of `others` (the arcs it already has), in the facet's plane. The height bound above caps how far an arc
+ * bulges, not the angle it leaves a corner at: into a facet with a sharp corner it crossed the side there, and the
+ * facet was invalid (00143363_15: one facet of a plane spoiled the hybrid build that was valid with chords).
+ */
+function arcCrosses(cut, q, others, scaleLen) {
+  const p0 = cut[0], p1 = cut[cut.length - 1];
+  const n = unit(cross(sub(q[1], q[0]), sub(q[2], q[0]))), e1 = unit(sub(p1, p0)), e2 = cross(n, e1);
+  const at = (x) => { const w = sub(x, p0); return [dot(w, e1), dot(w, e2)]; };
+  const c = q.reduce((m, x) => (Math.abs(dot(sub(x, p0), e2)) > Math.abs(dot(sub(m, p0), e2)) ? x : m));
+  const eps = 1e-12 * scaleLen * scaleLen;
+  const side = (a, b, x) => (b[0] - a[0]) * (x[1] - a[1]) - (b[1] - a[1]) * (x[0] - a[0]);
+  const meet = (a, b, x, y) => {
+    const s1 = side(a, b, x), s2 = side(a, b, y), s3 = side(x, y, a), s4 = side(x, y, b);
+    return ((s1 > eps && s2 < -eps) || (s1 < -eps && s2 > eps)) && ((s3 > eps && s4 < -eps) || (s3 < -eps && s4 > eps));
+  };
+  const P = cut.map(at), C = at(c), A = at(p0), B = at(p1);
+  const same = (x, y) => Math.hypot(x[0] - y[0], x[1] - y[1]) <= 1e-9 * scaleLen;
+  const lines = [[A, C], [B, C], ...others.map((o) => o.map(at))];
+  for (const L of lines) {
+    for (let i = 0; i + 1 < P.length; i++) for (let j = 0; j + 1 < L.length; j++) {
+      // segments meeting at a corner they share are not a crossing
+      if ([P[i], P[i + 1]].some((x) => same(x, L[j]) || same(x, L[j + 1]))) continue;
+      if (meet(P[i], P[i + 1], L[j], L[j + 1])) return true;
+    }
+  }
+  return false;
+}
+
 /** An edge on an exact line or circle (exactCurve) from v0 to v1, following the chain's direction. */
 function exactEdge(oc, ex, pts, closed, v0, v1) {
   if (ex.line) return closed ? null : new oc.BRepBuilderAPI_MakeEdge_2(v0, v1);
@@ -446,7 +476,7 @@ export function buildTopo(oc, mesh, surfaces, { facetLabels = null, only = null,
   // 100 mm out of a 580 mm part: thin fins inside a valid solid of the right volume). Keeping such
   // corners on their mesh vertex, with or without a matching vertex tolerance, made Star worse
   // (analytic -> 21-31% facets, and OCCT 7.9 then read the STEP as invalid), so it is left as measured.
-  const vertex = new Map(), cornerPos = new Map();
+  const vertex = new Map(), cornerPos = new Map(), arcsOf = new Map();   // arcsOf: a facet's arcs so far
   const place = (c) => {
     const fl = flagsAt(facesAt.get(c));
     const v = Math.floor(c / BODY_STRIDE);
@@ -507,7 +537,8 @@ export function buildTopo(oc, mesh, surfaces, { facetLabels = null, only = null,
     if (BUILD.FACET_ARCS && fa !== null && !closed && path.length === 2 && ss.length === 1 && ss[0][0] !== 'plane' && ss[0][0] !== 'bspline') {
       const q = T[patchTris.get(fa)[0]].map((v) => cornerAt(ck(v, bd)));
       if (q.every(Boolean)) cut = facetArc(q, pts[0], pts[1], ss[0], scaleLen);
-      if (cut) bump(info, 'facet_arcs');
+      if (cut && arcCrosses(cut, q, arcsOf.get(fa) ?? [], scaleLen)) { cut = null; bump(info, 'facet_arc_crossing'); }
+      if (cut) { bump(info, 'facet_arcs'); arcsOf.set(fa, [...(arcsOf.get(fa) ?? []), cut]); }
     }
     const straight = bothPlanes || (fa !== null && !cut);
     const v0 = vertex.get(ck(path[0], bd)), v1 = vertex.get(ck(path[path.length - 1], bd));
@@ -782,14 +813,19 @@ function connectedShells(oc, builder, faces) {
   return comp;
 }
 
-const PCURVE_TOL = 1e-7;
+const PCURVE_TOL = 1e-7, PCURVE_ON = 1e-2, PCURVE_OVERSHOOT = 0.5;
 
 /**
  * PCURVES for the spline edges: each one's curve in the parameters of both its faces, through the surface's own
  * (u, v) at the same points and the same parameters as the 3D spline. Without them ShapeFix projects every spline
  * onto both surfaces, which on a plain build (no exact lines or circles) is most of its time: 31 s against 0.5 s
  * for the clean build of the same 42 faces, 00000890_001. One that strays from the 3D curve by more than
- * PCURVE_TOL x diagonal beyond twice the curve's own distance from the surface is left to ShapeFix.
+ * PCURVE_TOL x diagonal beyond twice the curve's own distance from the surface is left to ShapeFix, and so is one
+ * whose points are off the surface by more than PCURVE_ON x diagonal, or whose poles go round a periodic surface more
+ * than PCURVE_OVERSHOOT periods beyond its points (the interpolation overshooting; a thread's helix goes round 3.6
+ * times through its own points, 00003819_009): an edge to a corner far off its surfaces (00046240_0, 2.5e5 mm out)
+ * passed the check above, as the curve's own distance is allowed, with a pcurve 609,773 rad round a torus, and
+ * ShapeFix ran for hours on it.
  */
 function addPcurves(oc, builder, edges, faceOf, facets, info, scaleLen) {
   const sas = new Map();
@@ -811,10 +847,12 @@ function addPcurves(oc, builder, edges, faceOf, facets, info, scaleLen) {
       if (!face) continue;
       const { g, sa, up, vp } = analysis(f, face);
       const uv = [];
+      let gap = 0;
       for (const q of pc.pts) {
         const gp = pnt(oc, q);
         const p2 = sa.ValueOfUV(gp, 1e-9);
         let u = p2.X(), v = p2.Y();
+        gap = Math.max(gap, sa.Gap());
         gp.delete(); p2.delete();
         if (uv.length) { const [u0, v0] = uv[uv.length - 1]; u = wrap(u, u0, up); v = wrap(v, v0, vp); }
         uv.push([u, v, 0]);
@@ -824,8 +862,12 @@ function addPcurves(oc, builder, edges, faceOf, facets, info, scaleLen) {
         const [u0, v0] = uv[0], [ul, vl] = uv[uv.length - 1];
         closeWith = [wrap(u0, ul, up), wrap(v0, vl, vp), 0];
       }
+      if (!(gap <= PCURVE_ON * scaleLen)) { bump(info, 'pcurve_off_surface'); continue; }
       try {
         const { poles, knots, mults, degree } = interpolateChain(uv, pc.closed, { t: pc.t, closeWith });
+        const span = (P, k) => { let lo = Infinity, hi = -Infinity; for (const q of P) { lo = Math.min(lo, q[k]); hi = Math.max(hi, q[k]); } return hi - lo; };
+        const over = (k, period) => period && span(poles, k) > span(uv, k) + PCURVE_OVERSHOOT * period;
+        if (over(0, up) || over(1, vp)) { bump(info, 'pcurve_overshoot'); continue; }
         // Checked halfway between its points, where the two interpolations part most: the pcurve's point must be
         // as near the 3D curve's as the surface is (the tolerance ShapeFix's projection would give the edge), else
         // ShapeFix projects it. Interpolated (u, v) strays where the chain is sparse and turns: 5 points round a
