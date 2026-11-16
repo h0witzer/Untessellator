@@ -31,7 +31,7 @@ const MIME = {
 
 const server = http.createServer((req, res) => {
   let urlPath = req.url.split('?')[0];
-  if (urlPath === '/') urlPath = '/index.html';
+  if (urlPath.endsWith('/')) urlPath += 'index.html';   // a folder's index, as GitHub Pages serves it (/guide/)
 
   // Normalise and guard against path traversal
   const filePath = path.normalize(path.join(ROOT, urlPath));

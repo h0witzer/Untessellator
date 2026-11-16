@@ -462,6 +462,7 @@ export function createGuide(app) {
     }
     sample = opened;
     planted = false;
+    address('/guide/');
     go(0);
   }
 
@@ -499,9 +500,22 @@ export function createGuide(app) {
     point(null);
     card.hidden = true;
     app.stage.classList.remove('wb-view--guide');
+    address('/');
   }
 
   return { start, stop, get running() { return at >= 0 || !!message; } };
+}
+
+/**
+ * The address bar says where the user is: untessellator.com/guide/ while the guide runs, the plain site once it ends
+ * (other query parameters kept). /guide/ is guide/index.html, which hands a reload back to /?guide, so a reload
+ * mid-guide starts it again and one after it closed doesn't. The page's own paths don't move: index.html's <base>.
+ */
+function address(path) {
+  const url = new URL(location.href);
+  url.searchParams.delete('guide');
+  url.pathname = path;
+  if (url.href !== location.href) history.replaceState(history.state, '', url);
 }
 
 const esc = (text) => String(text).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
