@@ -5,7 +5,8 @@
 // stops reading there.
 //
 // The live copies are elsewhere: link-card.png is brand/social-preview.png, readme-banner.png is
-// brand/readme-banner.png, and the gallery's two are brand/ in Untessellator-Gallery. Copy a new render over them.
+// brand/readme-banner.png, guide-card.png is brand/guide-card.png (the card of untessellator.com/guide/), and the
+// gallery's two are brand/ in Untessellator-Gallery. Copy a new render over them.
 //
 // Usage: node brand/cards/render.mjs <playwright package dir> [--preview] [name.html ...]
 //   (the package dir is the folder holding Playwright's index.mjs; CHROME=<chrome.exe> picks a browser)

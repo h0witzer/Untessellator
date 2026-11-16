@@ -1,0 +1,47 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<!-- The guide's link card: brand/guide-card.png, the og:image of untessellator.com/guide/. 1280x640, the gallery card's
+     layout. The tile is guide-part.png: the sample bracket in the page at the guide's "Check the types" step (Color by
+     Type, the large hole typed as a cone, the guide's outline on its rim), with a copy of the guide's card over it. -->
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=IBM+Plex+Mono:wght@500&display=swap">
+<style>
+  html, body { margin: 0; background: #2a1638; }
+  .c { width: 1280px; height: 640px; position: relative; overflow: hidden; background: #2a1638; font-family: "Chakra Petch", sans-serif; }
+  .left { position: absolute; left: 64px; top: 0; bottom: 24px; width: 545px; display: flex; flex-direction: column; justify-content: center; gap: 20px; }
+  .row { display: flex; align-items: flex-end; gap: 16px; }
+  .row img { width: 420px; display: block; }
+  .row span { color: #c7b6da; font: 600 20px/1 "Chakra Petch", sans-serif; letter-spacing: 0.22em; padding-bottom: 4px; }
+  .t { color: #f5effb; font: 700 46px/1.06 "Chakra Petch", sans-serif; margin-top: 8px; }
+  .s { color: #c7b6da; font: 500 22px/1.4 "Chakra Petch", sans-serif; letter-spacing: 0.02em; }
+  .u { color: #b98cff; font: 600 21px/1 "Chakra Petch", sans-serif; letter-spacing: 0.03em; margin-top: 4px; }
+  /* the part, on the stage in an octagon tile */
+  .tile { position: absolute; right: 56px; top: 40px; width: 548px; height: 548px; background: #2a1a37 url(guide-part.png) left -34px top 66px / 548px no-repeat;
+    clip-path: polygon(16px 0, calc(100% - 16px) 0, 100% 16px, 100% calc(100% - 16px), calc(100% - 16px) 100%, 16px 100%, 0 calc(100% - 16px), 0 16px); }
+  /* a copy of the guide's card (workbench.css .wb-guide), in the tile's empty upper right */
+  .g { position: absolute; right: 74px; top: 58px; width: 318px; padding: 14px 18px 16px; background: rgba(36, 21, 47, 0.97); display: grid; gap: 9px;
+    clip-path: polygon(9px 0, calc(100% - 9px) 0, 100% 9px, 100% calc(100% - 9px), calc(100% - 9px) 100%, 9px 100%, 0 calc(100% - 9px), 0 9px); }
+  .gh { display: flex; justify-content: space-between; align-items: center; color: #9a85b0; font: 600 13px/1 "Chakra Petch", sans-serif; letter-spacing: 0.12em; }
+  .gh i { font: 500 13px/1 "IBM Plex Mono", monospace; font-style: normal; color: #c7b6da; letter-spacing: 0; }
+  .gb { height: 5px; border-radius: 3px; background: #170c20; overflow: hidden; }
+  .gb span { display: block; width: 73%; height: 100%; border-radius: 3px; background: linear-gradient(90deg, #ff7a1a, #ffc933, #ff5c8a, #2fc59a, #8a4fe0); }
+  .gt { color: #f5effb; font: 700 27px/1.1 "Chakra Petch", sans-serif; }
+  .gt b { color: #ffc933; font-weight: 700; }
+  .gx { color: #c7b6da; font: 500 18px/1.35 "Chakra Petch", sans-serif; }
+  .band { position: absolute; left: 0; right: 0; bottom: 0; height: 16px; background: url(../facet-band.svg) left / 100% 100% no-repeat; }
+</style></head>
+<body data-scale="1"><div class="card c">
+  <div class="left">
+    <div class="row"><img src="../wordmark-on-plum.svg" alt=""><span>GUIDE</span></div>
+    <div class="t">Turn a mesh back into<br>CAD, step by step.</div>
+    <div class="s">Auto-paint a sample bracket. Then fix four planted mistakes by hand and export a clean STEP.<br>Free, in your browser.</div>
+    <div class="u">untessellator.com/guide</div>
+  </div>
+  <div class="tile"></div>
+  <div class="g">
+    <div class="gh">ROUND 2 · FIX BY HAND <i>8 of 11</i></div>
+    <div class="gb"><span></span></div>
+    <div class="gt"><b>▸</b> Check the types</div>
+    <div class="gx">The large hole is typed as a cone. The check can't see that.</div>
+  </div>
+  <div class="band"></div>
+</div></body></html>
