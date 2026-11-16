@@ -31,6 +31,24 @@
 .studio-empty[hidden] {
   display: none;
 }
+/* the empty view's two ways in: a file of your own, or the guide on its sample */
+.studio-empty__actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px;
+  pointer-events: auto;
+}
+.studio-empty__actions .wb-btn {
+  padding: 11px 18px;
+  font: 600 14px/1 var(--wb-font-label);
+  letter-spacing: 0.02em;
+  color: var(--wb-text);
+}
+/* the group table with no groups yet: its Auto-paint button, then the words */
+.wb-lstart .wb-btn {
+  margin-right: 6px;
+}
 .studio-empty__about {
   max-width: 440px;
   margin: 0;

@@ -68,6 +68,7 @@ import { GroupStore, typeLabel } from './groups.js';
 import { conversionNumbers, reportUrl, reportJson, placeGroups, binaryStl, fingerprint } from './report.js';
 import { zipSync, strToU8 } from 'fflate';
 import { typeRgb } from './palette.js';
+import { createGuide } from './guide.js';
 
 const UNPAINTED = [0.74, 0.74, 0.74];
 const FOV = ui.LIGHTING.fieldOfViewDegrees;
@@ -139,6 +140,8 @@ ui.registerIcons({
   folder: '<path d="M1.6 3.2L7.6 3.2L9.6 5.2L18.4 5.2L18.4 16.8L1.6 16.8Z" opacity=".5"/><path d="M1.6 8L17 8L18.4 9.4L18.4 16.8L1.6 16.8Z"/>',
   // Four tiles, two of them dimmed: the gallery.
   gallery: '<path d="M1.6 1.6L8.8 1.6L8.8 8.8L1.6 8.8Z"/><path d="M11.2 1.6L18.4 1.6L18.4 8.8L11.2 8.8Z" opacity=".5"/><path d="M1.6 11.2L8.8 11.2L8.8 18.4L1.6 18.4Z" opacity=".5"/><path d="M11.2 11.2L18.4 11.2L18.4 18.4L11.2 18.4Z"/>',
+  // A faceted map pin with a diamond window, its right half in the second tone: the guide.
+  guide: '<path d="M10 1.2L15.8 4.6V10.4L10 18.8L4.2 10.4V4.6ZM10 4.6L7.2 7.4L10 10.2L12.8 7.4Z" fill-rule="evenodd"/><path d="M10 1.2L15.8 4.6V10.4L10 18.8V10.2L12.8 7.4L10 4.6Z" opacity=".22" fill="#000"/>',
   // A heart in facets: support.
   heart: '<path d="M10 18L1.6 9.6L1.6 5.4L4.8 2.2L7.8 2.2L10 4.4L12.2 2.2L15.2 2.2L18.4 5.4L18.4 9.6Z"/><path d="M10 4.4L10 18L18.4 9.6L18.4 5.4L15.2 2.2L12.2 2.2Z" opacity=".22" fill="#000"/>',
   // A faceted lens with a diamond pupil: a body on show in the Bodies list; struck through and dimmed, hidden.
@@ -303,12 +306,32 @@ shell.stage.append(resultEl);
 let resultSteps = [];
 /** The last step of every problem card: a failure can always be reported (report.js). */
 const REPORT_STEP = { label: 'Report it', detail: 'Downloads a report file and opens a prefilled GitHub issue; nothing is sent until you submit it.', onSelect: () => reportConversion() };
+// The Ko-fi ask under a clean export's card, for a part of the user's own (never the guide's sample). "Hide for 2 weeks"
+// (or following the link) keeps it off this browser for 14 days; with storage blocked, for this visit only.
+const SUPPORT_URL = 'https://ko-fi.com/derekvanallen';
+const SUPPORT_KEY = 'untessellator.supportHiddenUntil';
+const SUPPORT_SNOOZE_MS = 14 * 24 * 60 * 60 * 1000;
+let supportSnoozed = false;
+function supportHidden() {
+  if (supportSnoozed) return true;
+  try { return Number(localStorage.getItem(SUPPORT_KEY) ?? 0) > Date.now(); } catch { return false; }
+}
+function snoozeSupport() {
+  supportSnoozed = true;
+  try { localStorage.setItem(SUPPORT_KEY, String(Date.now() + SUPPORT_SNOOZE_MS)); } catch { /* storage blocked: this visit only */ }
+}
+const supportHtml = () => `<div class="wb-rsupport">${ui.iconMarkup('heart', { className: 'wb-ticon wb-rheart' })}
+  <span class="wb-rsupport-text">Untessellator is free. If it saved you some time, consider supporting my future projects.</span>
+  <a class="wb-btn wb-small" href="${SUPPORT_URL}" target="_blank" rel="noopener" data-act="support-go" title="Opens Ko-fi in a new tab">Buy me a beer</a>
+  <button type="button" class="wb-rsupport-hide" data-act="support-hide">Hide for 2 weeks</button></div>`;
+
 /**
  * Show the result card: `title`, a `lead` sentence, `groups` ([id, why] pairs, worst first) and `steps`
  * ([{ label, detail, primary?, onSelect }]). `bad` marks it as a problem, and a problem card always ends with
- * Report it. A new run or a new mesh closes it.
+ * Report it. `support` adds the Ko-fi ask (a clean export's card) unless it was hidden in the last 2 weeks. A new run
+ * or a new mesh closes it.
  */
-function showResult({ title, lead = '', groups = [], steps = [], bad = false }) {
+function showResult({ title, lead = '', groups = [], steps = [], bad = false, support = false }) {
   const SHOWN = 6;
   if (bad) steps = [...steps, REPORT_STEP];
   resultSteps = steps;
@@ -323,7 +346,8 @@ function showResult({ title, lead = '', groups = [], steps = [], bad = false }) 
       <button type="button" class="wb-iconbtn wb-rclose" data-act="close" aria-label="Close" title="Close (the ⚠ marks stay in the list)">✕</button></div>
     ${lead ? `<p class="wb-rlead">${esc(lead)}</p>` : ''}
     ${groups.length ? `<ul class="wb-rgroups">${groups.slice(0, SHOWN).map(row).join('')}</ul>${groups.length > SHOWN ? `<div class="wb-rmore">and ${groups.length - SHOWN} more, marked ⚠ in the list</div>` : ''}` : ''}
-    ${steps.length ? `<div class="wb-rsteps">${steps.map((s, i) => `<div class="wb-rstep"><button type="button" class="wb-btn wb-small${s.primary ? ' wb-primary' : ''}" data-step="${i}">${esc(s.label)}</button><span>${esc(s.detail)}</span></div>`).join('')}</div>` : ''}`;
+    ${steps.length ? `<div class="wb-rsteps">${steps.map((s, i) => `<div class="wb-rstep"><button type="button" class="wb-btn wb-small${s.primary ? ' wb-primary' : ''}" data-step="${i}">${esc(s.label)}</button><span>${esc(s.detail)}</span></div>`).join('')}</div>` : ''}
+    ${support && !supportHidden() ? supportHtml() : ''}`;
   resultEl.hidden = false;
   shell.hint.hidden = true;
 }
@@ -395,6 +419,15 @@ resultEl.addEventListener('click', (event) => {
   const el = event.target.closest('[data-act],[data-step],[data-group]');
   if (!el) return;
   if (el.dataset.act === 'close') hideResult();
+  // the Ko-fi link opens in its own tab (no preventDefault); either way the ask leaves this card and the next 2 weeks
+  else if (el.dataset.act === 'support-go') {
+    snoozeSupport();
+    const row = el.closest('.wb-rsupport');
+    setTimeout(() => { if (row) row.innerHTML = `${ui.iconMarkup('heart', { className: 'wb-ticon wb-rheart' })}<span class="wb-rsupport-text">Thank you!</span>`; }, 0);
+  } else if (el.dataset.act === 'support-hide') {
+    snoozeSupport();
+    el.closest('.wb-rsupport')?.remove();
+  }
   else if (el.dataset.group) {
     const id = Number(el.dataset.group);
     if (!mesh?.store.groups.has(id)) return;
@@ -449,8 +482,10 @@ const corner = ui.mountViewCube(shell.stage, {
   },
 });
 
-// The tool row: the tools, the surface to paint as (each its icon), the brush, auto-paint, the fill options and
-// the report. `toolbar` gives the studio's code its calls (setPressed, setDisabled, get) by each control's data-tb.
+// The tool row, in the order the work goes: auto-paint first (white while anything is unpainted: the step to take
+// after opening a file) with its fill options, then the tools to fix what it got wrong, the surface to paint as (each
+// its icon) and the brush. `toolbar` gives the studio's code its calls (setPressed, setDisabled, get) by each
+// control's data-tb.
 const TOOL_ICONS = { select: 'select', fill: 'bucket', raw: 'brush', erase: 'eraseFill', delete: 'deleteFace' };
 const toolRow = document.getElementById('tools');
 const typeTip = (type, i) => (type === 'auto' ? `The model picks the surface from the seed (${i + 1})`
@@ -458,6 +493,9 @@ const typeTip = (type, i) => (type === 'auto' ? `The model picks the surface fro
     : type === 'skip' ? `Skip what the import mangled: left out of fitting, auto-paint and the checks; export heals it over with the group around it, or drops a stray shell (${i + 1})`
       : `Fill as ${typeLabel(type).toLowerCase()}; painting into a group retypes it (${i + 1})`);
 toolRow.innerHTML = `
+  <button type="button" class="wb-tool wb-tool--auto" data-tb="autopaint" title="Auto-paint every unpainted face; your groups are left alone (P). Esc stops">${ui.iconMarkup('wand', { className: 'wb-ticon' })}Auto-paint</button>
+  <button type="button" class="wb-tool" data-tb="fill-options" title="Fill method, model and options" aria-label="Fill options">${ui.iconMarkup('surface', { className: 'wb-ticon' })}</button>
+  <span class="wb-vsep"></span>
   <div class="wb-tgroup wb-tgroup--tools">${[
     ['select', 'Select', 'Click a face to select its group (V)'],
     ['fill', 'Bucket', 'Fill: each triangle crossed fills its surface into the group (G)'],
@@ -468,10 +506,7 @@ toolRow.innerHTML = `
   <span class="wb-vsep"></span>
   <div class="wb-tgroup"><span class="wb-glabel">Paint as</span>${FILL_TYPES.map((type, i) => `${type === 'skip' ? '<span class="wb-vsep wb-vsep--short"></span>' : ''}<button type="button" class="wb-ftype${type === 'skip' ? ' wb-ftype--skip' : ''}" data-tb="type-${type}" aria-pressed="${settings.type === type}" title="${typeTip(type, i)}" aria-label="${type === 'auto' ? 'Auto' : typeLabel(type)}">${typeIcon(type, type === 'auto' ? null : TYPE_RGB[type])}<span class="wb-tlabel">${type === 'auto' ? 'Auto' : typeLabel(type)}</span></button>`).join('')}</div>
   <span class="wb-vsep"></span>
-  <label class="wb-size" for="brush-size">Brush <input type="range" id="brush-size" min="3" max="64" value="${settings.brushPx}"> <span class="mono" id="brush-px">${settings.brushPx}px</span></label>
-  <span class="wb-vsep"></span>
-  <button type="button" class="wb-tool" data-tb="autopaint" title="Auto-paint every unpainted face; your groups are left alone (P). Esc stops">${ui.iconMarkup('wand', { className: 'wb-ticon' })}Auto-paint</button>
-  <button type="button" class="wb-tool" data-tb="fill-options" title="Fill method, model and options" aria-label="Fill options">${ui.iconMarkup('surface', { className: 'wb-ticon' })}</button>`;
+  <label class="wb-size" for="brush-size">Brush <input type="range" id="brush-size" min="3" max="64" value="${settings.brushPx}"> <span class="mono" id="brush-px">${settings.brushPx}px</span></label>`;
 toolRow.addEventListener('click', (event) => {
   const button = event.target.closest('[data-tb]');
   if (!button) return;
@@ -485,7 +520,7 @@ toolRow.addEventListener('click', (event) => {
 const reportButton = document.getElementById('report');
 reportButton.innerHTML = ui.iconMarkup('flag', { className: 'wb-ticon' });
 // the header's other icons, before their labels (a narrow window hides the labels)
-for (const [id, icon] of [['open', 'folder'], ['undo', 'undo'], ['redo', 'redo'], ['gallery', 'gallery'], ['support', 'heart']]) {
+for (const [id, icon] of [['open', 'folder'], ['undo', 'undo'], ['redo', 'redo'], ['guide', 'guide'], ['gallery', 'gallery'], ['support', 'heart']]) {
   document.getElementById(id).insertAdjacentHTML('afterbegin', ui.iconMarkup(icon, { className: 'wb-ticon' }));
 }
 reportButton.addEventListener('click', () => reportConversion());
@@ -539,6 +574,8 @@ let needsRender = true;
 let edgesDirty = false;
 let legendDirty = false;
 let cursor = null;
+/** The triangles the guide points at (guide.js), outlined over any other outline; null when it points at none. */
+let guideRing = null;
 const modifiers = { shift: false, alt: false };
 
 window.studio = {
@@ -1378,6 +1415,49 @@ function editGroups(label, change) {
   refreshPanel();
 }
 
+/**
+ * Paint the open mesh as `paint` says, as one undo step called `label`: `owner` a group index per triangle (-1 left
+ * unpainted) and `types` each index's type. Every group there was goes. The guide's prepared paints (guide.js) come
+ * through here; nothing in it depends on a model, so a retrained model can't change what they show. False when the
+ * paint doesn't fit the mesh or a stroke or auto-paint is running.
+ */
+async function loadPaint(paint, label) {
+  if (!mesh || paint.owner.length !== mesh.model.count) return false;
+  if (stroke || autoRun) { say('Finish or cancel (Esc) the stroke or auto-paint first', true); return false; }
+  const current = mesh;
+  await preparePaint();   // each group is fitted as it is made, which takes the fill tool
+  if (mesh !== current || stroke || autoRun) return false;
+  selection = new Set();
+  active = null;
+  mesh.flags = new Map();   // the export check's flags were for the groups this replaces
+  editGroups(label, (store) => {
+    for (let t = 0; t < paint.owner.length; t++) store.assign(t, -1);
+    const ids = new Map();
+    paint.owner.forEach((i, t) => {
+      if (i < 0) return;
+      if (!ids.has(i)) {
+        const id = store.create(paint.types[i]).id;
+        ids.set(i, id);
+        mesh.origins.set(id, { by: 'guide' });
+      }
+      store.assign(t, ids.get(i));
+    });
+    return [...ids.values()];
+  });
+  return true;
+}
+
+/** Frame triangles `tris` in the view, as zoomTo frames groups. */
+function zoomToTriangles(tris) {
+  if (!mesh || !tris.length) return;
+  const P = mesh.model.positions;
+  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  for (const t of tris) for (let k = 0; k < 9; k++) { const a = k % 3; lo[a] = Math.min(lo[a], P[t * 9 + k]); hi[a] = Math.max(hi[a], P[t * 9 + k]); }
+  camera.center = lo.map((v, a) => (v + hi[a]) / 2);
+  camera.distance = Math.max(Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) / 2, mesh.model.radius * 0.25) * 2.7;
+  requestRender();
+}
+
 function deleteGroup(id) {
   const name = mesh.store.name(id);
   editGroups(`Delete ${name}`, (store) => {
@@ -1564,7 +1644,7 @@ async function exportStep({ checked = false } = {}) {
     if (report.timedOut || report.failed) offerAfterFacets(current, step, report);
     else if (report.tier !== 'analytic') offerRepair(current, step, report);
     else if (shown) offerSave(current, step, report);
-    else saveStep(current, step, report, `${name}.stp`);
+    else savedClean(current, step, report);
   } catch (error) {
     if (error.name === 'AbortError') { say('Export stopped: nothing was saved'); return; }
     console.error(error);
@@ -1627,7 +1707,17 @@ function offerSave(current, step, report) {
       { label: 'Save STEP', primary: true, detail: `Downloads ${file}.`, onSelect: () => saveStep(current, step, report, file) },
       { label: 'Back to editing', detail: 'Returns to the painted groups; nothing is saved.', onSelect: () => {} },
     ],
+    // the ask is for a part of the user's own; the guide's sample did nothing for them yet
+    support: !current.fromGuide,
   });
+}
+
+/** A fully analytic build with no preview to show: it saved at once, so the card only says so, with the Ko-fi ask. */
+function savedClean(current, step, report) {
+  const file = `${current.name}.stp`;
+  saveStep(current, step, report, file);
+  if (current.fromGuide || supportHidden()) return;
+  showResult({ title: `Saved: ${file}`, lead: 'A closed solid, every face on its fitted surface.', support: true });
 }
 
 /**
@@ -2255,9 +2345,13 @@ function selectGroup(id, event = {}) {
   edgesDirty = true;
   refreshPanel();
 }
+/** Zooms to groups so far (each by the user: a row, Zoom to, a card's group), and the last one's groups: the guide's. */
+const zooms = { count: 0, ids: [] };
 /** Frame groups `ids` in the view. */
 function zoomTo(ids) {
   if (!mesh) return;
+  zooms.count++;
+  zooms.ids = [...ids];
   const { model, store } = mesh;
   const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
   const P = model.positions;
@@ -3075,7 +3169,7 @@ function replaceMesh(positions, src, label) {
   store.takeChanged();
   const next = {
     model, geometry: { index: null, attributes: { position: { array: positions } } }, name: old.name, store,
-    colours: new Float32Array(model.count * 9), offset: old.offset, repair: old.repair,
+    colours: new Float32Array(model.count * 9), offset: old.offset, repair: old.repair, fromGuide: old.fromGuide,
     synthetic: Uint8Array.from(src, (s) => (s < 0 || old.synthetic?.[s] ? 1 : 0)),   // caps, the repair's or the edit's
     flags: new Map(), showFlags: false,
     deviation: new Float32Array(model.count).fill(NaN), levels: new Float32Array(model.count * 3).fill(NO_LEVEL),
@@ -3458,6 +3552,8 @@ function refreshPanel() {
   toolbar.setDisabled('undo', store?.undoStack.length || mesh?.before ? null : 'Nothing to undo');
   toolbar.setDisabled('redo', store?.redoStack.length || meshRedo() ? null : 'Nothing to redo');
   toolbar.setDisabled('export', store?.list().length ? null : 'Paint at least one face group first');
+  // auto-paint is the step to take while anything is unpainted: white, as Export STEP is once there is a group
+  toolbar.get('autopaint')?.classList.toggle('wb-tool--go', hasMesh && store.painted < mesh.model.count);
   const slider = document.getElementById('brush-size');
   if (slider && Number(slider.value) !== settings.brushPx) { slider.value = settings.brushPx; document.getElementById('brush-px').textContent = `${settings.brushPx}px`; }
   const summary = document.getElementById('summary');
@@ -3507,6 +3603,8 @@ function refreshPanel() {
   let unpainted = mesh.model.count - store.painted;
   if (bodySel.size) { unpainted = 0; for (let t = 0; t < mesh.model.count; t++) if (store.owner[t] < 0 && bodySel.has(mesh.model.bodyOf[t])) unpainted++; }
   if (unpainted) body += `<tr class="wb-unp"><td>Unpainted</td><td></td><td class="wb-num">${unpainted.toLocaleString()}</td><td class="wb-col-area"></td><td></td></tr>`;
+  // no groups yet: the way to start, above the unpainted row
+  if (!all.length) body = `<tr><td colspan="5" class="wb-lnote wb-lstart"><button type="button" class="wb-btn wb-primary wb-small" data-act="autopaint" title="Auto-paint every face (P)">Auto-paint</button> or paint faces with the bucket.</td></tr>${body}`;
   // the arrow points the way the numbers run: Fit's first order is worst first, so its numbers fall
   const arrow = (k) => (table.sort.key !== k ? '' : (k === 'fit' ? table.sort.dir < 0 : table.sort.dir > 0) ? ' ▲' : ' ▼');
   const fitOptions = (current) => SURFACE_KINDS.map((t) => `<option value="${t}" ${current === t ? 'selected' : ''}>${typeLabel(t)}</option>`).join('');
@@ -3585,7 +3683,7 @@ function refreshPanel() {
     ${picked.length > 1 ? below : ''}
     <div class="wb-tablewrap"><table>
       <thead><tr>${[['name', 'Group'], ['type', 'Type'], ['count', 'Tris', 'wb-num'], ['area', 'Area', 'wb-num wb-col-area'], ['fit', 'Fit · worst']].map(([k, l, cls]) => `<th class="${cls ?? ''}"><button type="button" data-sort="${k}">${l}${arrow(k)}</button></th>`).join('')}</tr></thead>
-      <tbody>${body || '<tr><td colspan="5" class="wb-lnote">No groups yet: paint, or Auto-paint (P).</td></tr>'}</tbody></table></div>
+      <tbody>${body}</tbody></table></div>
     ${picked.length === 1 ? below : ''}`;
   PANEL_SCROLLERS.forEach((sel, i) => {
     const el = panelEl.querySelector(sel), was = scrolled[i];
@@ -3608,6 +3706,8 @@ function setType(type) {
 }
 
 // the table's controls
+/** The last click on a group's row, { id, at }: the first half of a double-click (the click handler below). */
+let rowClick = null;
 panelEl.addEventListener('click', (event) => {
   if (!mesh) return;
   if (event.target.closest('input.wb-bname')) return;
@@ -3624,7 +3724,22 @@ panelEl.addEventListener('click', (event) => {
   else if (d.by) { table.by = d.by; refreshPanel(); }
   else if (d.ftype) { if (table.types.has(d.ftype)) table.types.delete(d.ftype); else table.types.add(d.ftype); refreshPanel(); }
   else if (d.ffit) { if (table.fits.has(d.ffit)) table.fits.delete(d.ffit); else table.fits.add(d.ffit); refreshPanel(); }
-  else if (el.matches('tr.wb-g')) selectGroup(Number(d.group), event);
+  else if (el.matches('tr.wb-g')) {
+    // A double-click zooms to the group. The first click redraws the table, so the second lands on a new row and the
+    // browser fires no dblclick: two plain clicks on one group within the double-click time count as one.
+    const id = Number(d.group), now = performance.now();
+    if (rowClick?.id === id && now - rowClick.at < 450 && !event.shiftKey && !event.ctrlKey && !event.metaKey) {
+      rowClick = null;
+      selection = new Set([id]);
+      active = id;
+      edgesDirty = true;
+      refreshPanel();
+      zoomTo(new Set([id]));
+    } else {
+      rowClick = { id, at: now };
+      selectGroup(id, event);
+    }
+  }
   else if (d.act === 'body-zoom') zoomToBodies([...bodySel]);
   else if (d.act === 'body-solo') { mesh.hiddenBodies = new Set(mesh.model.bodies.map((_, b) => b).filter((b) => !bodySel.has(b))); applyHidden(); refreshPanel(); }
   else if (d.act === 'body-showall') showAllBodies();
@@ -3632,6 +3747,7 @@ panelEl.addEventListener('click', (event) => {
   else if (d.act === 'body-delete') deleteBodies([...bodySel].sort((a, b) => a - b));
   else if (d.act === 'body-clear') { bodySel = new Set(); edgesDirty = true; requestRender(); refreshPanel(); }
   else if (d.act === 'fix-find') findFixes();
+  else if (d.act === 'autopaint') runAutoPaint();
   else if (d.act === 'mfix-apply') applyMeshFixes();
   else if (d.act === 'fix-toggle') { fixes.open = !fixes.open; refreshPanel(); }
   else if (d.act === 'fix-apply') applyFixes(fixes.list.filter((p) => !fixes.unchecked.has(p.id)));
@@ -3972,13 +4088,16 @@ function frame(now) {
     lastEdgeBuild = now;
     const { model, store } = mesh;
     renderer.setBands('edges', workbenchEdges(model, store));
-    // The picked groups' outline; with none, the groups the export check flagged when shown (showDoubts).
+    // What the guide points at, while it points; else the picked groups' outline; with none, the groups the export
+    // check flagged when shown (showDoubts). The guide's outline goes first: a fill selects the group it made, and
+    // that group's outline would hide the next faces the guide means.
     const picked = new Set([...selection].filter((id) => store.count(id)));
     const flagged = !picked.size && mesh.showFlags && mesh.flags.size ? mesh.flags : null;
     const ring = picked.size ? picked : flagged;
-    renderer.setBands('active', !picked.size && mesh.showProblems ? meshHealth(mesh).ends
-      : ring ? outline(model, trianglesOf(store.owner, ring), (t) => ring.has(store.owner[t]))
-        : bodySel.size ? bodyEdges(model, store.owner, 30, (t) => bodySel.has(model.bodyOf[t])) : null);
+    renderer.setBands('active', guideRing ? outline(model, guideRing, (t) => guideRing.has(t))
+      : !picked.size && mesh.showProblems ? meshHealth(mesh).ends
+        : ring ? outline(model, trianglesOf(store.owner, ring), (t) => ring.has(store.owner[t]))
+          : bodySel.size ? bodyEdges(model, store.owner, 30, (t) => bodySel.has(model.bodyOf[t])) : null);
     if (hoverKey?.startsWith('g')) { const key = hoverKey; hoverKey = null; setHover(key); }
     edgesDirty = false;
     needsRender = true;
@@ -4018,6 +4137,65 @@ function frame(now) {
 
 refreshPanel();
 requestAnimationFrame(frame);
+
+// ── the guide ─────────────────────────────────────────────────────────────────
+// A walk through the tool on a sample bracket (guide.js): Auto-paint and export, then a paint with mistakes planted in
+// it, fixed with Find fixes and by hand. It reads the studio's state and drives nothing the user can't: what it needs
+// beyond reading is opening its sample, loading its paint, and pointing (an outline on the part, a framed view).
+const guide = createGuide({
+  stage: shell.stage,
+  card: { result: resultEl, tools: toolRow, panel: panelEl },
+  get mesh() { return mesh; },
+  get busy() { return !!(stroke || autoRun || busy.onStop); },
+  get autoRunning() { return !!autoRun; },
+  get tool() { return settings.tool; },
+  get type() { return settings.type; },
+  get colorBy() { return settings.deviation; },
+  get fixes() { return { fresh: fixesFresh(), count: fixes.list?.length ?? 0, open: fixes.open }; },
+  get previewing() { return !!previewing; },
+  get selection() { return [...selection]; },
+  /** The group table's filters: the types and fit verdicts it shows (none picked: all). */
+  get filters() { return { types: [...table.types], fits: [...table.fits] }; },
+  get zooms() { return { count: zooms.count, ids: zooms.ids }; },
+  /** The view shows the whole part, as F, Zoom to fit or a view cube face leave it (within 2% of the fitted zoom). */
+  get viewFitted() {
+    if (!mesh || fitMove) return false;
+    const { centre, radius } = mesh.model;
+    return Math.abs(camera.distance - radius * FIT_DISTANCE) < 0.02 * radius * FIT_DISTANCE
+      && Math.hypot(...camera.center.map((c, a) => c - centre[a])) < 0.02 * radius;
+  },
+  /** Whether the mesh opening changed the file's triangles (meshRepair): the guide's data indexes them as filed. */
+  get repaired() { return !!mesh?.repair && repairChanges(mesh.repair).length > 0; },
+  typeColor: (type) => css(TYPE_RGB[type]),
+  async openSample(url, name) {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+    const before = mesh;
+    await openFile(new File([await response.blob()], name));
+    if (mesh && mesh !== before) mesh.fromGuide = true;   // the guide's own part: its exports don't ask for support
+    return mesh;
+  },
+  loadPaint,
+  point(tris) {
+    guideRing = tris?.length ? new Set(tris) : null;
+    edgesDirty = true;
+    requestRender();
+  },
+  frame: (tris) => zoomToTriangles(tris),
+  /** The group list unfiltered: a step that had the user filter it leaves it so (the view and colors stay theirs). */
+  clearFilters() {
+    table.types.clear();
+    table.fits.clear();
+    table.search = '';
+    refreshPanel();
+  },
+  openFilePicker: () => fileInput.click(),
+  say,
+});
+document.getElementById('guide').addEventListener('click', () => guide.start());
+document.getElementById('empty-guide').addEventListener('click', () => guide.start());
+document.getElementById('empty-open').addEventListener('click', () => fileInput.click());
+if (new URLSearchParams(location.search).has('guide')) guide.start();
 
 const initial = new URLSearchParams(location.search).get('mesh');
 if (initial) {

@@ -150,6 +150,8 @@ body { background: var(--wb-bg); color: var(--wb-text); font: 14.5px/1.45 var(--
 /* Alt or Shift held (studio.js showHeldTool): the eraser or brush lights up, the chosen tool keeps a tint */
 .wb-tool[data-held] { background: var(--wb-accent); color: var(--wb-accent-ink); font-weight: 700; clip-path: var(--btn-round); }
 .wb-tools--holding .wb-tool[aria-pressed="true"]:not([data-held]) { background: var(--wb-raised-3); color: var(--wb-text); font-weight: 400; }
+/* Auto-paint while anything is unpainted (studio.js refreshPanel): white, the step to take next, as a primary is */
+.wb-tool--go:not([aria-pressed="true"]), .wb-tool--go:not([aria-pressed="true"]):hover { background: #ffffff; color: var(--wb-accent-ink); font-weight: 700; }
 .wb-ftype { border: 0; background: var(--wb-raised-2); padding: 5px 10px 5px 7px; cursor: pointer; display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; white-space: nowrap; }
 .wb-ftype:hover { background: var(--wb-raised-3); }
 .wb-ftype .wb-sw { width: 10px; height: 10px; border-radius: 3px; }
@@ -229,6 +231,13 @@ body { background: var(--wb-bg); color: var(--wb-text); font: 14.5px/1.45 var(--
 .wb-rstep { display: grid; grid-template-columns: 138px minmax(0, 1fr); gap: 10px; align-items: center; font-size: 12px; line-height: 1.35; color: var(--wb-muted); }
 .wb-rstep .wb-btn { width: 100%; color: var(--wb-text); }
 .wb-rstep .wb-btn.wb-primary { color: var(--wb-accent-ink); }
+/* the Ko-fi ask under a clean export's card (studio.js supportHtml): a quiet row, the heart in the logo's pink */
+.wb-rsupport { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; border-top: 1px solid var(--wb-line); padding-top: 9px; font-size: 12px; color: var(--wb-muted); }
+.wb-rsupport-text { flex: 1 1 180px; min-width: 0; line-height: 1.35; }
+.wb-rheart { width: 16px; height: 16px; color: #ff5c8a; }
+.wb-rsupport .wb-btn { text-decoration: none; color: var(--wb-text); }
+.wb-rsupport-hide { border: 0; background: none; padding: 0; font: inherit; font-size: 11.5px; color: var(--wb-faint); text-decoration: underline; cursor: pointer; }
+.wb-rsupport-hide:hover { color: var(--wb-text); }
 /* the STEP preview (studio.js enterPreview): the STEP's canvas over the mesh's, clipped at the shutter, the mesh left
    of it and the STEP right; Color by does not apply to it */
 .wb-view--preview .wb-colorby { display: none; }
@@ -357,8 +366,59 @@ div.wb-fixhead { cursor: default; }
   body:not(.wb-anyway) .wb-phone { display: flex; }
 }
 
+/* the guide (guide.js): its card top left over the view, under Color by; the type legend moves down below it */
+.wb-guide { position: absolute; left: 12px; top: 62px; width: min(340px, calc(100% - 24px)); padding: 11px 14px 12px; display: grid; gap: 9px; z-index: 3; background: rgba(36, 21, 47, 0.96); clip-path: var(--card-cut); font-size: 13px; }
+.wb-guide[hidden] { display: none; }
+.wb-view--guide .wb-legend { top: calc(62px + var(--guide-h, 0px) + 10px); }
+.wb-ghead { display: flex; align-items: center; gap: 10px; }
+.wb-ground { flex: 1; min-width: 0; font: 600 11px/1.2 var(--wb-font-label); letter-spacing: 0.12em; text-transform: uppercase; color: var(--wb-faint); }
+.wb-gcount { font: 11.5px var(--wb-font-data); color: var(--wb-muted); white-space: nowrap; }
+/* the round's progress, in the logo's filament colors */
+.wb-gbar { height: 4px; border-radius: 2px; background: var(--wb-sunk); overflow: hidden; }
+.wb-gbar span { display: block; height: 100%; background: linear-gradient(90deg, #ff7a1a, #ffc933, #ff5c8a, #2fc59a, #8a4fe0); border-radius: 2px; transition: width 0.3s ease; }
+.wb-glive { display: grid; gap: 5px; }
+.wb-gtitle { margin: 0; font: 600 15px/1.25 var(--wb-font-label); color: var(--wb-text); }
+.wb-gtitle--done::before { content: "✓ "; color: #2fc59a; }
+.wb-gtext { margin: 0; color: var(--wb-muted); line-height: 1.45; }
+.wb-gtext b { color: var(--wb-text); font-weight: 600; }
+.wb-gaside { display: block; margin-top: 6px; color: var(--wb-faint); font-size: 12px; }
+.wb-guide kbd { border: 1px solid var(--wb-line-strong); border-radius: 3px; padding: 1px 4px; color: var(--wb-muted); }
+.wb-gsw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 4px; vertical-align: -1px; }
+/* a step's checklist: each item ticks itself off as it's done; the next one to do reads brightest */
+.wb-gchecks { list-style: none; margin: 2px 0 0; padding: 0; display: grid; gap: 6px; color: var(--wb-faint); line-height: 1.4; }
+.wb-gchecks li { display: grid; grid-template-columns: 16px minmax(0, 1fr); gap: 6px; }
+.wb-gchecks li::before { content: "○"; color: var(--wb-faint); }
+.wb-gchecks .wb-gcheck--now { color: var(--wb-text); }
+.wb-gchecks .wb-gcheck--now::before { content: "▸"; color: var(--wb-select); }
+.wb-gchecks .wb-gcheck--met { color: var(--wb-muted); }
+.wb-gchecks .wb-gcheck--met::before { content: "✓"; color: #2fc59a; }
+.wb-gchecks b { color: inherit; font-weight: 600; }
+/* what is off when the part isn't right yet */
+.wb-ghint { margin: 0; padding: 7px 10px; background: rgba(255, 201, 51, 0.12); color: var(--wb-text); font-size: 12.5px; line-height: 1.4; clip-path: var(--btn-cut); }
+.wb-ghint::before { content: "⚠ "; color: var(--wb-select); }
+.wb-grow { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.wb-glink { justify-self: start; border: 0; background: none; padding: 0; color: var(--wb-faint); font: inherit; font-size: 12px; text-decoration: underline; cursor: pointer; }
+.wb-glink:hover { color: var(--wb-text); }
+/* the Guide button pressed while it runs: the card shows where it is */
+.wb-guide--flash { animation: wb-guide-flash 0.5s ease 2; }
+@keyframes wb-guide-flash { 50% { background: rgba(90, 58, 124, 0.98); } }
+/* the control a step needs (guide.js pulse): the selection yellow, breathing; an animation, so it shows over a chosen
+   control's own fill */
+[data-guide] { animation: wb-guide-pulse 1.3s ease-in-out infinite; }
+@keyframes wb-guide-pulse {
+  0%, 100% { background-color: var(--wb-select); color: var(--wb-accent-ink); }
+  50% { background-color: rgba(255, 201, 51, 0.3); color: var(--wb-text); }
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-guide] { animation: none; background-color: var(--wb-select) !important; color: var(--wb-accent-ink) !important; }
+  .wb-gbar span { transition: none; }
+  .wb-guide--flash { animation: none; }
+}
+
 @media (max-width: 980px) {
   html, body { height: auto; }
+  .wb-guide { top: 12px; right: 12px; width: auto; }
+  .wb-view--guide .wb-busy, .wb-view--guide .wb-result { top: calc(var(--guide-h, 0px) + 24px); }
   .wb { height: auto; grid-template-columns: minmax(0, 1fr); grid-template-rows: 56px 50px 60vh auto 28px; grid-template-areas: "top" "tools" "view" "panel" "status"; }
   .wb-panel { border-left: 0; border-top: 1px solid var(--wb-line); }
   .wb-tablewrap { max-height: 60vh; }
