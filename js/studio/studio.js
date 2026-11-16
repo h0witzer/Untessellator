@@ -38,8 +38,8 @@ import { preflight, PREFLIGHT } from '../knit/preflight.js';
 import { distNormal } from '../knit/geometry.js';
 import { capOwners, fitTriangles, projectCapVertices } from './caps.js';
 import { creaseTableFor, creaseFor } from '../regionGrow.js';
-import { coherentScores, seedOrder, autoPaint, AUTO_TANGENT } from '../autoPaint.js';
-import { annotateEdges, edgeWall } from '../edgeWall.js';
+import { seedOrder, autoPaint, AUTO_TANGENT } from '../autoPaint.js';
+import { createPaintClient } from './paintClient.js';
 
 /** The learned face-boundary scorer (ml/edge_train.py), scored once per mesh. */
 const EDGE_MODEL = 'models/edge-boundary.onnx';
@@ -568,6 +568,14 @@ let stroke = null;
 /** The auto-paint in progress: { stop } — Esc sets stop. */
 let autoRun = null;
 let lastEdgeBuild = 0;
+/** A stroke changed triangles since the last frame: the frame loop pushes their colours and redraws the panel. */
+let strokeDirty = false;
+/** The panel is due a redraw; while a stroke is down the frame loop draws it at most every PANEL_EVERY_MS. */
+let panelDirty = false;
+let lastPanel = 0;
+const PANEL_EVERY_MS = 250;
+/** While a stroke is down the group edges are rebuilt (a pass over the whole mesh) at most this often. */
+const STROKE_EDGES_MS = 150;
 let paintPromise = null;
 let prepared = null;
 let needsRender = true;
@@ -666,11 +674,11 @@ async function openFile(file) {
     checkMesh(mesh);   // its fixes (holes, fins, walls, overlapping pieces), in the background
     // Adjacency and curvature take a moment on a big mesh: start now so the first stroke doesn't wait.
     // Seed scores for auto-paint too, so the button starts at once.
+    // The worker's copy, its edge scores and seed scores start at once; the page's own copy (strokes read it) after.
     const opened = mesh;
-    setTimeout(() => preparePaint()
-      .then(() => edgeScoresFor(opened))
-      .then(() => coherenceFor(opened))
-      .catch(() => {}), 50);
+    edgeScoresFor(opened).catch(() => {});
+    coherenceFor(opened).catch(() => {});
+    setTimeout(() => { if (mesh === opened) preparePaint().catch(() => {}); }, 50);
   } catch (error) {
     console.error(error);
     say(`Could not open ${file.name}: ${error.message}`, true);
@@ -827,11 +835,18 @@ function strokeGroup(t) {
   return stroke.gid;
 }
 
-function applyBrush(point) {
+/**
+ * One brush step at `point`. `area` is a renderer.pickArea readback that covers the point (moveStroke reads one for a
+ * whole mouse move); without it the step reads its own.
+ */
+function applyBrush(point, area = null) {
   if (stroke.cancelled) return;
   const { store } = mesh;
+  const radius = stroke.mode === 'fill' ? 0 : settings.brushPx * dpr();
+  const r = Math.ceil(radius);
+  area ??= renderer.pickArea(point.x - r, point.y - r, point.x + r, point.y + r);
   if (stroke.mode === 'fill') {
-    const { centre } = renderer.pick(point.x, point.y, 0);
+    const centre = area.at(Math.round(point.x), Math.round(point.y));
     if (centre < 0) return;
     strokeGroup(centre);
     // Painted already, by this group or another (a fill never takes from another group).
@@ -841,13 +856,14 @@ function applyBrush(point) {
     pump();
     return;
   }
-  const { centre, ids } = renderer.pick(point.x, point.y, settings.brushPx * dpr());
+  const { centre, ids } = area.around(point.x, point.y, radius);
   if (!ids.size) return;
   if (stroke.mode === 'delete') { markDoomed(ids); return; }
   const target = stroke.mode === 'erase' ? -1 : strokeGroup(centre >= 0 ? centre : ids.values().next().value);
   let changed = 0;
   for (const t of ids) if (store.assign(t, target)) changed++;
-  if (changed) { flushChanged(); refreshPanel(); }
+  // The colours, edges and panel catch up in the frame loop, once a frame however many steps a mouse move takes.
+  if (changed) strokeDirty = true;
 }
 
 /** The Delete brush: triangles `ids` turn red, to go when the stroke ends (Esc keeps them). */
@@ -865,13 +881,22 @@ function markDoomed(ids) {
   if (last >= 0) { renderer.updateColours(colours, first, last); requestRender(); }
 }
 
+/** The longest piece of a mouse move one pick readback covers (device pixels): a fast swipe reads a few boxes, not one huge one. */
+const PICK_SPAN = 256;
+
 function moveStroke(point) {
   const from = stroke.last;
   const distance = Math.hypot(point.x - from.x, point.y - from.y);
   const step = stroke.mode === 'fill' ? 3 * dpr() : Math.max(2, (settings.brushPx * dpr()) / 2);
   const steps = Math.max(1, Math.ceil(distance / step));
-  for (let i = 1; i <= steps; i++) {
-    applyBrush({ x: from.x + ((point.x - from.x) * i) / steps, y: from.y + ((point.y - from.y) * i) / steps });
+  const r = stroke.mode === 'fill' ? 0 : Math.ceil(settings.brushPx * dpr());
+  const lerp = (i) => ({ x: from.x + ((point.x - from.x) * i) / steps, y: from.y + ((point.y - from.y) * i) / steps });
+  const per = Math.max(1, Math.floor(PICK_SPAN / step));
+  for (let i = 1; i <= steps; i += per) {
+    const last = Math.min(steps, i + per - 1);
+    const a = lerp(i - 1), b = lerp(last);
+    const area = renderer.pickArea(Math.min(a.x, b.x) - r, Math.min(a.y, b.y) - r, Math.max(a.x, b.x) + r, Math.max(a.y, b.y) + r);
+    for (let j = i; j <= last; j++) applyBrush(lerp(j), area);
   }
   stroke.moved += distance / dpr();
   stroke.last = point;
@@ -882,7 +907,7 @@ async function pump() {
   if (!s || s.pumping) return;
   s.pumping = true;
   try {
-    const { tool, mesh: paintMesh } = await preparePaint();
+    const { mesh: paintMesh } = await preparePaint();
     while (s.queue.length && !s.cancelled) {
       const seed = s.queue.shift();
       if (mesh.store.owner[seed] !== -1) continue;   // an earlier fill in this stroke took it
@@ -898,10 +923,10 @@ async function pump() {
       if (type === 'freeform' || type === 'skip') out = freeformFill(seed, paintMesh);
       else {
         const refineUrl = await refineUrlFor(mesh);
-        out = await tool.paintAt(seed, paintMesh, {
+        out = await painter.fill(mesh, seed, {
           method: settings.method, type, modelUrl: settings.model, taken: takenMask(s.gid),
           extended: MODELS.find((m) => m.url === settings.model)?.features === 'v6',
-          grow: growOptions(), refineUrl,
+          wall: settings.edgeWall, refineUrl,
         });
       }
       if (s.cancelled) break;
@@ -912,8 +937,7 @@ async function pump() {
       if (mesh.store.owner[seed] === -1 && mesh.store.assign(seed, s.gid)) claimed++;
       s.fills++;
       s.claimed += claimed;
-      flushChanged();
-      refreshPanel();
+      strokeDirty = true;
       s.lastMessage = fillMessage(out, claimed);
       say(s.lastMessage);
     }
@@ -984,28 +1008,22 @@ function freeformFill(seed, paintMesh) {
 
 // ── auto-paint ────────────────────────────────────────────────────────────────
 
+/** The paint worker (js/paintWorker.js): fills, edge scoring, seed scores and the group typer run there. */
+const painter = createPaintClient();
+
 /**
- * Score every edge of a loaded mesh with the boundary model, once, and build the wall growth uses.
- * A failure (no model file, no runtime) leaves `target.edgeWall` unset and fills behave as before.
+ * Score every edge of a mesh with the boundary model, in the paint worker, which builds the wall growth uses from
+ * the scores and keeps them: asking again for the same model returns at once. A failure (no model file, no runtime)
+ * leaves the edges unscored and fills behave as before.
  */
 function edgeScoresFor(target) {
-  // Scores live on the adjacency itself, so a switch of boundary model re-scores the mesh. Jobs run
-  // one after another: the scores in place are always those of the last model asked for.
   const url = settings.refine ? EDGE_MODEL_V2 : EDGE_MODEL;
-  if (!target.edgeScores || target.edgeUrl !== url) {
-    target.edgeUrl = url;
-    const previous = target.edgeScores ?? Promise.resolve();
-    target.edgeScores = previous.catch(() => {}).then(() => preparePaint()).then(async ({ tool, mesh: paintMesh }) => {
-      const { runner, meta } = await tool.edgeScorerFor(url);
-      const { edges, ms } = await annotateEdges(paintMesh.facets, paintMesh.adjacency, runner, meta.columns);
-      const logit = meta.thresholds['fpr0.02'].logit;
-      target.edgeWall = edgeWall(1 / (1 + Math.exp(-logit)), EDGE_WALL_TYPES);
-      console.log(`edge boundaries (${url}): ${edges} edges in ${ms.toFixed(0)} ms`);
-      return target.edgeWall;
-    });
-    target.edgeScores.catch((error) => console.warn('no learned face boundaries:', error.message));
-  }
-  return target.edgeScores;
+  const job = painter.scoreEdges(target, url, EDGE_WALL_TYPES).then((r) => {
+    if (!r.cached) console.log(`edge boundaries (${url}): ${r.edges} edges in ${r.ms.toFixed(0)} ms`);
+    return r;
+  });
+  job.catch((error) => console.warn('no learned face boundaries:', error.message));
+  return job;
 }
 
 /**
@@ -1019,18 +1037,14 @@ async function refineUrlFor(target) {
   } catch {
     return null;
   }
-  return target.edgeUrl === EDGE_MODEL_V2 ? REFINER : null;
+  return settings.refine ? REFINER : null;
 }
 
-/** Growth options shared by strokes and auto-paint: the learned wall when it is on and ready. */
-function growOptions() {
-  return settings.edgeWall && mesh?.edgeWall ? { wall: mesh.edgeWall } : {};
-}
-
-/** Per-facet seed coherence for a loaded mesh (js/autoPaint.js), computed once and cached. */
+/** Per-facet seed coherence for a loaded mesh (js/autoPaint.js), worked out in the paint worker once and cached. */
 function coherenceFor(target) {
   if (!target.coherence) {
-    target.coherence = preparePaint().then(({ mesh: paintMesh }) => coherentScores(paintMesh.facets, paintMesh.adjacency));
+    target.coherence = painter.coherence(target);
+    target.coherence.catch(() => { target.coherence = null; });   // a failed or superseded run is asked again next time
   }
   return target.coherence;
 }
@@ -1060,7 +1074,7 @@ async function runAutoPaint() {
   let editOpen = false;
   try {
     progress('Auto-paint: preparing…');
-    const { tool, mesh: paintMesh } = await preparePaint();
+    const { mesh: paintMesh } = await preparePaint();
     progress('Auto-paint: scoring seeds…');
     const caps = current.synthetic;
     const order = seedOrder(await coherenceFor(current), paintMesh.facets).filter((t) => !caps?.[t]);   // a cap seeds nothing
@@ -1082,9 +1096,9 @@ async function runAutoPaint() {
       owner: store.owner,
       fill: (seed, taken) => {
         lastSeed = seed;
-        return tool.paintAt(seed, paintMesh, {
+        return painter.fill(current, seed, {
           method: settings.autoMethod, type: 'auto', modelUrl: settings.model, taken, extended, reportFit: false,
-          grow: { ...growOptions(), ...(settings.autoTangent ? { tangent: AUTO_TANGENT } : {}) }, refineUrl,
+          wall: settings.edgeWall, grow: settings.autoTangent ? { tangent: AUTO_TANGENT } : {}, refineUrl,
         });
       },
       onSegment: async (claim, out) => {
@@ -1126,9 +1140,12 @@ async function runAutoPaint() {
     // Freeform faces back into one group each (js/freeformMerge.js): auto-paint knows only primitives and
     // carves a B-spline face into many. Only this run's groups, and only on a part made mostly of such
     // faces; the joined groups stay untyped, so the export fits them a B-spline. Part of the undo step.
+    // The merge, typing and fitting run in the paint worker: on a 14,000-triangle part they took 20 s of the page's
+    // thread, the merge 9 s of it in one piece.
     progress('Auto-paint: joining freeform pieces…', PAINT_SHARE);
-    const joined = Int32Array.from(store.owner);
-    const { freeform } = tool.freeformMerge(joined, paintMesh.facets, paintMesh.adjacency, { only: new Set(created) });
+    const merged = await painter.freeformMerge(current, store.owner, created);
+    if (mesh !== current) throw new Error('another mesh was opened');
+    const joined = merged.owner, freeform = new Set(merged.freeform);
     for (let t = 0; t < joined.length; t++) if (joined[t] !== store.owner[t]) store.assign(t, joined[t]);
     // Caps the repair added join the group around them (caps.js), whatever the fills made of them.
     for (const [t, id] of capOwners(store.owner, caps, current.model.neighbours)) store.assign(t, id);
@@ -1139,68 +1156,29 @@ async function runAutoPaint() {
     for (let t = 0; t < store.owner.length; t++) if (!caps?.[t]) byGroup.get(store.owner[t])?.add(t);
     for (const [id, tris] of byGroup) if (!tris.size) byGroup.delete(id);
     // Each finished group's export type (paintCore.typeFinalGroup): untyped groups get one, and a group
-    // a simpler or truer primitive fits exactly takes it; freeform groups stay untyped.
+    // a simpler or truer primitive fits exactly takes it; freeform groups stay untyped. The learned typer
+    // decides where it is confident; it needs groups of 3 or more triangles. A model that fails to load
+    // leaves every group to typeFinalGroup, as before.
     progress('Auto-paint: typing groups…', PAINT_SHARE);
-    // The learned typer decides where it is confident; it needs groups of 3 or more triangles. A model
-    // that fails to load leaves every group to typeFinalGroup, as before.
-    const learned = new Map();
-    const typer = settings.groupTyper ? await tool.groupTyperFor(GROUP_TYPER).catch(() => null) : null;
+    const typerUrl = settings.groupTyper ? GROUP_TYPER : null;
     // the bar's typing share: the typer's evidence for each group, then each group's type and fit
     const typingDone = (from, share, k) => PAINT_SHARE + (1 - PAINT_SHARE) * (from + share * k / Math.max(1, byGroup.size));
-    if (typer) {
-      const rows = [];
-      let seen = 0;
-      for (const [id, tris] of byGroup) {
-        seen++;
-        if (freeform.has(id)) continue;
-        const f = tool.groupTypeFeatures(tris, paintMesh.facets, paintMesh.adjacency, store.groups.get(id).type);
-        if (f) rows.push([id, f]);
-        const now = performance.now();
-        if (now - uiClock.yield > 40) {
-          busy.step(`Weighing each group's type… ${seen} of ${byGroup.size}`, typingDone(0, 0.5, seen));
-          await new Promise((resolve) => setTimeout(resolve, 0));
-          uiClock.yield = performance.now();
-        }
+    const results = await painter.typeGroups(current,
+      [...byGroup].map(([id, tris]) => ({ id, tris: Int32Array.from(tris), type: store.groups.get(id).type ?? null, freeform: freeform.has(id) })),
+      typerUrl,
+      ({ phase, done, of }) => (phase === 'weigh'
+        ? busy.step(`Weighing each group's type… ${done} of ${of}`, typingDone(0, 0.5, done))
+        : busy.step(`Typing and fitting groups… ${done} of ${of}`, typerUrl ? typingDone(0.5, 0.5, done) : typingDone(0, 1, done))));
+    if (mesh !== current) throw new Error('another mesh was opened');
+    for (const r of results) {
+      const group = store.groups.get(r.id);
+      const origin = current.origins.get(r.id);
+      group.type = r.type;
+      if (origin) {
+        origin.typedBy = r.typedBy;
+        if (r.typer) origin.typer = r.typer;
       }
-      if (rows.length) {
-        const width = tool.N_GROUP_FEATURES, k = tool.GROUP_TYPES.length;
-        const X = new Float32Array(rows.length * width);
-        rows.forEach(([, f], i) => X.set(f.features, i * width));
-        const probs = await typer.run(X, rows.length);
-        rows.forEach(([id, f], i) => {
-          const d = tool.decideGroupType(probs.subarray(i * k, i * k + k), f.rule, typer.threshold);
-          learned.set(id, d.type);
-          const origin = current.origins.get(id);
-          if (origin) origin.typer = { by: d.by, p: Math.round(d.p * 1000) / 1000 };
-        });
-      }
-    }
-    let typed = 0;
-    for (const [id, tris] of byGroup) {
-      const group = store.groups.get(id);
-      const origin = current.origins.get(id);
-      typed++;
-      if (freeform.has(id)) {
-        group.type = null;
-        if (origin) origin.typedBy = 'freeform merge';
-        refit(id, tris);
-        continue;
-      }
-      if (learned.has(id)) {
-        group.type = learned.get(id);
-        if (origin) origin.typedBy = origin.typer?.by === 'model' ? 'group typer' : 'typer rule';
-      } else {
-        const typed = tool.typeFinalGroup(tris, paintMesh.facets, group.type);
-        if (typed.changed) group.type = typed.type;
-        if (origin) origin.typedBy = typed.changed ? 'exact rule' : 'fill';
-      }
-      refit(id, tris);
-      const now = performance.now();
-      if (now - uiClock.yield > 40) {
-        busy.step(`Typing and fitting groups… ${typed} of ${byGroup.size}`, typer ? typingDone(0.5, 0.5, typed) : typingDone(0, 1, typed));
-        await new Promise((resolve) => setTimeout(resolve, 0));
-        uiClock.yield = performance.now();
-      }
+      refit(r.id, byGroup.get(r.id), r.fit);
     }
     store.commit(`Auto-paint ${result.segments} groups`);
     editOpen = false;
@@ -1296,17 +1274,18 @@ function finishStroke() {
   refreshPanel();
 }
 
-/** Refit a group's whole region with its type, for the panel. Skipped until the fill tool has loaded. */
-function refit(id, tris = null) {
+/** Refit a group's whole region with its type, for the panel (or take `fitted`, a fit made already). Skipped until the fill tool has loaded. */
+function refit(id, tris = null, fitted = null) {
   const { store } = mesh;
   const group = store.groups.get(id);
   mesh.flags.delete(id);   // a changed group is no longer the one the export check flagged
   groupsEdited(null, id);
-  if (!group || !prepared) return;
+  if (!group || (!prepared && !fitted)) return;
   // the deviation view recolors the group against its new surface (in the frame loop, once per frame)
   if (settings.deviation) mesh.refitted.add(id);
   if (!group.type || group.type === 'skip' || !store.count(id)) { group.fit = null; return; }   // skipped: never fitted
-  const result = fitRegionAs(group.type, fitTriangles(tris ?? store.triangles(id), mesh.synthetic), prepared.mesh.facets);
+  // `fitted`: the fit the paint worker already made of these triangles (auto-paint)
+  const result = fitted ?? fitRegionAs(group.type, fitTriangles(tris ?? store.triangles(id), mesh.synthetic), prepared.mesh.facets);
   // the type goes with the params: a stroke can retype the group before its refit
   group.fit = result.params
     ? { type: group.type, params: result.params, relResidual: result.relResidual }
@@ -3204,7 +3183,8 @@ function swapMesh(target) {
   refreshPanel();
   requestRender();
   const opened = mesh;
-  setTimeout(() => preparePaint().then(() => edgeScoresFor(opened)).catch(() => {}), 50);
+  edgeScoresFor(opened).catch(() => {});
+  setTimeout(() => { if (mesh === opened) preparePaint().catch(() => {}); }, 50);
   checkMesh(target);
 }
 
@@ -3544,9 +3524,10 @@ const groupRgb = (r) => (r.type === 'skip' ? SKIP_RGB : settings.deviation === '
 
 /** The top bar, the status line and the face-group table with its fixes and inspector. */
 /** The panel's parts that scroll on their own (workbench.css: overflow auto). */
-const PANEL_SCROLLERS = ['.wb-blist', '.wb-tablewrap', '.wb-inspector'];
+const PANEL_SCROLLERS = ['.wb-blist', '.wb-fixitems', '.wb-tablewrap', '.wb-inspector'];
 
 function refreshPanel() {
+  panelDirty = false;
   const hasMesh = !!mesh;
   const store = mesh?.store;
   toolbar.setDisabled('undo', store?.undoStack.length || mesh?.before ? null : 'Nothing to undo');
@@ -3617,7 +3598,7 @@ function refreshPanel() {
   if (meshFixes.length) {
     const ticked = meshFixes.filter((f) => !fixes.unchecked.has(f.id));
     card = `<div class="wb-fixhead"><span class="wb-t">Fix bad areas</span><span class="wb-c">mesh · ${meshFixes.length}</span></div>
-      <div class="wb-fixlist">${meshFixes.map((f) => `<label class="wb-fix"><input type="checkbox" data-fix="${f.id}" ${fixes.unchecked.has(f.id) ? '' : 'checked'}><span><button type="button" class="wb-fixtitle" data-mshow="${f.step}" title="Show where">${esc(f.title)}</button><br><span class="wb-d">${esc(f.detail)}</span></span></label>`).join('')}
+      <div class="wb-fixlist"><div class="wb-fixitems">${meshFixes.map((f) => `<label class="wb-fix"><input type="checkbox" data-fix="${f.id}" ${fixes.unchecked.has(f.id) ? '' : 'checked'}><span><button type="button" class="wb-fixtitle" data-mshow="${f.step}" title="Show where">${esc(f.title)}</button><br><span class="wb-d">${esc(f.detail)}</span></span></label>`).join('')}</div>
         <div class="wb-irow"><button type="button" class="wb-btn wb-primary wb-small" data-act="mfix-apply" ${ticked.length ? '' : 'disabled'}>Apply ${ticked.length} as one step</button></div>
         <div class="wb-d">The groups' own fixes come once the mesh is sound.</div></div>`;
   } else if (meshPending) card = '<div class="wb-fixhead"><span class="wb-t">Fix bad areas</span><span class="wb-c">checking the mesh…</span></div>';
@@ -3625,7 +3606,7 @@ function refreshPanel() {
   else if (fresh && fixes.list.length) {
     const checked = fixes.list.filter((p) => !fixes.unchecked.has(p.id));
     card = `<button type="button" class="wb-fixhead" data-act="fix-toggle" aria-expanded="${fixes.open}"><span class="wb-t">Fix bad areas</span><span class="wb-c">${fixes.list.length} ready ${fixes.open ? '▾' : '▸'}</span></button>`
-      + (fixes.open ? `<div class="wb-fixlist">${fixes.list.map((p) => `<label class="wb-fix"><input type="checkbox" id="fix-${p.id}" data-fix="${p.id}" ${fixes.unchecked.has(p.id) ? '' : 'checked'}><span>${esc(p.title)}<br><span class="wb-d">${esc(p.detail)}</span></span></label>`).join('')}
+      + (fixes.open ? `<div class="wb-fixlist"><div class="wb-fixitems">${fixes.list.map((p) => `<label class="wb-fix"><input type="checkbox" id="fix-${p.id}" data-fix="${p.id}" ${fixes.unchecked.has(p.id) ? '' : 'checked'}><span>${esc(p.title)}<br><span class="wb-d">${esc(p.detail)}</span></span></label>`).join('')}</div>
         <div class="wb-irow"><button type="button" class="wb-btn wb-primary wb-small" data-act="fix-apply" ${checked.length ? '' : 'disabled'}>Apply ${checked.length} as one step</button><button type="button" class="wb-btn wb-small" data-act="repair" title="Build the solid and let the kernel judge each change (retypes and merges), each its own undo step; Esc stops">Repair with the kernel</button></div></div>` : '');
   } else {
     card = `<div class="wb-fixhead"><span class="wb-t">Fix bad areas</span><span class="wb-c">${fresh ? 'nothing found' : ''}</span></div>`
@@ -4082,9 +4063,22 @@ function frame(now) {
     mesh.refitted.clear();
     if (!autoRun) refreshPanel();   // auto-paint redraws the panel on its own clock
   }
-  if (legendDirty && mesh && !previewing && settings.deviation && (!autoRun || now - lastEdgeBuild > 500)) drawLegend();
-  // While auto-paint runs, edges are rebuilt at most twice a second rather than after every fill.
-  if (edgesDirty && mesh && !previewing && (!autoRun || now - lastEdgeBuild > 500)) {
+  // A stroke's edits since the last frame, in one go however many brush steps or fills made them: their colours
+  // now, the panel (redrawn whole) a few times a second until the stroke ends and draws it itself.
+  if (strokeDirty && mesh) {
+    strokeDirty = false;
+    flushChanged();
+    panelDirty = true;
+  }
+  if (panelDirty && (!stroke || now - lastPanel > PANEL_EVERY_MS)) {
+    lastPanel = now;
+    refreshPanel();
+  }
+  // While auto-paint runs, edges are rebuilt at most twice a second rather than after every fill; while a stroke
+  // is down, a few times a second rather than every frame.
+  const edgeWait = autoRun ? 500 : stroke ? STROKE_EDGES_MS : 0;
+  if (legendDirty && mesh && !previewing && settings.deviation && now - lastEdgeBuild > edgeWait) drawLegend();
+  if (edgesDirty && mesh && !previewing && now - lastEdgeBuild > edgeWait) {
     lastEdgeBuild = now;
     const { model, store } = mesh;
     renderer.setBands('edges', workbenchEdges(model, store));

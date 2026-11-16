@@ -359,8 +359,19 @@ export function createRenderer(canvas) {
      * triangle at that pixel or -1, `ids` every visible triangle within `radius` pixels.
      */
     pick(x, y, radius = 0) {
-      const ids = new Set();
-      if (!mesh || !lastMvp) return { centre: -1, ids };
+      const r = Math.ceil(radius);
+      return this.pickArea(Math.round(x) - r, Math.round(y) - r, Math.round(x) + r, Math.round(y) + r).around(x, y, radius);
+    },
+
+    /**
+     * One readback of the pick buffer over the box (xa, ya)-(xb, yb), device pixels from the top left, inclusive and
+     * clamped to the canvas. readPixels stalls until the GPU catches up, so a brush stroke reads the box its whole
+     * mouse move sweeps once and asks it for each brush step: `at(x, y)` is the triangle at a pixel or -1, and
+     * `around(x, y, radius)` is pick's answer for a point inside the box.
+     */
+    pickArea(xa, ya, xb, yb) {
+      const empty = { at: () => -1, around: () => ({ centre: -1, ids: new Set() }) };
+      if (!mesh || !lastMvp) return empty;
       const [width, height] = lastSize;
       const target = ensurePickTarget(width, height);
       gl.bindFramebuffer(gl.FRAMEBUFFER, target.framebuffer);
@@ -376,32 +387,34 @@ export function createRenderer(canvas) {
         gl.bindVertexArray(null);
         pickDirty = false;
       }
-      const r = Math.ceil(radius);
-      const cx = Math.round(x);
-      const cy = Math.round(y);
-      const x0 = Math.max(0, cx - r);
-      const y0 = Math.max(0, cy - r);
-      const w = Math.min(width, cx + r + 1) - x0;
-      const h = Math.min(height, cy + r + 1) - y0;
-      let centre = -1;
-      if (w > 0 && h > 0) {
-        const block = new Uint8Array(w * h * 4);
-        gl.readPixels(x0, height - (y0 + h), w, h, gl.RGBA, gl.UNSIGNED_BYTE, block);
-        for (let row = 0; row < h; row++) {
-          const py = y0 + h - 1 - row;   // readPixels rows run bottom up
-          for (let col = 0; col < w; col++) {
-            const px = x0 + col;
+      const x0 = Math.max(0, Math.floor(Math.min(xa, xb)));
+      const y0 = Math.max(0, Math.floor(Math.min(ya, yb)));
+      const w = Math.min(width, Math.ceil(Math.max(xa, xb)) + 1) - x0;
+      const h = Math.min(height, Math.ceil(Math.max(ya, yb)) + 1) - y0;
+      if (w <= 0 || h <= 0) { gl.bindFramebuffer(gl.FRAMEBUFFER, null); return empty; }
+      const block = new Uint8Array(w * h * 4);
+      gl.readPixels(x0, height - (y0 + h), w, h, gl.RGBA, gl.UNSIGNED_BYTE, block);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      const at = (px, py) => {
+        const col = px - x0, row = y0 + h - 1 - py;   // readPixels rows run bottom up
+        if (col < 0 || col >= w || row < 0 || row >= h) return -1;
+        const i = (row * w + col) * 4;
+        return (block[i] | (block[i + 1] << 8) | (block[i + 2] << 16)) - 1;
+      };
+      const around = (x, y, radius = 0) => {
+        const ids = new Set();
+        const r = Math.ceil(radius), cx = Math.round(x), cy = Math.round(y);
+        const centre = at(cx, cy);
+        for (let py = cy - r; py <= cy + r; py++) {
+          for (let px = cx - r; px <= cx + r; px++) {
             if ((px - cx) ** 2 + (py - cy) ** 2 > radius * radius) continue;
-            const i = (row * w + col) * 4;
-            const id = (block[i] | (block[i + 1] << 8) | (block[i + 2] << 16)) - 1;
-            if (id < 0) continue;
-            ids.add(id);
-            if (px === cx && py === cy) centre = id;
+            const id = at(px, py);
+            if (id >= 0) ids.add(id);
           }
         }
-      }
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-      return { centre, ids };
+        return { centre, ids };
+      };
+      return { at, around };
     },
   };
 }

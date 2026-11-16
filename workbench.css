@@ -256,7 +256,9 @@ body { background: var(--wb-bg); color: var(--wb-text); font: 14.5px/1.45 var(--
 .wb-toast { position: absolute; left: 50%; bottom: 56px; transform: translateX(-50%); background: var(--wb-text); color: var(--wb-accent-ink); padding: 9px 15px; font-size: 13px; font-weight: 600; max-width: calc(100% - 32px); pointer-events: none; }
 
 /* face groups */
-.wb-panel { grid-area: panel; background: var(--wb-panel); border-left: 1px solid var(--wb-line); display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+/* overflow: the last resort when the panel's parts outgrow a short window; normally only the table, the Bodies list
+   and the fix list scroll */
+.wb-panel { grid-area: panel; background: var(--wb-panel); border-left: 1px solid var(--wb-line); display: flex; flex-direction: column; min-height: 0; min-width: 0; overflow: hidden auto; }
 .wb-phead { padding: 12px 16px 10px; display: flex; flex-direction: column; gap: 10px; border-bottom: 1px solid var(--wb-line); }
 .wb-ptitle { display: flex; align-items: center; gap: 10px; }
 .wb-ptitle h2 { margin: 0; font: 700 19px/1.2 var(--wb-font-label); }
@@ -274,13 +276,16 @@ body { background: var(--wb-bg); color: var(--wb-text); font: 14.5px/1.45 var(--
 .wb-seg button:hover { background: var(--wb-raised-3); color: var(--wb-text); }
 .wb-seg button[aria-pressed="true"] { background: var(--wb-accent); color: var(--wb-accent-ink); font-weight: 700; clip-path: var(--btn-round); }
 
-.wb-fixcard { margin: 10px 16px 0; border: 0; background: var(--wb-raised); clip-path: var(--card-cut); }
+.wb-fixcard { flex: none; margin: 10px 16px 0; border: 0; background: var(--wb-raised); clip-path: var(--card-cut); }
 .wb-fixcard .wb-btn:not(.wb-primary) { background: #432c5c; }
 .wb-fixcard .wb-btn:not(.wb-primary):hover:not([disabled]) { background: #553a72; }
 .wb-fixhead { width: 100%; display: flex; align-items: center; gap: 10px; padding: 10px 13px; background: transparent; border: 0; cursor: pointer; text-align: left; }
 .wb-fixhead .wb-t { font-weight: 600; flex: 1; }
 .wb-fixhead .wb-c { font: 12px var(--wb-font-data); color: var(--wb-muted); }
 .wb-fixlist { display: flex; flex-direction: column; gap: 8px; padding: 0 13px 13px; }
+/* The fixes themselves scroll in a box of their own (a mesh can have hundreds): the Apply row under them stays in
+   view, and the group table keeps its share of the panel. */
+.wb-fixitems { display: flex; flex-direction: column; gap: 8px; max-height: min(34vh, 320px); overflow: hidden auto; overscroll-behavior: contain; padding-right: 4px; }
 .wb-fix { display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 8px; font-size: 12.5px; }
 .wb-fix input { margin: 2px 0 0; accent-color: var(--wb-accent); }
 .wb-fix .wb-d { color: var(--wb-muted); }
