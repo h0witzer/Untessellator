@@ -327,7 +327,8 @@ export function loadModelFile(file) {
   const ext = file.name.split('.').pop().toLowerCase();
   if (ext === 'obj') return loadOBJFile(file);
   if (ext === '3mf') return load3MFFile(file);
-  return loadSTLFile(file);
+  if (ext === 'stl') return loadSTLFile(file);
+  return Promise.reject(new Error("it isn't an STL, OBJ or 3MF file"));
 }
 
 /**

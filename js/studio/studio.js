@@ -441,7 +441,10 @@ resultEl.addEventListener('click', (event) => {
 });
 const fileInput = document.createElement('input');
 fileInput.type = 'file';
-fileInput.accept = '.stl,.obj,.3mf';
+// iOS turns accept into system file types and has none for STL, OBJ or 3MF, so it greys those files out:
+// there the picker shows every file and loadModelFile turns away the rest. iPadOS Safari says it is a Mac.
+const IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
+if (!IOS) fileInput.accept = '.stl,.obj,.3mf';
 fileInput.hidden = true;
 document.body.append(fileInput);
 
