@@ -18,6 +18,7 @@
  */
 
 import { nzBasis, Surface } from './nurbs.js';
+import { envelope } from './subd/envelopeCholesky.js';
 
 export const FIT = {
   DEGREE: 3, MARGIN: 0.10, PLANE_MIN_COS: 0.15, TOL: 1e-5, LAMBDA: 1e-6, CORRECT_ITERS: 3, REFINE_ROUNDS: 8,
@@ -74,7 +75,7 @@ export function planeParam(V, T) {
 }
 
 /** Least-squares conformal map of a disk, two far-apart boundary vertices pinned; null if not a disk or it folds. */
-export function lscm(V, T, iters = 20000, holes = false) {
+export function lscm(V, T, holes = false) {
   const nV = V.length;
   const cnt = edgeCounts(T);
   // a disk; with holes = true any connected face with borders (holes stay holes in the map; a fold fails it)
@@ -89,29 +90,59 @@ export function lscm(V, T, iters = 20000, holes = false) {
   let i1 = b[0];
   for (const q of b) if (norm(sub(V[q], V[i0])) > norm(sub(V[i1], V[i0]))) i1 = q;
   const pin = new Map([[i0, [0, 0]], [i1, [norm(sub(V[i1], V[i0])), 0]]]);
-  return lscmSolve(V, T, pin, null, 0, iters);
+  return lscmSolve(V, T, pin, null, 0);
+}
+
+/** The area-weighted spread (standard deviation) of log(map area / 3D area) over the triangles: 0 for an isometry. */
+function areaSpread(V, T, uv, shiftOf = () => 0) {
+  let sw = 0, s1 = 0, s2 = 0;
+  T.forEach(([a, b, c], ti) => {
+    const A3 = norm(cross(sub(V[b], V[a]), sub(V[c], V[a]))) / 2;
+    const ua = uv[a][0] + shiftOf(ti, 0), ub = uv[b][0] + shiftOf(ti, 1), uc = uv[c][0] + shiftOf(ti, 2);
+    const A = ((ub - ua) * (uv[c][1] - uv[a][1]) - (uv[b][1] - uv[a][1]) * (uc - ua)) / 2;
+    if (!(A > 0 && A3 > 0)) return;
+    const l = Math.log(A / A3);
+    sw += A3; s1 += A3 * l; s2 += A3 * l * l;
+  });
+  return sw > 0 ? Math.sqrt(Math.max(0, s2 / sw - (s1 / sw) ** 2)) : Infinity;
 }
 
 /**
- * A ring or tube (connected, Euler characteristic 0, two boundary loops): {uv, period}, a periodic
- * conformal map in which u goes once round, or null (ml/freeform_fit.py annulus_param). The ring is cut
- * along ONE seam, the shortest path between its two boundary loops, and LSCM is solved with the
- * triangles right of the seam carrying their seam vertices shifted by the period (the first loop's length).
+ * A face that closes round (connected, genus 0, two or more border loops: a ring or a tube, perhaps with holes in
+ * its wall): {uv, period}, a periodic conformal map in which u goes once round, or null (ml/freeform_fit.py
+ * annulus_param, extended to holes). Two of the loops are the rims the face goes round between; any others are
+ * holes, left free in the map. With holes, every pair of loops is tried as the rims and the map nearest an isometry
+ * kept (the least spread of the log of its area scale over the face: a wrong pair stretches the wall round a hole,
+ * by orders of magnitude). The face is cut along ONE seam,
+ * the shortest path between the two rims clear of the holes, and LSCM is solved with the triangles right of the
+ * seam carrying their seam vertices shifted by the period (the first rim's length).
  */
 export function annulusParam(V, T) {
   const nV = V.length;
   const cnt = edgeCounts(T);
-  if (nV - cnt.size + T.length !== 0 || components(T, nV) !== 1) return null;
-  const bedges = [...cnt].filter(([, c]) => c === 1).map(([k]) => k.split('_').map(Number));
+  if (components(T, nV) !== 1) return null;
+  // border half-edges (the face on their left), grouped into loops by their vertices
+  const bhalf = [];
+  for (const t of T) for (let k = 0; k < 3; k++) {
+    const a = t[k], b = t[(k + 1) % 3];
+    if (cnt.get(a < b ? `${a}_${b}` : `${b}_${a}`) === 1) bhalf.push([a, b]);
+  }
   const par = new Map();
   const find = (x) => { if (!par.has(x)) par.set(x, x); while (par.get(x) !== x) { par.set(x, par.get(par.get(x))); x = par.get(x); } return x; };
-  for (const [a, b] of bedges) par.set(find(a), find(b));
+  for (const [a, b] of bhalf) par.set(find(a), find(b));
   const comps = new Map();
-  for (const [a, b] of bedges) { const r = find(a); if (!comps.has(r)) comps.set(r, new Set()); comps.get(r).add(a).add(b); }
-  if (comps.size !== 2) return null;
-  const [A, B] = [...comps.values()];
-  let period = 0;
-  for (const [a, b] of bedges) if (A.has(a)) period += norm(sub(V[a], V[b]));
+  for (const [a, b] of bhalf) {
+    const r = find(a);
+    if (!comps.has(r)) comps.set(r, { verts: new Set(), len: 0, area: [0, 0, 0] });
+    const c = comps.get(r);
+    c.verts.add(a).add(b);
+    c.len += norm(sub(V[a], V[b]));
+    const x = cross(V[a], V[b]);
+    for (let k = 0; k < 3; k++) c.area[k] += x[k] / 2;
+  }
+  const loops = [...comps.values()];
+  // genus 0: chi = 2 - (number of loops)
+  if (loops.length < 2 || nV - cnt.size + T.length !== 2 - loops.length) return null;
   const adj = new Map();
   for (const k of cnt.keys()) {
     const [a, b] = k.split('_').map(Number);
@@ -119,64 +150,77 @@ export function annulusParam(V, T) {
     (adj.get(a) ?? adj.set(a, []).get(a)).push([b, l]);
     (adj.get(b) ?? adj.set(b, []).get(b)).push([a, l]);
   }
-  // Dijkstra from loop A to loop B (a binary heap)
-  const dist = new Map([...A].map((a) => [a, 0]));
-  const prev = new Map();
-  const heap = [...A].map((a) => [0, a]);
-  const push = (e) => { heap.push(e); let i = heap.length - 1; while (i > 0) { const p = (i - 1) >> 1; if (heap[p][0] <= heap[i][0]) break; [heap[p], heap[i]] = [heap[i], heap[p]]; i = p; } };
-  const pop = () => { const top = heap[0], last = heap.pop(); if (heap.length) { heap[0] = last; let i = 0; for (;;) { const l = 2 * i + 1, r = l + 1; let m = i; if (l < heap.length && heap[l][0] < heap[m][0]) m = l; if (r < heap.length && heap[r][0] < heap[m][0]) m = r; if (m === i) break; [heap[m], heap[i]] = [heap[i], heap[m]]; i = m; } } return top; };
-  for (let i = (heap.length >> 1) - 1; i >= 0; i--) { /* already all zero: a valid heap */ }
-  let end = null;
-  while (heap.length) {
-    const [d, x] = pop();
-    if (d > (dist.get(x) ?? Infinity)) continue;
-    if (B.has(x)) { end = x; break; }
-    for (const [y, l] of adj.get(x) ?? []) {
-      if (A.has(y)) continue;
-      if (d + l < (dist.get(y) ?? Infinity)) { dist.set(y, d + l); prev.set(y, x); push([d + l, y]); }
-    }
-  }
-  if (end === null) return null;
-  const path = [end];
-  while (prev.has(path[path.length - 1])) path.push(prev.get(path[path.length - 1]));
-  path.reverse();                                       // path[0] on loop A, the last on loop B
-  const seam = new Set(path.slice(1).map((b, i) => { const a = path[i]; return a < b ? `${a}_${b}` : `${b}_${a}`; }));
   const triOf = new Map(), inc = new Map();
   T.forEach((t, i) => { for (let k = 0; k < 3; k++) { triOf.set(`${t[k]}>${t[(k + 1) % 3]}`, i); (inc.get(t[k]) ?? inc.set(t[k], []).get(t[k])).push(i); } });
-  const shift = new Set();                              // "triangle,corner"
-  for (let i = 0; i < path.length; i++) {
-    const x = path[i];
-    // the triangle right of the seam at x: it holds the seam edge reversed
-    const start = i + 1 < path.length ? triOf.get(`${path[i + 1]}>${x}`) : triOf.get(`${x}>${path[i - 1]}`);
-    if (start === undefined) return null;
-    const fan = new Set(inc.get(x)), seen = new Set([start]), stack = [start];
-    while (stack.length) {
-      const t = stack.pop();
-      for (const w of T[t]) {
-        if (w === x || seam.has(x < w ? `${x}_${w}` : `${w}_${x}`)) continue;
-        for (const o of [triOf.get(`${x}>${w}`), triOf.get(`${w}>${x}`)]) {
-          if (o !== undefined && o !== t && fan.has(o) && !seen.has(o)) { seen.add(o); stack.push(o); }
-        }
+  // one system for every pair of rims: a single pin (anywhere; it only fixes the map's translation, the period its
+  // scale and turn), the rims' seam in the right-hand side only
+  const p0 = T[0][0], pinned = new Set([p0]), sys = lscmSystem(V, T, pinned), pin = new Map([[p0, [0, 0]]]);
+  let best = null;
+  for (let ia = 0; ia < loops.length; ia++) for (let ib = ia + 1; ib < loops.length; ib++) {
+    const A = loops[ia].verts, B = loops[ib].verts, period = loops[ia].len;
+    const holes = new Set();
+    loops.forEach((l, i) => { if (i !== ia && i !== ib) for (const v of l.verts) holes.add(v); });
+    // Dijkstra from rim A to rim B, clear of the holes (a binary heap)
+    const dist = new Map([...A].map((a) => [a, 0]));
+    const prev = new Map();
+    const heap = [...A].map((a) => [0, a]);
+    const push = (e) => { heap.push(e); let i = heap.length - 1; while (i > 0) { const p = (i - 1) >> 1; if (heap[p][0] <= heap[i][0]) break; [heap[p], heap[i]] = [heap[i], heap[p]]; i = p; } };
+    const pop = () => { const top = heap[0], last = heap.pop(); if (heap.length) { heap[0] = last; let i = 0; for (;;) { const l = 2 * i + 1, r = l + 1; let m = i; if (l < heap.length && heap[l][0] < heap[m][0]) m = l; if (r < heap.length && heap[r][0] < heap[m][0]) m = r; if (m === i) break; [heap[m], heap[i]] = [heap[i], heap[m]]; i = m; } } return top; };
+    let end = null;
+    while (heap.length) {
+      const [d, x] = pop();
+      if (d > (dist.get(x) ?? Infinity)) continue;
+      if (B.has(x)) { end = x; break; }
+      for (const [y, l] of adj.get(x) ?? []) {
+        if (A.has(y) || holes.has(y)) continue;
+        if (d + l < (dist.get(y) ?? Infinity)) { dist.set(y, d + l); prev.set(y, x); push([d + l, y]); }
       }
     }
-    for (const t of seen) shift.add(`${t},${T[t].indexOf(x)}`);
+    if (end === null) continue;
+    const path = [end];
+    while (prev.has(path[path.length - 1])) path.push(prev.get(path[path.length - 1]));
+    path.reverse();                                     // path[0] on rim A, the last on rim B
+    const seam = new Set(path.slice(1).map((b, i) => { const a = path[i]; return a < b ? `${a}_${b}` : `${b}_${a}`; }));
+    const shift = new Set();                            // "triangle,corner"
+    let ok = true;
+    for (let i = 0; i < path.length && ok; i++) {
+      const x = path[i];
+      // the triangle right of the seam at x: it holds the seam edge reversed
+      const start = i + 1 < path.length ? triOf.get(`${path[i + 1]}>${x}`) : triOf.get(`${x}>${path[i - 1]}`);
+      if (start === undefined) { ok = false; break; }
+      const fan = new Set(inc.get(x)), seen = new Set([start]), stack = [start];
+      while (stack.length) {
+        const t = stack.pop();
+        for (const w of T[t]) {
+          if (w === x || seam.has(x < w ? `${x}_${w}` : `${w}_${x}`)) continue;
+          for (const o of [triOf.get(`${x}>${w}`), triOf.get(`${w}>${x}`)]) {
+            if (o !== undefined && o !== t && fan.has(o) && !seen.has(o)) { seen.add(o); stack.push(o); }
+          }
+        }
+      }
+      for (const t of seen) shift.add(`${t},${T[t].indexOf(x)}`);
+    }
+    if (!ok) continue;
+    const uv = settle(V, T, sys.solve(pin, shift, period), sys.good, shift, period, pinned);
+    if (!uv) continue;
+    if (loops.length === 2) return { uv, period, loops: 2 };
+    const spread = areaSpread(V, T, uv, (ti, k) => (shift.has(`${ti},${k}`) ? period : 0));
+    if (!best || spread < best.spread) best = { uv, period, spread, loops: loops.length };
   }
-  const uv = lscmSolve(V, T, new Map([[path[0], [0, 0]]]), shift, period, 20000);
-  return uv ? { uv, period } : null;
+  return best;
 }
 
 /**
- * The LSCM energy minimised with the pinned vertices fixed, by Jacobi-preconditioned CG on the normal
- * equations. shift: "triangle,corner" keys whose vertex sits at u + period in that triangle (right of
- * a ring's seam). Returns vertex uv, mirrored in v if need be, or null if any triangle folds.
+ * The least-squares conformal map's system for a mesh with the vertices `pinned` held: per triangle, in its own
+ * frame and weighted by its area, the two Cauchy-Riemann residuals over its corners' (u, v). Their normal equations
+ * are factored once (envelope Cholesky), so maps that differ only in where the pins sit or in a ring's seam (which
+ * moves some corners' u by the period: the right-hand side only) cost a solve each. Past LSCM_DIRECT_MAX envelope
+ * entries (memory), Jacobi-preconditioned conjugate gradients instead.
+ * solve(pin: Map vertex -> [u, v], shift: Set "triangle,corner" of corners at u + period | null, period) -> uv.
  */
-function lscmSolve(V, T, pin, shift, period, iters) {
-  const nV = V.length;
-  // per triangle: local 2D frame, its two Cauchy-Riemann rows over the corner (u, v) unknowns
-  const rows = [], cols = [], vals = [], konst = [];
-  let nr = 0;
-  const good = [];
-  const shifted = (ti, k) => (shift && shift.has(`${ti},${k}`) ? period : 0);
+const LSCM_DIRECT_MAX = 1.5e7;
+function lscmSystem(V, T, pinned) {
+  const nV = V.length, good = [], rcol = [], rval = [];   // 6 columns per row, two rows per good triangle
   const A2s = T.map(([a, bb, c]) => norm(cross(sub(V[bb], V[a]), sub(V[c], V[a]))));
   const A2max = Math.max(...A2s, 0);
   T.forEach(([a, bb, c], ti) => {
@@ -189,66 +233,110 @@ function lscmSolve(V, T, pin, shift, period, iters) {
     good.push(ti);
     const ey = cross([nn[0] / A2, nn[1] / A2, nn[2] / A2], ex);
     const xs = [0, l1, dot(sub(p2, p0), ex)], ys = [0, 0, dot(sub(p2, p0), ey)];
-    const s = 1 / Math.sqrt(A2 * 2);
-    const tri = [a, bb, c];
+    const s = 1 / Math.sqrt(A2 * 2), tri = [a, bb, c];
+    const c1 = [], v1 = [], c2 = [], v2 = [];
     for (let k = 0; k < 3; k++) {
-      const kk = (k + 1) % 3, l = (k + 2) % 3;
-      const eax = xs[l] - xs[kk], eay = ys[l] - ys[kk];
-      const vi = tri[k];
-      rows.push(nr, nr); cols.push(2 * vi, 2 * vi + 1); vals.push(-eay * s, -eax * s);
-      rows.push(nr + 1, nr + 1); cols.push(2 * vi, 2 * vi + 1); vals.push(eax * s, -eay * s);
-      const sh = shifted(ti, k);                        // a shifted corner's u is u + period
-      if (sh) konst.push([nr, -eay * s * sh], [nr + 1, eax * s * sh]);
+      const kk = (k + 1) % 3, l = (k + 2) % 3, eax = xs[l] - xs[kk], eay = ys[l] - ys[kk], vi = tri[k];
+      c1.push(2 * vi, 2 * vi + 1); v1.push(-eay * s, -eax * s);
+      c2.push(2 * vi, 2 * vi + 1); v2.push(eax * s, -eay * s);
     }
-    nr += 2;
+    rcol.push(c1, c2); rval.push(v1, v2);
   });
-  const fixed = new Float64Array(2 * nV), isfree = new Uint8Array(2 * nV).fill(1);
-  for (const [q, [pu, pv]] of pin) { fixed[2 * q] = pu; fixed[2 * q + 1] = pv; isfree[2 * q] = isfree[2 * q + 1] = 0; }
-  const fidx = new Int32Array(2 * nV).fill(-1);
+  const nr = rcol.length, free = new Int32Array(2 * nV).fill(-1);
   let nf = 0;
-  for (let i = 0; i < 2 * nV; i++) if (isfree[i]) fidx[i] = nf++;
-  const rhs = new Float64Array(nr);
-  for (const [row, c] of konst) rhs[row] -= c;
-  const R = [], C = [], W = [];
-  for (let k = 0; k < rows.length; k++) {
-    if (isfree[cols[k]]) { R.push(rows[k]); C.push(fidx[cols[k]]); W.push(vals[k]); }
-    else rhs[rows[k]] -= vals[k] * fixed[cols[k]];
+  for (let i = 0; i < 2 * nV; i++) if (!pinned.has(i >> 1)) free[i] = nf++;
+  const adj = Array.from({ length: nf }, () => new Set());
+  for (const cs of rcol) for (const c of cs) {
+    const i = free[c];
+    if (i >= 0) for (const d of cs) { const j = free[d]; if (j >= 0 && j !== i) adj[i].add(j); }
   }
-  const Av = (x) => { const y = new Float64Array(nr); for (let k = 0; k < R.length; k++) y[R[k]] += W[k] * x[C[k]]; return y; };
-  const Atv = (y) => { const x = new Float64Array(nf); for (let k = 0; k < R.length; k++) x[C[k]] += W[k] * y[R[k]]; return x; };
+  const E = envelope(nf, adj.map((x) => [...x]), LSCM_DIRECT_MAX);
   const diag = new Float64Array(nf);
-  for (let k = 0; k < R.length; k++) diag[C[k]] += W[k] * W[k];
-  // start from the plane projection
-  const nsum = T.reduce((s, [a, bb, c]) => { const n = cross(sub(V[bb], V[a]), sub(V[c], V[a])); return [s[0] + n[0], s[1] + n[1], s[2] + n[2]]; }, [1e-300, 0, 0]);
-  const [x0, y0] = frame(nsum);
-  const x = new Float64Array(nf);                    // a ring starts from zero
-  if (!shift) for (let q = 0; q < nV; q++) {
-    if (isfree[2 * q]) x[fidx[2 * q]] = dot(V[q], x0);
-    if (isfree[2 * q + 1]) x[fidx[2 * q + 1]] = dot(V[q], y0);
+  for (let r = 0; r < nr; r++) {
+    const cs = rcol[r], vs = rval[r];
+    for (let k = 0; k < 6; k++) {
+      const i = free[cs[k]];
+      if (i < 0) continue;
+      diag[i] += vs[k] * vs[k];
+      if (E) for (let m = 0; m < 6; m++) { const j = free[cs[m]]; if (j >= 0 && j <= i) E.add(i, j, vs[k] * vs[m]); }
+    }
   }
-  const Ax = Av(x);
-  const res = new Float64Array(nr);
-  for (let i = 0; i < nr; i++) res[i] = rhs[i] - Ax[i];
-  const r = Atv(res);
-  const z = r.map((v, i) => v / Math.max(diag[i], 1e-300));
-  const p = Float64Array.from(z);
-  let rz = r.reduce((s, v, i) => s + v * z[i], 0);
-  const r0 = Math.sqrt(Math.max(r.reduce((s, v) => s + v * v, 0), 1e-300));
-  for (let it = 0; it < iters; it++) {
-    const Ap = Atv(Av(p));
-    let pAp = 0;
-    for (let i = 0; i < nf; i++) pAp += p[i] * Ap[i];
-    const alpha = rz / Math.max(pAp, 1e-300);
-    let rr = 0;
-    for (let i = 0; i < nf; i++) { x[i] += alpha * p[i]; r[i] -= alpha * Ap[i]; rr += r[i] * r[i]; }
-    if (Math.sqrt(rr) < 1e-10 * r0) break;
-    let rz2 = 0;
-    for (let i = 0; i < nf; i++) { z[i] = r[i] / Math.max(diag[i], 1e-300); rz2 += r[i] * z[i]; }
-    const beta = rz2 / Math.max(rz, 1e-300);
-    for (let i = 0; i < nf; i++) p[i] = z[i] + beta * p[i];
-    rz = rz2;
-  }
-  const uv = V.map((_, q) => [isfree[2 * q] ? x[fidx[2 * q]] : fixed[2 * q], isfree[2 * q + 1] ? x[fidx[2 * q + 1]] : fixed[2 * q + 1]]);
+  if (E) E.factor();
+  // the residuals' constant part: pinned coordinates and shifted corners (in a row, column 2k is corner k's u)
+  const rowTi = good.flatMap((ti) => [ti, ti]);
+  const constant = (pin, shift, period) => {
+    const b = new Float64Array(nr);
+    for (let r = 0; r < nr; r++) {
+      const cs = rcol[r], vs = rval[r];
+      let x = 0;
+      for (let k = 0; k < 6; k++) if (free[cs[k]] < 0) x -= vs[k] * pin.get(cs[k] >> 1)[cs[k] & 1];
+      if (shift) for (let k = 0; k < 3; k++) if (shift.has(`${rowTi[r]},${k}`)) x -= vs[2 * k] * period;
+      b[r] = x;
+    }
+    return b;
+  };
+  const Atv = (y) => {
+    const x = new Float64Array(nf);
+    for (let r = 0; r < nr; r++) for (let k = 0; k < 6; k++) { const i = free[rcol[r][k]]; if (i >= 0) x[i] += rval[r][k] * y[r]; }
+    return x;
+  };
+  const Av = (x) => {
+    const y = new Float64Array(nr);
+    for (let r = 0; r < nr; r++) { let t = 0; for (let k = 0; k < 6; k++) { const i = free[rcol[r][k]]; if (i >= 0) t += rval[r][k] * x[i]; } y[r] = t; }
+    return y;
+  };
+  const cg = (rhs, x) => {
+    const Ax = Atv(Av(x)), r = new Float64Array(nf);
+    for (let i = 0; i < nf; i++) r[i] = rhs[i] - Ax[i];
+    const z = r.map((v, i) => v / Math.max(diag[i], 1e-300)), p = Float64Array.from(z);
+    let rz = r.reduce((s, v, i) => s + v * z[i], 0);
+    const r0 = Math.sqrt(Math.max(r.reduce((s, v) => s + v * v, 0), 1e-300));
+    for (let it = 0; it < 20000; it++) {
+      const Ap = Atv(Av(p));
+      let pAp = 0;
+      for (let i = 0; i < nf; i++) pAp += p[i] * Ap[i];
+      const alpha = rz / Math.max(pAp, 1e-300);
+      let rr = 0;
+      for (let i = 0; i < nf; i++) { x[i] += alpha * p[i]; r[i] -= alpha * Ap[i]; rr += r[i] * r[i]; }
+      if (Math.sqrt(rr) < 1e-10 * r0) break;
+      let rz2 = 0;
+      for (let i = 0; i < nf; i++) { z[i] = r[i] / Math.max(diag[i], 1e-300); rz2 += r[i] * z[i]; }
+      const beta = rz2 / Math.max(rz, 1e-300);
+      for (let i = 0; i < nf; i++) p[i] = z[i] + beta * p[i];
+      rz = rz2;
+    }
+    return x;
+  };
+  return {
+    good,
+    solve(pin, shift = null, period = 0) {
+      const rhs = Atv(constant(pin, shift, period));
+      let x;
+      if (E) x = E.solve(rhs);
+      else {
+        // conjugate gradients from the plane projection (a ring: from zero)
+        x = new Float64Array(nf);
+        if (!shift) {
+          const nsum = T.reduce((s, [a, bb, c]) => { const n = cross(sub(V[bb], V[a]), sub(V[c], V[a])); return [s[0] + n[0], s[1] + n[1], s[2] + n[2]]; }, [1e-300, 0, 0]);
+          const [x0, y0] = frame(nsum);
+          for (let q = 0; q < nV; q++) {
+            if (free[2 * q] >= 0) x[free[2 * q]] = dot(V[q], x0);
+            if (free[2 * q + 1] >= 0) x[free[2 * q + 1]] = dot(V[q], y0);
+          }
+        }
+        x = cg(rhs, x);
+      }
+      return V.map((_, q) => [0, 1].map((d) => (free[2 * q + d] >= 0 ? x[free[2 * q + d]] : pin.get(q)[d])));
+    },
+  };
+}
+
+/**
+ * A map from lscmSystem made usable: mirrored in v if most triangles came out reversed, its folded slivers
+ * untangled (untangle, below); null if folds remain. shift / period as in lscmSystem's solve.
+ */
+function settle(V, T, uv, good, shift, period, pinned) {
+  const shifted = (ti, k) => (shift && shift.has(`${ti},${k}`) ? period : 0);
   const signedArea = (ti) => {
     const [a, bb, c] = T[ti];
     const ua = uv[a][0] + shifted(ti, 0), ub = uv[bb][0] + shifted(ti, 1), uc = uv[c][0] + shifted(ti, 2);
@@ -257,8 +345,84 @@ function lscmSolve(V, T, pin, shift, period, iters) {
   let neg = 0;
   for (const ti of good) if (signedArea(ti) <= 0) neg++;
   if (neg > 0.5 * good.length) for (const q of uv) q[1] = -q[1];
-  for (const ti of good) if (signedArea(ti) <= 0) return null;
-  return uv;
+  return untangle(V, T, uv, good, signedArea, shifted, pinned) ? uv : null;
+}
+
+/** The LSCM map with the vertices of `pin` held where it says (one system, one solve), settled; or null. */
+function lscmSolve(V, T, pin, shift, period) {
+  const pinned = new Set(pin.keys()), sys = lscmSystem(V, T, pinned);
+  return settle(V, T, sys.solve(pin, shift, period), sys.good, shift, period, pinned);
+}
+
+/**
+ * A conformal map of a mesh is conformal per triangle only on average, so a few slivers can come out folded. Their
+ * vertices (and then their neighbours', the region growing a ring at a time) are moved to the weighted mean of their
+ * neighbours, the rest of the map as it is: Tutte's step with Floater's mean value weights (from the mesh's own
+ * angles, so a flat mesh keeps its shape). False if folds remain: then the map is wrong as a whole, not in a few
+ * slivers.
+ */
+function untangle(V, T, uv, good, signedArea, shifted, pinned) {
+  let folded = good.filter((ti) => signedArea(ti) <= 0);
+  if (!folded.length) return true;
+  // first each folded triangle's widest corner (of a sliver: the one near the line through the other two) put where
+  // the triangle has its 3D shape again (the conformal place, given the other two corners), border or not
+  for (const ti of folded) {
+    const t = T[ti], ang = [0, 1, 2].map((k) => {
+      const e1 = sub(V[t[(k + 1) % 3]], V[t[k]]), e2 = sub(V[t[(k + 2) % 3]], V[t[k]]);
+      return Math.acos(Math.max(-1, Math.min(1, dot(e1, e2) / (norm(e1) * norm(e2) || 1))));
+    });
+    const k = ang.indexOf(Math.max(...ang)), c = t[k], a = t[(k + 1) % 3], b = t[(k + 2) % 3];
+    if (pinned.has(c)) continue;
+    const e = sub(V[b], V[a]), w = sub(V[c], V[a]), ee = dot(e, e);
+    if (!(ee > 0)) continue;
+    const x = dot(w, e) / ee, y = norm(cross(e, w)) / ee;
+    const ua = uv[a][0] + shifted(ti, (k + 1) % 3), ub = uv[b][0] + shifted(ti, (k + 2) % 3);
+    const du = ub - ua, dv = uv[b][1] - uv[a][1];
+    uv[c][0] = ua + x * du - y * dv - shifted(ti, k);
+    uv[c][1] = uv[a][1] + x * dv + y * du;
+  }
+  folded = good.filter((ti) => signedArea(ti) <= 0);
+  if (!folded.length) return true;
+  // each vertex's neighbours: [vertex, u offset to see it from this side of a ring's seam, weight], the weight
+  // tan(a / 2) / |edge| summed over the angles a at the vertex beside that edge
+  const nbr = new Map();
+  T.forEach((t, ti) => {
+    for (let k = 0; k < 3; k++) {
+      const x = t[k], k1 = (k + 1) % 3, k2 = (k + 2) % 3;
+      const e1 = sub(V[t[k1]], V[x]), e2 = sub(V[t[k2]], V[x]), l1 = norm(e1), l2 = norm(e2);
+      if (!(l1 > 0 && l2 > 0)) continue;
+      const half = Math.tan(Math.acos(Math.max(-1, Math.min(1, dot(e1, e2) / (l1 * l2)))) / 2);
+      if (!nbr.has(x)) nbr.set(x, []);
+      nbr.get(x).push([t[k1], shifted(ti, k1) - shifted(ti, k), half / l1], [t[k2], shifted(ti, k2) - shifted(ti, k), half / l2]);
+    }
+  });
+  // the border holds (a border vertex's neighbours are all on one side of it: their mean is inside the face)
+  const cnt = edgeCounts(T), fixed = new Set(pinned);
+  for (const [k, c] of cnt) if (c === 1) for (const q of k.split('_').map(Number)) fixed.add(q);
+  const region = new Set();
+  for (const ti of folded) for (const x of T[ti]) region.add(x);
+  // the 3D area folded over, against one triangle's (the mesh's resolution: a fold smaller than that is a sliver
+  // flipped, not the map wrong, and the fit's parameter correction re-places every vertex anyway)
+  const area3 = (ti) => { const [a, b, c] = T[ti]; return norm(cross(sub(V[b], V[a]), sub(V[c], V[a]))) / 2; };
+  const mean = good.reduce((s, ti) => s + area3(ti), 0) / good.length;
+  const foldedArea = (f) => f.reduce((s, ti) => s + area3(ti), 0);
+  let best = { area: foldedArea(folded), uv: uv.map((q) => [...q]) };
+  for (let grow = 0; grow < 8 && folded.length; grow++) {
+    for (const x of [...region]) for (const [y] of nbr.get(x) ?? []) region.add(y);
+    const free = [...region].filter((x) => !fixed.has(x));
+    for (let sweep = 0; sweep < 50; sweep++) {
+      for (const x of free) {
+        let su = 0, sv = 0, sw = 0;
+        for (const [y, du, w] of nbr.get(x) ?? []) { su += w * (uv[y][0] + du); sv += w * uv[y][1]; sw += w; }
+        if (sw > 0) { uv[x][0] = su / sw; uv[x][1] = sv / sw; }
+      }
+    }
+    folded = good.filter((ti) => signedArea(ti) <= 0);
+    const area = foldedArea(folded);
+    if (area < best.area) best = { area, uv: uv.map((q) => [...q]) };
+  }
+  best.uv.forEach((q, i) => { uv[i][0] = q[0]; uv[i][1] = q[1]; });
+  return best.area < mean;
 }
 
 // ── the least-squares fit ────────────────────────────────────────────────────
@@ -342,15 +506,16 @@ function assemble(M, rhs, tu, tv, U, Vv, X, nv, wrap = 0) {
 
 /** Thin-plate energy (|S_uu|^2 + 2|S_uv|^2 + |S_vv|^2 over the domain) into M with weight lam. Returns its trace. */
 function thinPlate(M, tu, tv, nv, lam, wrap = 0) {
+  // lam: the weights of the three bending terms (S_uu, 2 S_uv, S_vv); returns their traces
   const ku = distinct(tu.slice(P_, tu.length - P_)), kv = distinct(tv.slice(P_, tv.length - P_));
-  let tr = 0;
+  const tr = [0, 0, 0];
   for (let a = 0; a + 1 < ku.length; a++) for (const [gu, wu] of GAUSS) {
     const u = (ku[a] + ku[a + 1]) / 2 + ((ku[a + 1] - ku[a]) / 2) * gu, wU = ((ku[a + 1] - ku[a]) / 2) * wu;
     const bu = nzBasis(tu, P_, u, 2);
     for (let b = 0; b + 1 < kv.length; b++) for (const [gv, wv] of GAUSS) {
       const v = (kv[b] + kv[b + 1]) / 2 + ((kv[b + 1] - kv[b]) / 2) * gv, wV = ((kv[b + 1] - kv[b]) / 2) * wv;
       const bv = nzBasis(tv, P_, v, 2);
-      for (const [du, dvv, c] of [[2, 0, 1], [1, 1, 2], [0, 2, 1]]) {
+      for (const [du, dvv, c, t] of [[2, 0, 1, 0], [1, 1, 2, 1], [0, 2, 1, 2]]) {
         const cols = [], vals = [];
         const sw = Math.sqrt(wU * wV * c);
         for (let i = 0; i <= P_; i++) for (let j = 0; j <= P_; j++) {
@@ -359,8 +524,8 @@ function thinPlate(M, tu, tv, nv, lam, wrap = 0) {
           cols.push((bu.first + i) * nv + (wrap ? (bv.first + j) % wrap : bv.first + j)); vals.push(w);
         }
         for (let x = 0; x < cols.length; x++) {
-          tr += vals[x] * vals[x];
-          if (lam) for (let y = x; y < cols.length; y++) M.add(cols[x], cols[y], lam * vals[x] * vals[y]);
+          tr[t] += vals[x] * vals[x];
+          if (lam) for (let y = x; y < cols.length; y++) M.add(cols[x], cols[y], lam[t] * vals[x] * vals[y]);
         }
       }
     }
@@ -396,7 +561,7 @@ function lcg(seed) { let s = seed >>> 0 || 1; return () => (s = (Math.imul(s, 16
  * (indices into V). scale: the part diagonal, for the tolerance (default the group's own). Returns
  * {params (nurbs.Surface.toParams) | null, info: {param, spans, rounds, max_err, rms_err (x scale), fail?}}.
  */
-export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, seed = 0, densify = 0, densifyMax = 2 * FIT.MAX_POINTS } = {}) {
+export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, seed = 0 } = {}) {
   const info = { n_vertices: V.length, n_triangles: T.length };
   if (!T.length || V.length < 3) return { params: null, info: { ...info, fail: 'empty' } };
   if (!scale) {
@@ -410,11 +575,17 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
     uv = lscm(V, T);
     info.param = 'lscm';
     if (!uv) {
-      const ap = annulusParam(V, T);
+      let ap = annulusParam(V, T);
+      if (ap && ap.loops > 2) {
+        // with holes the face may not go round at all (a plate curled too far to project): its map with holes,
+        // not closing round, competes on the same spread
+        const flat = lscm(V, T, true);
+        if (flat && areaSpread(V, T, flat) < ap.spread) { ap = null; uv = flat; info.param = 'lscm-holes'; }
+      }
       if (ap) { ({ uv, period } = ap); info.param = 'periodic'; }
-      else {
+      else if (!uv) {
         // a face with holes (or a ring the periodic map misses): its conformal map, holes and all
-        uv = lscm(V, T, 20000, true);
+        uv = lscm(V, T, true);
         info.param = 'lscm-holes';
         if (!uv) return { params: null, info: { ...info, fail: 'param' } };
       }
@@ -439,6 +610,13 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
   }
   const ext = [Math.max(hi[0] - lo[0], 1e-9 * scale), Math.max(hi[1] - lo[1], 1e-9 * scale)];
   for (let k = 0; k < (period ? 1 : 2); k++) { const m = FIT.MARGIN * ext[k] + 1e-6 * scale; lo[k] -= m; hi[k] += m; }
+  if (info.param === 'plane') {
+    const flat = exactPlane(V, uv, lo, hi, tol * scale);
+    if (flat) {
+      Object.assign(info, { spans: [1, 1], rounds: 0, holdout: 0, max_err: flat.maxErr / scale, rms_err: flat.rmsErr / scale, exact: 'plane' });
+      return { params: flat.params, info, vertexUV: new Map(uv.map((q, i) => [i, [q[0], q[1]]])) };
+    }
+  }
   // data: all vertices, or the boundary plus a sample of the interior
   const cnt = edgeCounts(T);
   const bset = new Set();
@@ -452,72 +630,46 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
   }
   const X = idx.map((i) => V[i]);
   let U = Float64Array.from(idx, (i) => uv[i][0]), Vv = Float64Array.from(idx, (i) => uv[i][1]);
-  // densify (model units): points inside every triangle longer than that, its k x k sub-triangles' centroids with
-  // their (u, v) interpolated, so a CAD face's long triangles (vertices on its border only) are data inside too.
-  // They are data for the fit only: a facet's inside is a chord, off the true surface, so the tolerance, the
-  // hold-out and the refinement go by the mesh's own vertices (nOrig of them, first in X).
-  const nOrig = X.length;
-  if (densify > 0) {
-    const xs = [...X], us = [...U], vs = [...Vv];
-    for (const [a, b, c] of T) {
-      const L = Math.max(norm(sub(V[a], V[b])), norm(sub(V[b], V[c])), norm(sub(V[c], V[a])));
-      const k = Math.min(24, Math.ceil(L / densify));
-      if (k < 2) continue;
-      // round a ring the second coordinate wraps: a triangle across the wrap is left as it is
-      if (period && Math.max(Math.abs(uv[a][1] - uv[b][1]), Math.abs(uv[b][1] - uv[c][1]), Math.abs(uv[c][1] - uv[a][1])) > period / 2) continue;
-      for (let i = 0; i < k; i++) for (let j = 0; i + j < k; j++) for (const up of [0, 1]) {
-        if (up && i + j > k - 2) continue;
-        const wb = (i + (up ? 2 : 1) / 3) / k, wc = (j + (up ? 2 : 1) / 3) / k, wa = 1 - wb - wc;
-        xs.push([0, 1, 2].map((d) => wa * V[a][d] + wb * V[b][d] + wc * V[c][d]));
-        us.push(wa * uv[a][0] + wb * uv[b][0] + wc * uv[c][0]);
-        vs.push(wa * uv[a][1] + wb * uv[b][1] + wc * uv[c][1]);
-      }
-    }
-    const base = X.length, extraN = xs.length - base;
-    if (extraN > 0) {
-      const keep = Math.min(extraN, densifyMax), order = [...Array(extraN).keys()];
-      for (let i = order.length - 1; i > 0; i--) { const j = Math.floor(rand() * (i + 1)); [order[i], order[j]] = [order[j], order[i]]; }
-      const pick = order.slice(0, keep);
-      for (const e of pick) X.push(xs[base + e]);
-      U = Float64Array.from([...U, ...pick.map((e) => us[base + e])]);
-      Vv = Float64Array.from([...Vv, ...pick.map((e) => vs[base + e])]);
-      idx.push(...pick.map(() => -1));
-    }
-  }
-  // initial net: one span across, spans along in proportion to the aspect ratio (round a ring, at
-  // least PERIODIC_MIN_SPANS so it closes smoothly; wrap = its distinct columns)
+  // initial net: square spans, one across the short way (round a ring, at least PERIODIC_MIN_SPANS so it closes
+  // smoothly; wrap = its distinct columns; a long tube: spans along it as wide as those round it), but no more
+  // control points than the refinement allows the data (DOF_RATIO per point): a sliver of a few points does not
+  // need forty
+  const cpCap = Math.max(16, FIT.DOF_RATIO * X.length);
   let tu, tv, wrap = 0;
   if (period) {
     wrap = Math.min(FIT.MAX_SPANS, Math.max(FIT.PERIODIC_MIN_SPANS, Math.round(ext[1] / Math.max(ext[0], 1e-300))));
-    tu = clamped(lo[0], hi[0], 1);
+    const along = Math.min(FIT.MAX_SPANS, Math.max(1, Math.round((ext[0] * wrap) / ext[1])), Math.floor(cpCap / wrap) - 3);
+    tu = clamped(lo[0], hi[0], Math.max(1, along));
     tv = periodicKnots(period, wrap);
   } else {
-    const su = Math.min(FIT.MAX_SPANS, Math.max(1, Math.round(ext[0] / Math.max(ext[1], 1e-300))));
-    tu = clamped(lo[0], hi[0], su);
+    const su = Math.min(FIT.MAX_SPANS, Math.max(1, Math.round(ext[0] / Math.max(ext[1], 1e-300))), Math.floor(cpCap / 4) - 3);
+    tu = clamped(lo[0], hi[0], Math.max(1, su));
     tv = clamped(lo[1], hi[1], 1);
   }
   const absTol = tol * scale;
-  // the thin-plate weight, fixed once: lam x trace(A^T A) / trace(R) on the initial net
+  // the thin-plate weights, fixed once on the initial net: each bending term (along u, along v, the twist) lam x
+  // trace(A^T A) / its own trace (one weight over their sum is set by the shortest spans, and leaves bending the long
+  // way near zero: a band's net ripples between its rim vertices, a sliver's folds)
   {
     const nv = wrap || tv.length - P_ - 1, n = (tu.length - P_ - 1) * nv;
     const M = new Band(n, bandOf(nv, wrap));
     const trA = assemble(M, new Float64Array(n * 3), tu, tv, U, Vv, X, nv, wrap);
-    const trR = thinPlate(M, tu, tv, nv, 0, wrap);
-    info.lam_abs = (lam * trA) / Math.max(trR, 1e-300);
+    const trR = thinPlate(M, tu, tv, nv, null, wrap);
+    info.lam_abs = trR.map((t) => (lam * trA) / Math.max(t, 1e-300));
   }
   const lamAbs = info.lam_abs;
   // hold-out: 10% of the interior vertices left out, to choose the refinement level
   const hold = new Uint8Array(X.length);
-  const cand = idx.map((q, k) => (q < 0 || bset.has(q) ? -1 : k)).filter((k) => k >= 0);
-  const nHold = Math.floor(FIT.HOLDOUT_FRAC * nOrig);
+  const cand = idx.map((q, k) => (bset.has(q) ? -1 : k)).filter((k) => k >= 0);
+  const nHold = Math.floor(FIT.HOLDOUT_FRAC * X.length);
   if (nHold >= FIT.HOLDOUT_MIN && cand.length > 2 * nHold) {
     for (let i = cand.length - 1; i > 0; i--) { const j = Math.floor(rand() * (i + 1)); [cand[i], cand[j]] = [cand[j], cand[i]]; }
     for (const k of cand.slice(0, nHold)) hold[k] = 1;
   }
   const F = [...hold.keys()].filter((k) => !hold[k]);
   const err = new Float64Array(X.length);
-  const project = (S) => {                       // the mesh's own vertices only: added points keep their (u, v)
-    for (let k = 0; k < nOrig; k++) {
+  const project = (S) => {
+    for (let k = 0; k < X.length; k++) {
       const r = S.closest(X[k], [U[k], Vv[k]], 8);
       U[k] = r.u; Vv[k] = r.v;
       err[k] = norm(sub(r.S, X[k]));
@@ -533,13 +685,13 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
     }
     if (!S) return { params: null, info: { ...info, fail: 'solve' } };
     let val = 0, errF = 0;
-    for (let k = 0; k < nOrig; k++) { if (hold[k]) val = Math.max(val, err[k]); else errF = Math.max(errF, err[k]); }
+    for (let k = 0; k < X.length; k++) { if (hold[k]) val = Math.max(val, err[k]); else errF = Math.max(errF, err[k]); }
     if (!hold.some(Boolean)) val = errF;
     if (!best || val < best.val) { best = { val, tu: tu.slice(), tv: tv.slice(), wrap, U: Float64Array.from(U), V: Float64Array.from(Vv), rnd }; stale = 0; } else stale++;
     if (errF <= absTol || rnd === FIT.REFINE_ROUNDS || stale >= FIT.VAL_PATIENCE) break;
     // a knot mid-span in every span holding a vertex over tolerance and REFINE_MIN_POINTS in all;
     // round a ring the spans are doubled instead
-    const over = (k) => k < nOrig && err[k] > absTol && !hold[k];
+    const over = (k) => err[k] > absTol && !hold[k];
     const kvD = distinct(tv), kuD = distinct(tu);
     const spanIdx = (kd, x) => { let i = 0; while (i + 1 < kd.length - 1 && x >= kd[i + 1]) i++; return i; };
     const addV = [], addU = [];
@@ -553,7 +705,7 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
     for (const i of overU) if ((countU.get(i) ?? 0) >= FIT.REFINE_MIN_POINTS) addU.push((kuD[i] + kuD[i + 1]) / 2);
     if (kvD.length - 1 + addV.length > FIT.MAX_SPANS) addV.length = 0;
     if (kuD.length - 1 + addU.length > FIT.MAX_SPANS) addU.length = 0;
-    const cap = Math.min(FIT.DOF_RATIO * nOrig, FIT.MAX_CP);
+    const cap = Math.min(FIT.DOF_RATIO * X.length, FIT.MAX_CP);
     const nuNew = tu.length - P_ - 1 + addU.length;
     if (wrap) {
       const grow = 2 * wrap <= FIT.MAX_SPANS && 2 * wrap * nuNew <= cap;
@@ -576,14 +728,42 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
     project(S);
   }
   let maxErr = 0, sq = 0;
-  for (let k = 0; k < nOrig; k++) { maxErr = Math.max(maxErr, err[k]); sq += err[k] * err[k]; }
+  for (let k = 0; k < X.length; k++) { maxErr = Math.max(maxErr, err[k]); sq += err[k] * err[k]; }
   Object.assign(info, { spans: [distinct(tu).length - 1, wrap || distinct(tv).length - 1], rounds: best.rnd,
-    holdout: hold.reduce((s, h) => s + h, 0), max_err: maxErr / scale, rms_err: Math.sqrt(sq / nOrig) / scale });
+    holdout: hold.reduce((s, h) => s + h, 0), max_err: maxErr / scale, rms_err: Math.sqrt(sq / X.length) / scale });
   // where each of the mesh's own vertices sits on the surface (the parameter correction's last projection), in the
   // returned surface's (u, v): the round direction first when it wraps
   const vertexUV = new Map();
-  for (let k = 0; k < nOrig; k++) if (idx[k] >= 0) vertexUV.set(idx[k], wrap ? [Vv[k], U[k]] : [U[k], Vv[k]]);
+  for (let k = 0; k < X.length; k++) vertexUV.set(idx[k], wrap ? [Vv[k], U[k]] : [U[k], Vv[k]]);
   return { params: wrap ? uPeriodic(S) : S.toParams(), info, vertexUV };
+}
+
+/**
+ * A face whose vertices lie on a plane within tol, as that plane exactly: the affine map from its (u, v) (a
+ * projection onto the plane, so already isometric) to 3D by least squares, written as a one-span bicubic with its
+ * poles at the Greville points (a B-spline reproduces an affine map exactly there). A plane is the closest surface,
+ * and a least-squares fit of a bicubic net to a few points of a long sliver is not even that (its bending along
+ * the sliver is weighted at round-off). Null when the vertices are not that flat.
+ */
+function exactPlane(V, uv, lo, hi, tol) {
+  const M = [[0, 0, 0], [0, 0, 0], [0, 0, 0]], R = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  V.forEach((p, i) => {
+    const b = [1, uv[i][0], uv[i][1]];
+    for (let r = 0; r < 3; r++) { for (let c = 0; c < 3; c++) M[r][c] += b[r] * b[c]; for (let k = 0; k < 3; k++) R[r][k] += b[r] * p[k]; }
+  });
+  // 3 x 3 solve (Cramer): rows of X = [o; eu; ev]
+  const det3 = (A) => A[0][0] * (A[1][1] * A[2][2] - A[1][2] * A[2][1]) - A[0][1] * (A[1][0] * A[2][2] - A[1][2] * A[2][0]) + A[0][2] * (A[1][0] * A[2][1] - A[1][1] * A[2][0]);
+  const D = det3(M);
+  if (!(Math.abs(D) > 0)) return null;
+  const X = [0, 1, 2].map((r) => [0, 1, 2].map((k) => det3(M.map((row, i) => row.map((x, c) => (c === r ? R[i][k] : x)))) / D));
+  const at = (u, v) => [0, 1, 2].map((k) => X[0][k] + u * X[1][k] + v * X[2][k]);
+  let maxErr = 0, sq = 0;
+  V.forEach((p, i) => { const e = norm(sub(at(uv[i][0], uv[i][1]), p)); maxErr = Math.max(maxErr, e); sq += e * e; });
+  if (maxErr > tol) return null;
+  const greville = (a, b) => [a, a + (b - a) / 3, a + (2 * (b - a)) / 3, b];
+  const gu = greville(lo[0], hi[0]), gv = greville(lo[1], hi[1]);
+  const poles = gu.map((u) => gv.map((v) => at(u, v)));
+  return { params: { poles, tu: clamped(lo[0], hi[0], 1), tv: clamped(lo[1], hi[1], 1), pu: P_, pv: P_, weights: null }, maxErr, rmsErr: Math.sqrt(sq / V.length) };
 }
 
 /** A v-wrapped net as Python's params: transposed so u goes round, flagged u_periodic (unclamped form). */

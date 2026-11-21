@@ -21,7 +21,6 @@ const sub = (a, b) => a.map((x, i) => x - b[i]);
 const dot = (a, b) => a.reduce((s, x, i) => s + x * b[i], 0);
 const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
 const len = (a) => Math.hypot(...a);
-const lerp = (a, b, w) => a.map((x, i) => x + w * (b[i] - x));
 
 /** Groups, their border loops (group on the left) as chains, and the chains (corner to corner, or a ring). */
 export function faceTopology(vertices, triangles, labels) {
@@ -105,7 +104,20 @@ export function faceTopology(vertices, triangles, labels) {
 
 // ── B-spline curves: { p, knots (flat, clamped on [0, 1]), poles: [[...]] } ─────────────────────────────────────
 
-const uniformKnots = (spans, p = 3) => [...Array(p).fill(0), ...Array.from({ length: spans + 1 }, (_, i) => i / spans), ...Array(p).fill(1)];
+/**
+ * Clamped cubic knots on [0, 1] with `spans` spans placed by the data's parameters ts (sorted, from 0 to 1): knot j
+ * at fractional index j (m - 1) / spans along them, so each span holds its share of the points (uniform knots on
+ * unevenly spaced points leave spans with none, decided by the regulariser alone; on even spacing these are
+ * uniform).
+ */
+function dataKnots(ts, spans, p = 3) {
+  const m = ts.length, inner = [];
+  for (let j = 1; j < spans; j++) {
+    const x = (j * (m - 1)) / spans, i = Math.min(m - 2, Math.floor(x)), a = x - i;
+    inner.push((1 - a) * ts[i] + a * ts[i + 1]);
+  }
+  return [...Array(p + 1).fill(0), ...inner, ...Array(p + 1).fill(1)];
+}
 
 export function curveAt(c, t, nder = 0) {
   const b = nzBasis(c.knots, c.p, Math.min(1, Math.max(0, t)), nder), dim = c.poles[0].length;
@@ -140,29 +152,42 @@ function solveSPD(A, B, n, dim) {
 
 /**
  * A cubic B-spline through pts[0] and pts[last] (fixed) nearest the points at parameters ts (default: chord
- * length), on uniform knots doubled until every point is within tol (or maxSpans). closed: pts[0] = pts[last]
- * and the curve is tangent-continuous there (first and last legs of the control polygon in line). A second
- * difference term, a millionth of the data's weight, only settles control points no point reaches.
+ * length): spans (knots placed by the data, dataKnots) doubled from `spans` until every point is within tol, while
+ * there are fewer control points than points and at most maxSpans; failing that, the interpolant (as many control
+ * points as points, its knots each the average of three parameters, NURBS Book 9.8, which keeps the system well
+ * posed however unevenly the points are spaced); the closest of these. knots: fit on these instead (a pcurve on
+ * its edge's). closed: pts[0] = pts[last] and the curve is tangent-continuous there (its first and last legs in
+ * line, in the ratio of the end spans). A second difference term, a millionth of the data's weight, only settles
+ * control points no point reaches.
  */
-export function fitCurve(pts, { ts = null, closed = false, tol = 0, spans = 1, maxSpans = 64 } = {}) {
+export function fitCurve(pts, { ts = null, closed = false, tol = 0, spans = 1, maxSpans = 256, knots: given = null } = {}) {
+  if (!given && tol > 0 && pts.length > 2) {
+    // points within tol of the last one kept are the same point at the fit's resolution (a split landing beside a
+    // vertex); the ends stay
+    const keepIdx = [0];
+    for (let i = 1; i < pts.length - 1; i++) if (len(sub(pts[i], pts[keepIdx[keepIdx.length - 1]])) > tol) keepIdx.push(i);
+    if (keepIdx.length > 1 && len(sub(pts[pts.length - 1], pts[keepIdx[keepIdx.length - 1]])) <= tol) keepIdx.pop();
+    keepIdx.push(pts.length - 1);
+    if (keepIdx.length < pts.length) { pts = keepIdx.map((i) => pts[i]); if (ts) ts = keepIdx.map((i) => ts[i]); }
+  }
   const dim = pts[0].length, m = pts.length;
   if (!ts) {
     const d = [0];
     for (let i = 1; i < m; i++) d.push(d[i - 1] + len(sub(pts[i], pts[i - 1])));
     ts = d.map((x) => x / (d[m - 1] || 1));
   }
-  let best = null;
-  for (let s = Math.max(spans, closed ? 4 : 1); ; s *= 2) {
-    const knots = uniformKnots(s), n = s + 3;
+  const fitOn = (knots) => {
+    const n = knots.length - 4;
     // poles as affine combinations of the free ones: P_i = const_i + sum_j M[i][j] Q_j
     const fixedA = pts[0], fixedB = pts[m - 1];
     const free = [];
     for (let i = 1; i < n - 1; i++) if (!(closed && i === 1)) free.push(i);
     const nf = free.length, col = new Map(free.map((i, j) => [i, j]));
+    const r = knots[4] / Math.max(1 - knots[knots.length - 5], 1e-300);   // first span over last
     const rowOf = (i) => {                        // [const, [[j, w]...]]
       if (i === 0) return [fixedA, []];
       if (i === n - 1) return [fixedB, []];
-      if (closed && i === 1) return [fixedA.map((x) => 2 * x), [[col.get(n - 2), -1]]];
+      if (closed && i === 1) return [fixedA.map((x) => (1 + r) * x), [[col.get(n - 2), -r]]];
       return [new Array(dim).fill(0), [[col.get(i), 1]]];
     };
     const rows = Array.from({ length: n }, (_, i) => rowOf(i));
@@ -194,9 +219,23 @@ export function fitCurve(pts, { ts = null, closed = false, tol = 0, spans = 1, m
     let err = 0;
     for (let k = 0; k < m; k++) err = Math.max(err, len(sub(curveAt(curve, ts[k])[0], pts[k])));
     curve.err = err;
-    if (!best || err < best.err) best = curve;
-    if (err <= tol || 2 * s > maxSpans || 2 * s + 3 > 2 * m) return best;
+    return curve;
+  };
+  if (given) return fitOn(given);
+  let best = null;
+  const keep = (c) => { if (!best || c.err < best.err) best = c; return c.err <= tol; };
+  // (closed, the tangent condition takes a control point: one more span to interpolate)
+  const full = closed ? m - 2 : m - 3;
+  for (let s = Math.max(spans, closed ? 4 : 1); s < full && s <= maxSpans; s *= 2) if (keep(fitOn(dataKnots(ts, s)))) return best;
+  if (full >= 1 && full <= maxSpans) {
+    if (closed) keep(fitOn(dataKnots(ts, full)));
+    else {
+      const inner = [];
+      for (let j = 1; j <= m - 4; j++) inner.push((ts[j] + ts[j + 1] + ts[j + 2]) / 3);
+      keep(fitOn([0, 0, 0, 0, ...inner, 1, 1, 1, 1]));
+    }
   }
+  return best ?? fitOn(dataKnots(ts, 1));
 }
 
 // ── the solid ────────────────────────────────────────────────────────────────────────────────────────────────
@@ -215,10 +254,8 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
   const faces = groups.map((g, gi) => {
     const local = new Map(), Vg = [];
     const Tg = g.tris.map((f) => triangles[f].map((v) => { if (!local.has(v)) { local.set(v, Vg.length); Vg.push(vertices[v]); } return local.get(v); }));
-    let area = 0;
-    for (const [a, b, c] of Tg) area += len(cross(sub(Vg[b], Vg[a]), sub(Vg[c], Vg[a]))) / 2;
-    // points inside the long triangles only to cover the face (a few hundred; the vertices judge the fit)
-    const fit = fitGroup(Vg, Tg, { scale: diag, densify: Math.sqrt(area / 400), densifyMax: 1500 });
+    // the mesh's vertices are the data (a CAD mesh's are on the true surface; its triangles' insides are chords)
+    const fit = fitGroup(Vg, Tg, { scale: diag });
     if (!fit.params) { problems.push(`face ${g.label}: no single surface fits it (${fit.info.fail})`); return null; }
     const S = Surface.fromParams(fit.params), periodic = !!fit.params.u_periodic;
     // which way the surface faces: its normal against the mesh's (outward) at a sample of triangles
@@ -245,8 +282,74 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
     v0: ch.ring ? -1 : vertexAt(ch.verts[0]), v1: ch.ring ? -1 : vertexAt(ch.verts[ch.verts.length - 1]),
   }));
   const loopsOf = groups.map((g) => g.loopChains.map((l) => l.map((e) => ({ ...e }))));
-  const split = (c, j, w) => {                     // between stored points j and j + 1 (cyclically for a ring)
-    const ch = work[c], n = ch.pts.length, X = lerp(ch.pts[j], ch.pts[(j + 1) % n], w), q = points.length;
+  const seedFor = (f, v) => {
+    const uv = v >= 0 ? f.seed.get(v) : null;
+    if (!uv) return null;
+    if (!f.periodic) return uv;
+    const [u0, u1] = f.S.dom, P = u1 - u0;
+    return [u0 + ((((uv[0] - f.shift - u0) % P) + P) % P), uv[1]];
+  };
+  // each border where its two faces meet: the mesh gives its vertices only, and the smooth curve through a coarse
+  // ring of them is not the edge between them (a hexagon's spline is not its circle). Where that curve's midpoint
+  // between two vertices strays more than tol from either face's surface, the point is moved onto both (projected
+  // onto each in turn until they agree: alternating projections, which converge onto the intersection where the
+  // faces cross) and kept, and each half is checked again (three levels at most); the edge curve is then fitted
+  // through vertices and these points alike. A point is kept only where its correction is more than its own
+  // uncertainty: the surfaces are right to their fit (e, at least tol), and two surfaces at angle a locate their
+  // intersection only to e / sin a across it (faces meeting near tangentially do not say where their edge is: the
+  // mesh border does); nor where the projections do not come within tol of each other; and only within what the
+  // mesh allows: its border is inscribed in the true edge, which strays from a segment's chord by no more than the
+  // sagitta of the turn the border makes there, (L / 2) tan(turn / 4) (between vertices neither surface has data,
+  // and a surface's guess there is no better than the mesh's).
+  const onBoth = (x, fa, fb, sa, sb) => {
+    let a = fa.S.closest(x, sa), b = fb.S.closest(a.S, sb);
+    for (let it = 0; it < 30 && len(sub(a.S, b.S)) > absTol / 8; it++) {
+      a = fa.S.closest(b.S, [a.u, a.v]);
+      b = fb.S.closest(a.S, [b.u, b.v]);
+    }
+    if (len(sub(a.S, b.S)) > absTol) return null;
+    const na = fa.S.normal(a.u, a.v)[1], nb = fb.S.normal(b.u, b.v)[1];
+    const sin = len(cross(na, nb)), e = Math.max(absTol, fa.info.max_err * diag, fb.info.max_err * diag);
+    return { y: a.S.map((q, k) => (q + b.S[k]) / 2), unc: e / Math.max(sin, 1e-12) };
+  };
+  chains.forEach((c0, c) => {
+    if (c0.uses.length !== 2) return;
+    const ch = work[c], [fa, fb] = c0.uses.map((u) => faces[u.g]);
+    const pts = ch.ring ? [...ch.pts, ch.pts[0]] : ch.pts, vid = ch.ring ? [...ch.vid, ch.vid[0]] : ch.vid, d = [0];
+    for (let i = 1; i < pts.length; i++) d.push(d[i - 1] + len(sub(pts[i], pts[i - 1])));
+    const ts = d.map((x) => x / (d[d.length - 1] || 1));
+    const C = fitCurve(pts, { ts, closed: ch.ring, tol: absTol });
+    // the border's turn at each vertex (a chain's ends are corners: no turn of its own there)
+    const n = pts.length, turn = new Float64Array(n);
+    for (let i = 0; i < n; i++) {
+      const ip = ch.ring ? (i - 1 + n - 1) % (n - 1) : i - 1, inx = ch.ring ? (i + 1) % (n - 1) : i + 1;
+      if (!ch.ring && (i === 0 || i === n - 1)) continue;
+      const d1 = sub(pts[i], pts[ip]), d2 = sub(pts[inx], pts[i]), l1 = len(d1), l2 = len(d2);
+      if (l1 > 0 && l2 > 0) turn[i] = Math.acos(Math.max(-1, Math.min(1, dot(d1, d2) / (l1 * l2))));
+    }
+    const outP = [pts[0]], outV = [vid[0]];
+    for (let i = 0; i + 1 < pts.length; i++) {
+      const sa = seedFor(fa, vid[i]) ?? seedFor(fa, vid[i + 1]), sb = seedFor(fb, vid[i]) ?? seedFor(fb, vid[i + 1]);
+      const A = pts[i], AB = sub(pts[i + 1], A), L = len(AB);
+      const sag = (L / 2) * Math.tan(Math.max(turn[i], turn[i + 1]) / 4) + absTol;
+      const offChord = (y) => (L > 0 ? len(cross(sub(y, A), AB)) / L : len(sub(y, A)));
+      const refine = (ta, tb, depth) => {
+        const x = curveAt(C, (ta + tb) / 2)[0], r = onBoth(x, fa, fb, sa, sb);
+        if (!r || len(sub(x, r.y)) <= Math.max(absTol, r.unc) || offChord(r.y) > sag) return;
+        const y = r.y;
+        if (depth < 2) refine(ta, (ta + tb) / 2, depth + 1);
+        outP.push(y); outV.push(-1);
+        if (depth < 2) refine((ta + tb) / 2, tb, depth + 1);
+      };
+      refine(ts[i], ts[i + 1], 0);
+      outP.push(pts[i + 1]); outV.push(vid[i + 1]);
+    }
+    if (outP.length === pts.length) return;
+    ch.pts = ch.ring ? outP.slice(0, -1) : outP;
+    ch.vid = ch.ring ? outV.slice(0, -1) : outV;
+  });
+  const split = (c, j, X) => {                     // X: between stored points j and j + 1 (cyclically for a ring)
+    const ch = work[c], n = ch.pts.length, q = points.length;
     points.push(X);
     if (ch.ring) {
       ch.pts = [X, ...ch.pts.slice(j + 1), ...ch.pts.slice(0, j + 1), X];
@@ -256,7 +359,8 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
     }
     const c2 = work.length;
     work.push({ pts: [X, ...ch.pts.slice(j + 1)], vid: [-1, ...ch.vid.slice(j + 1)], ring: false, closed: false, v0: q, v1: ch.v1 });
-    ch.pts = [...ch.pts.slice(0, j + 1), X]; ch.vid = [...ch.vid.slice(0, j + 1), -1]; ch.v1 = q;
+    // (a closed chain split again, at a second face's seam, is two open ones)
+    ch.pts = [...ch.pts.slice(0, j + 1), X]; ch.vid = [...ch.vid.slice(0, j + 1), -1]; ch.v1 = q; ch.closed = false;
     for (const loops of loopsOf) for (const l of loops) for (let i = 0; i < l.length; i++) {
       if (l[i].c !== c) continue;
       l.splice(i, 1, ...(l[i].rev ? [{ c: c2, rev: true }, { c, rev: true }] : [{ c, rev: false }, { c: c2, rev: false }]));
@@ -264,96 +368,90 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
     }
     return q;
   };
-  const seedFor = (f, v) => {
-    const uv = v >= 0 ? f.seed.get(v) : null;
-    if (!uv) return null;
-    if (!f.periodic) return uv;
-    const [u0, u1] = f.S.dom, P = u1 - u0;
-    return [u0 + ((((uv[0] - f.shift - u0) % P) + P) % P), uv[1]];
+  // a loop's points in its direction on face f's surface, each with the stored chain segment it starts and its u
+  // unwrapped along the loop; ends: where each chain starts; turn: how many times the loop goes round the surface
+  // (a rim once, either way; a hole in the wall not at all)
+  const trace = (f, l) => {
+    const { S } = f, [u0, u1] = S.dom, P = u1 - u0, seq = [], ends = [];
+    for (const e of l) {
+      const ch = work[e.c], n = ch.pts.length;
+      ends.push(seq.length);
+      if (ch.ring) for (let k = 0; k < n; k++) { const i = e.rev ? (n - k) % n : k; seq.push({ x: ch.pts[i], v: ch.vid[i], c: e.c, j: e.rev ? (n - k - 1 + n) % n : k, rev: e.rev }); }
+      else for (let k = 0; k + 1 < n; k++) { const i = e.rev ? n - 1 - k : k; seq.push({ x: ch.pts[i], v: ch.vid[i], c: e.c, j: e.rev ? n - 2 - k : k, rev: e.rev }); }
+    }
+    let prev = null, last = null;
+    for (const s2 of seq) {
+      const r = S.closest(s2.x, seedFor(f, s2.v) ?? prev);
+      prev = [r.u, r.v];
+      let u = r.u;
+      if (last !== null) { while (u - last > P / 2) u -= P; while (last - u > P / 2) u += P; }
+      s2.u = last = u;
+    }
+    let back = seq[0].u - last;                    // the step back to the start, the short way
+    while (back > P / 2) back -= P;
+    while (back < -P / 2) back += P;
+    return { seq, ends, turn: Math.round((last + back - seq[0].u) / P) };
   };
-  const seamAt = new Map();                        // face -> the vertex where each of its loops crosses its seam
+  // the segments of a traced loop that cross the line u = us0 (or its copies a period apart)
+  const crossings = ({ seq, turn }, P, us0) => {
+    const hits = [];
+    for (let k = 0; k < seq.length; k++) {
+      const a = seq[k].u, b = k + 1 < seq.length ? seq[k + 1].u : seq[0].u + turn * P;
+      if (Math.floor((a - us0) / P) !== Math.floor((b - us0) / P)) hits.push(k);
+    }
+    return hits;
+  };
+  const seamAt = new Map();                        // face -> Map(rim loop -> the vertex where it crosses the seam)
   for (const f of faces) {
     if (!f.periodic) continue;
-    placeSeam(f, loopsOf[f.gi]);
-    const { S } = f, [u0, u1] = S.dom, P = u1 - u0, crossings = [];
-    for (const l of loopsOf[f.gi]) {
-      // the loop's points in its direction, each with the stored chain segment it starts
-      const seq = [];
-      for (const e of l) {
-        const ch = work[e.c], n = ch.pts.length;
-        if (ch.ring) for (let k = 0; k < n; k++) { const i = e.rev ? (n - k) % n : k; seq.push({ x: ch.pts[i], v: ch.vid[i], c: e.c, j: e.rev ? (n - k - 1 + n) % n : k, rev: e.rev }); }
-        else for (let k = 0; k + 1 < n; k++) { const i = e.rev ? n - 1 - k : k; seq.push({ x: ch.pts[i], v: ch.vid[i], c: e.c, j: e.rev ? n - 2 - k : k, rev: e.rev }); }
-      }
-      let prev = null, last = null;
-      for (const s2 of seq) {
-        const r = S.closest(s2.x, seedFor(f, s2.v) ?? prev);
-        prev = [r.u, r.v];
-        let u = r.u;
-        if (last !== null) { while (u - last > P / 2) u -= P; while (last - u > P / 2) u += P; }
-        s2.u = last = u;
-      }
-      // the loop closes on itself having gone once round: its end is its start moved by +-P
-      const turn = Math.round((seq[seq.length - 1].u - seq[0].u) / P) || Math.sign(seq[seq.length - 1].u - seq[0].u);
-      const hits = [];
-      for (let k = 0; k < seq.length; k++) {
-        const a = seq[k].u, b = k + 1 < seq.length ? seq[k + 1].u : seq[0].u + turn * P;
-        const ka = Math.floor((a - u0) / P), kb = Math.floor((b - u0) / P);
-        if (ka !== kb) { const target = u0 + Math.max(ka, kb) * P; hits.push({ k, w: (target - a) / ((b - a) || 1) }); }
-      }
-      if (hits.length !== 1) { problems.push(`face ${f.g.label}: a border crosses its seam ${hits.length} times`); break; }
-      const { k } = hits[0], s2 = seq[k], s3 = seq[(k + 1) % seq.length];
+    const loops = loopsOf[f.gi];
+    placeSeam(f, loops.map((l) => trace(f, l)));
+    const { S } = f, [u0, u1] = S.dom, P = u1 - u0, at = new Map();
+    seamAt.set(f.gi, at);
+    loops.forEach((l, li) => {
+      const tr = trace(f, l), { seq, turn } = tr, hits = crossings(tr, P, u0);
+      if (Math.abs(turn) > 1) { problems.push(`face ${f.g.label}: a border goes round its surface ${Math.abs(turn)} times`); return; }
+      if (hits.length !== Math.abs(turn)) { problems.push(`face ${f.g.label}: a border crosses its seam ${hits.length} times`); return; }
+      if (!turn) return;                           // a hole in the wall
+      const k = hits[0], s2 = seq[k], s3 = seq[(k + 1) % seq.length];
       const ua = s2.u, ub = k + 1 < seq.length ? s3.u : seq[0].u + turn * P;
       const target = u0 + Math.max(Math.floor((ua - u0) / P), Math.floor((ub - u0) / P)) * P;
-      // where the segment's projection meets the seam (bisection; the mesh is not linear in u)
-      let lo3 = 0, hi3 = 1, seedUV = [((ua - u0) % P + P) % P + u0, null];
-      const r0 = S.closest(s2.x, seedFor(f, s2.v));
-      seedUV = [r0.u, r0.v];
-      for (let it = 0; it < 30; it++) {
-        const wm = (lo3 + hi3) / 2, r = S.closest(lerp(s2.x, s3.x, wm), seedUV);
+      // the crossing on the smooth curve through the chain's points (the edge curve it will be fitted to), not on
+      // the chord between two of them (off the surface by its sagitta), by bisection on the projected u (the
+      // curve is not linear in u); the segment from stored point j to j + 1 in the chain's own direction
+      const ch = work[s2.c], pts = ch.ring ? [...ch.pts, ch.pts[0]] : ch.pts, d = [0];
+      for (let i = 1; i < pts.length; i++) d.push(d[i - 1] + len(sub(pts[i], pts[i - 1])));
+      const ts = d.map((x) => x / (d[d.length - 1] || 1));
+      const C = fitCurve(pts, { ts, closed: ch.ring || ch.closed, tol: absTol });
+      const [ta, tb, uA, uB] = s2.rev ? [ts[s2.j], ts[s2.j + 1], ub, ua] : [ts[s2.j], ts[s2.j + 1], ua, ub];
+      const r0 = S.closest(s2.x, seedFor(f, s2.v)), seedUV = [r0.u, r0.v];
+      let lo3 = 0, hi3 = 1;
+      for (let it = 0; it < 40; it++) {
+        const wm = (lo3 + hi3) / 2, r = S.closest(curveAt(C, ta + wm * (tb - ta))[0], seedUV);
         let u = r.u;
-        const guess = ua + wm * (ub - ua);
+        const guess = uA + wm * (uB - uA);
         while (u - guess > P / 2) u -= P;
         while (guess - u > P / 2) u += P;
-        if ((u - target) * (ub - ua) < 0) lo3 = wm; else hi3 = wm;
+        if ((u - target) * (uB - uA) < 0) lo3 = wm; else hi3 = wm;
       }
-      const w = (lo3 + hi3) / 2, ww = Math.min(1 - 1e-6, Math.max(1e-6, s2.rev ? 1 - w : w));
-      crossings.push(split(s2.c, s2.j, ww));
-    }
-    seamAt.set(f.gi, crossings);
+      const w = Math.min(1 - 1e-6, Math.max(1e-6, (lo3 + hi3) / 2));
+      at.set(li, split(s2.c, s2.j, curveAt(C, ta + w * (tb - ta))[0]));
+    });
   }
   if (problems.length) return { error: problems.join('; '), problems };
-  function placeSeam(f, loops) {
+  function placeSeam(f, traces) {
     // the seam may sit on any knot (rotating a uniform periodic net by whole spans moves it, the surface unchanged):
-    // the one each loop crosses once, its crossings furthest from the loops' corners (in points along the loop)
-    const { S } = f, [u0, u1] = S.dom, P = u1 - u0, rows = f.params.poles.length, wrap = rows - 3, h = P / wrap;
-    const seqs = loops.map((l) => {
-      const us = [], ends = [];
-      let prev = null, last = null;
-      for (const e of l) {
-        const ch = work[e.c], n = ch.pts.length, idx = ch.ring ? [...Array(n).keys()] : [...Array(n - 1).keys()];
-        ends.push(us.length);
-        for (const k of idx) {
-          const i = e.rev ? (ch.ring ? (n - k) % n : n - 1 - k) : k, x = ch.pts[i], r = S.closest(x, seedFor(f, ch.vid[i]) ?? prev);
-          prev = [r.u, r.v];
-          let u = r.u;
-          if (last !== null) { while (u - last > P / 2) u -= P; while (last - u > P / 2) u += P; }
-          us.push(last = u);
-        }
-      }
-      return { us, ends, turn: Math.round((us[us.length - 1] - us[0]) / P) || Math.sign(us[us.length - 1] - us[0]) };
-    });
+    // the one each rim crosses once and no hole crosses, the rims' crossings furthest from their corners (in points
+    // along the loop)
+    const [u0, u1] = f.S.dom, P = u1 - u0, rows = f.params.poles.length, wrap = rows - 3, h = P / wrap;
     let best = null;
     for (let j = 0; j < wrap; j++) {
       const us0 = u0 + j * h;
       let bad = 0, room = Infinity;
-      for (const { us, ends, turn } of seqs) {
-        const hits = [];
-        for (let k = 0; k < us.length; k++) {
-          const a = us[k], b = k + 1 < us.length ? us[k + 1] : us[0] + turn * P;
-          if (Math.floor((a - us0) / P) !== Math.floor((b - us0) / P)) hits.push(k);
-        }
-        bad += Math.abs(hits.length - 1);
-        if (hits.length) room = Math.min(room, ...ends.map((e) => Math.min(Math.abs(hits[0] - e), us.length - Math.abs(hits[0] - e))));
+      for (const tr of traces) {
+        const hits = crossings(tr, P, us0), n = tr.seq.length;
+        bad += Math.abs(hits.length - Math.abs(tr.turn));
+        if (tr.turn && hits.length) room = Math.min(room, ...tr.ends.map((e) => Math.min(Math.abs(hits[0] - e), n - Math.abs(hits[0] - e))));
       }
       if (!best || bad < best.bad || (bad === best.bad && room > best.room)) best = { j, bad, room };
     }
@@ -385,7 +483,11 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
       while (near + 1 < tv.length && Math.abs(tv[near + 1] - t) <= Math.abs(tv[near] - t)) near++;
       let sd = null;
       for (let o = 0; o < vid.length && !sd; o++) sd = seedFor(face, vid[near - o] ?? -1) ?? seedFor(face, vid[near + o] ?? -1);
-      const x = curveAt(curve, t)[0], r = S.closest(x, prev ?? sd);
+      // the closer of the projections from the last sample and from the nearest vertex's place (either can stall
+      // in a local minimum on the domain's edge when the other does not)
+      const x = curveAt(curve, t)[0];
+      let r = S.closest(x, prev ?? sd);
+      if (prev && sd) { const r2 = S.closest(x, sd); if (len(sub(r2.S, x)) < len(sub(r.S, x))) r = r2; }
       let u = r.u;
       if (periodic && uv.length) { while (u - uv[uv.length - 1][0] > P / 2) u -= P; while (uv[uv.length - 1][0] - u > P / 2) u += P; }
       uv.push([u, r.v]);
@@ -404,9 +506,10 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
         q[0] = Math.min(u1, Math.max(u0, q[0]));
       });
     }
-    const pc = fitCurve(uv, { ts, spans, maxSpans: spans });
-    pc.knots = curve.knots;
-    for (const t of ts) edgeTol = Math.max(edgeTol, len(sub(S.eval(...curveAt(pc, t)[0]).S, curveAt(curve, t)[0])));
+    const pc = fitCurve(uv, { ts, knots: curve.knots });
+    let et = 0;
+    for (const t of ts) et = Math.max(et, len(sub(S.eval(...curveAt(pc, t)[0]).S, curveAt(curve, t)[0])));
+    edgeTol = Math.max(edgeTol, et);
     return { pc, dir: Math.sign(uv[m][0] - uv[0][0]) };
   };
   const edges = work.map((ch) => ({ curve: ch.curve, v0: ch.v0, v1: ch.v1, pcurves: [] }));
@@ -435,11 +538,13 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
       loops.forEach((entries, li) => out[f.gi].bounds.push({ outer: li === outer, edges: entries.map((e) => ({ e: e.c, forward: !e.rev })) }));
       continue;
     }
-    if (loops.length !== 2) { problems.push(`face ${f.g.label}: closes round with ${loops.length} borders`); continue; }
-    // each loop from its seam vertex; A: the one whose u rises along it (it ends on the far side of the seam)
-    const q = seamAt.get(f.gi);
-    const fromSeam = loops.map((l, li) => {
-      const i = l.findIndex((e) => (e.rev ? edges[e.c].v1 : edges[e.c].v0) === q[li]);
+    // its two rims, each from its seam vertex; A: the one whose u rises along it (it ends on the far side of the
+    // seam); any other loop a hole in the wall
+    const at = seamAt.get(f.gi), rims = [...at.keys()];
+    if (rims.length !== 2) { problems.push(`face ${f.g.label}: closes round with ${rims.length} rims`); continue; }
+    const q = rims.map((li) => at.get(li));
+    const fromSeam = rims.map((li, r) => {
+      const l = loops[li], i = l.findIndex((e) => (e.rev ? edges[e.c].v1 : edges[e.c].v0) === q[r]);
       return l.slice(i).concat(l.slice(0, i));
     });
     const rise = fromSeam.map((l) => uvAt(l[l.length - 1], f.gi, 1)[0] - uvAt(l[0], f.gi, 0)[0]);
@@ -454,6 +559,7 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
     const seam = edges.length;
     edges.push({ curve, v0: qa, v1: qb, seam: { face: f.gi, pcurves: [line(u1), line(u0)] } });
     out[f.gi].bounds.push({ outer: true, edges: [...A.map((e) => ({ e: e.c, forward: !e.rev })), { e: seam, forward: true }, ...B.map((e) => ({ e: e.c, forward: !e.rev })), { e: seam, forward: false }] });
+    loops.forEach((l, li) => { if (!at.has(li)) out[f.gi].bounds.push({ outer: false, edges: l.map((e) => ({ e: e.c, forward: !e.rev })) }); });
   }
   if (problems.length) return { error: problems.join('; '), problems };
   const report = {

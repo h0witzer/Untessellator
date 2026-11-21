@@ -40,9 +40,10 @@ function reverseCuthillMcKee(adj) {
 
 /**
  * The envelope for a pattern: adj[i] lists j != i with A[i][j] possibly nonzero (symmetric). Returns an object
- * with add(i, j, x) (original indices, either triangle), factor(), solve(b) and clear().
+ * with add(i, j, x) (original indices, either triangle), factor(), solve(b) and clear(); or null when the envelope
+ * would hold more than maxSize entries (nothing allocated).
  */
-export function envelope(n, adj) {
+export function envelope(n, adj, maxSize = Infinity) {
   const order = reverseCuthillMcKee(adj.map((a) => [...a]));
   const pos = new Int32Array(n);
   order.forEach((v, k) => { pos[v] = k; });
@@ -54,6 +55,7 @@ export function envelope(n, adj) {
     first[i] = f;
   }
   for (let i = 0; i < n; i++) offset[i + 1] = offset[i] + (i - first[i] + 1);
+  if (offset[n] > maxSize) return null;
   const E = new Float64Array(offset[n]);
   const at = (i, j) => offset[i] + (j - first[i]);     // permuted i >= j
   return {
