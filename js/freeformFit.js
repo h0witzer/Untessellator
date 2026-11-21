@@ -395,7 +395,7 @@ function lcg(seed) { let s = seed >>> 0 || 1; return () => (s = (Math.imul(s, 16
  * (indices into V). scale: the part diagonal, for the tolerance (default the group's own). Returns
  * {params (nurbs.Surface.toParams) | null, info: {param, spans, rounds, max_err, rms_err (x scale), fail?}}.
  */
-export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, seed = 0 } = {}) {
+export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, seed = 0, densify = 0, densifyMax = 2 * FIT.MAX_POINTS } = {}) {
   const info = { n_vertices: V.length, n_triangles: T.length };
   if (!T.length || V.length < 3) return { params: null, info: { ...info, fail: 'empty' } };
   if (!scale) {
@@ -447,6 +447,38 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
   }
   const X = idx.map((i) => V[i]);
   let U = Float64Array.from(idx, (i) => uv[i][0]), Vv = Float64Array.from(idx, (i) => uv[i][1]);
+  // densify (model units): points inside every triangle longer than that, its k x k sub-triangles' centroids with
+  // their (u, v) interpolated, so a CAD face's long triangles (vertices on its border only) are data inside too.
+  // They are data for the fit only: a facet's inside is a chord, off the true surface, so the tolerance, the
+  // hold-out and the refinement go by the mesh's own vertices (nOrig of them, first in X).
+  const nOrig = X.length;
+  if (densify > 0) {
+    const xs = [...X], us = [...U], vs = [...Vv];
+    for (const [a, b, c] of T) {
+      const L = Math.max(norm(sub(V[a], V[b])), norm(sub(V[b], V[c])), norm(sub(V[c], V[a])));
+      const k = Math.min(24, Math.ceil(L / densify));
+      if (k < 2) continue;
+      // round a ring the second coordinate wraps: a triangle across the wrap is left as it is
+      if (period && Math.max(Math.abs(uv[a][1] - uv[b][1]), Math.abs(uv[b][1] - uv[c][1]), Math.abs(uv[c][1] - uv[a][1])) > period / 2) continue;
+      for (let i = 0; i < k; i++) for (let j = 0; i + j < k; j++) for (const up of [0, 1]) {
+        if (up && i + j > k - 2) continue;
+        const wb = (i + (up ? 2 : 1) / 3) / k, wc = (j + (up ? 2 : 1) / 3) / k, wa = 1 - wb - wc;
+        xs.push([0, 1, 2].map((d) => wa * V[a][d] + wb * V[b][d] + wc * V[c][d]));
+        us.push(wa * uv[a][0] + wb * uv[b][0] + wc * uv[c][0]);
+        vs.push(wa * uv[a][1] + wb * uv[b][1] + wc * uv[c][1]);
+      }
+    }
+    const base = X.length, extraN = xs.length - base;
+    if (extraN > 0) {
+      const keep = Math.min(extraN, densifyMax), order = [...Array(extraN).keys()];
+      for (let i = order.length - 1; i > 0; i--) { const j = Math.floor(rand() * (i + 1)); [order[i], order[j]] = [order[j], order[i]]; }
+      const pick = order.slice(0, keep);
+      for (const e of pick) X.push(xs[base + e]);
+      U = Float64Array.from([...U, ...pick.map((e) => us[base + e])]);
+      Vv = Float64Array.from([...Vv, ...pick.map((e) => vs[base + e])]);
+      idx.push(...pick.map(() => -1));
+    }
+  }
   // initial net: one span across, spans along in proportion to the aspect ratio (round a ring, at
   // least PERIODIC_MIN_SPANS so it closes smoothly; wrap = its distinct columns)
   let tu, tv, wrap = 0;
@@ -471,8 +503,8 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
   const lamAbs = info.lam_abs;
   // hold-out: 10% of the interior vertices left out, to choose the refinement level
   const hold = new Uint8Array(X.length);
-  const cand = idx.map((q, k) => (bset.has(q) ? -1 : k)).filter((k) => k >= 0);
-  const nHold = Math.floor(FIT.HOLDOUT_FRAC * X.length);
+  const cand = idx.map((q, k) => (q < 0 || bset.has(q) ? -1 : k)).filter((k) => k >= 0);
+  const nHold = Math.floor(FIT.HOLDOUT_FRAC * nOrig);
   if (nHold >= FIT.HOLDOUT_MIN && cand.length > 2 * nHold) {
     for (let i = cand.length - 1; i > 0; i--) { const j = Math.floor(rand() * (i + 1)); [cand[i], cand[j]] = [cand[j], cand[i]]; }
     for (const k of cand.slice(0, nHold)) hold[k] = 1;
@@ -496,13 +528,13 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
     }
     if (!S) return { params: null, info: { ...info, fail: 'solve' } };
     let val = 0, errF = 0;
-    for (let k = 0; k < X.length; k++) { if (hold[k]) val = Math.max(val, err[k]); else errF = Math.max(errF, err[k]); }
+    for (let k = 0; k < nOrig; k++) { if (hold[k]) val = Math.max(val, err[k]); else errF = Math.max(errF, err[k]); }
     if (!hold.some(Boolean)) val = errF;
     if (!best || val < best.val) { best = { val, tu: tu.slice(), tv: tv.slice(), wrap, U: Float64Array.from(U), V: Float64Array.from(Vv), rnd }; stale = 0; } else stale++;
     if (errF <= absTol || rnd === FIT.REFINE_ROUNDS || stale >= FIT.VAL_PATIENCE) break;
     // a knot mid-span in every span holding a vertex over tolerance and REFINE_MIN_POINTS in all;
     // round a ring the spans are doubled instead
-    const over = (k) => err[k] > absTol && !hold[k];
+    const over = (k) => k < nOrig && err[k] > absTol && !hold[k];
     const kvD = distinct(tv), kuD = distinct(tu);
     const spanIdx = (kd, x) => { let i = 0; while (i + 1 < kd.length - 1 && x >= kd[i + 1]) i++; return i; };
     const addV = [], addU = [];
@@ -516,7 +548,7 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
     for (const i of overU) if ((countU.get(i) ?? 0) >= FIT.REFINE_MIN_POINTS) addU.push((kuD[i] + kuD[i + 1]) / 2);
     if (kvD.length - 1 + addV.length > FIT.MAX_SPANS) addV.length = 0;
     if (kuD.length - 1 + addU.length > FIT.MAX_SPANS) addU.length = 0;
-    const cap = Math.min(FIT.DOF_RATIO * X.length, FIT.MAX_CP);
+    const cap = Math.min(FIT.DOF_RATIO * nOrig, FIT.MAX_CP);
     const nuNew = tu.length - P_ - 1 + addU.length;
     if (wrap) {
       const grow = 2 * wrap <= FIT.MAX_SPANS && 2 * wrap * nuNew <= cap;
@@ -539,9 +571,9 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
     project(S);
   }
   let maxErr = 0, sq = 0;
-  for (const e of err) { maxErr = Math.max(maxErr, e); sq += e * e; }
+  for (let k = 0; k < nOrig; k++) { maxErr = Math.max(maxErr, err[k]); sq += err[k] * err[k]; }
   Object.assign(info, { spans: [distinct(tu).length - 1, wrap || distinct(tv).length - 1], rounds: best.rnd,
-    holdout: hold.reduce((s, h) => s + h, 0), max_err: maxErr / scale, rms_err: Math.sqrt(sq / err.length) / scale });
+    holdout: hold.reduce((s, h) => s + h, 0), max_err: maxErr / scale, rms_err: Math.sqrt(sq / nOrig) / scale });
   return { params: wrap ? uPeriodic(S) : S.toParams(), info };
 }
 
