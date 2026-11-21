@@ -20,6 +20,6 @@ em++ -O3 -std=c++14 -fexceptions -DNDEBUG -DEIGEN_MPL2_ONLY \
   $FILES "$HERE/remesh.cpp" \
   -sMODULARIZE=1 -sEXPORT_ES6=1 -sEXPORT_NAME=QuadriFlow -sENVIRONMENT=web,worker,node \
   -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=8MB -sFORCE_FILESYSTEM=1 \
-  -sEXPORTED_FUNCTIONS=_qf_remesh -sEXPORTED_RUNTIME_METHODS=FS,ccall \
+  -sEXPORTED_FUNCTIONS=_qf_remesh,_malloc,_free -sEXPORTED_RUNTIME_METHODS=FS,ccall,HEAPF64,HEAP32 \
   -o "$OUT/quadriflow.mjs"
 ls -la "$OUT"

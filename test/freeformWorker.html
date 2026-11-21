@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>freeform worker</title>
+</head>
+<body>
+<pre id="out">running…</pre>
+<script type="module">
+// Browser check of js/subd/worker.js: a bumpy sphere (icosphere, 20480 triangles, 50 mm) through the freeform
+// export in a module worker. The result goes to document.title as JSON for a headless driver to read
+// (test/freeformBrowser.mjs).
+function icosphere(level) {
+  const t = (1 + Math.sqrt(5)) / 2;
+  let V = [[-1, t, 0], [1, t, 0], [-1, -t, 0], [1, -t, 0], [0, -1, t], [0, 1, t], [0, -1, -t], [0, 1, -t], [t, 0, -1], [t, 0, 1], [-t, 0, -1], [-t, 0, 1]];
+  let F = [[0, 11, 5], [0, 5, 1], [0, 1, 7], [0, 7, 10], [0, 10, 11], [1, 5, 9], [5, 11, 4], [11, 10, 2], [10, 7, 6], [7, 1, 8],
+    [3, 9, 4], [3, 4, 2], [3, 2, 6], [3, 6, 8], [3, 8, 9], [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1]];
+  for (let l = 0; l < level; l++) {
+    const mid = new Map(), m = (a, b) => {
+      const k = a < b ? `${a},${b}` : `${b},${a}`;
+      if (!mid.has(k)) { mid.set(k, V.length); V.push(V[a].map((x, c) => (x + V[b][c]) / 2)); }
+      return mid.get(k);
+    };
+    F = F.flatMap(([a, b, c]) => { const ab = m(a, b), bc = m(b, c), ca = m(c, a); return [[a, ab, ca], [b, bc, ab], [c, ca, bc], [ab, bc, ca]]; });
+  }
+  V = V.map((p) => { const r = Math.hypot(...p), u = p.map((x) => x / r); const s = 1 + 0.12 * Math.sin(3 * u[0]) * Math.sin(3 * u[1]) * Math.sin(3 * u[2]) + 0.08 * Math.cos(4 * u[2]); return u.map((x) => 25 * s * x); });
+  return { V, F };
+}
+const { V, F } = icosphere(5);
+const positions = new Float64Array(F.length * 9);
+F.forEach((t, i) => t.forEach((v, k) => positions.set(V[v], i * 9 + k * 3)));
+const t0 = performance.now();
+const worker = new Worker(new URL('../js/subd/worker.js', import.meta.url), { type: 'module' });
+const status = [];
+worker.onmessage = ({ data }) => {
+  if (data.type === 'status') { status.push(data.text); return; }
+  const ms = performance.now() - t0;
+  const out = data.type === 'done'
+    ? { ok: !!data.step, ms: Math.round(ms), stepBytes: data.step?.length ?? 0, previewTriangles: data.preview?.face.length ?? 0, bodies: data.report.bodies, status }
+    : { ok: false, ms: Math.round(ms), error: data.message, status };
+  document.getElementById('out').textContent = JSON.stringify(out, null, 1);
+  document.title = `done ${JSON.stringify(out)}`;
+};
+worker.onerror = (e) => { document.title = `done ${JSON.stringify({ ok: false, error: e.message })}`; };
+worker.postMessage({ positions, part: 'Bumpy sphere' }, [positions.buffer]);
+</script>
+</body>
+</html>

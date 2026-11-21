@@ -18,12 +18,17 @@ export function loadQuadriFlow() {
  */
 export async function quadRemesh(vertices, triangles, { faces = 300, seed = 0 } = {}) {
   const M = await loadQuadriFlow();
-  const lines = [];
-  for (const v of vertices) lines.push(`v ${v[0]} ${v[1]} ${v[2]}`);
-  for (const t of triangles) lines.push(`f ${t[0] + 1} ${t[1] + 1} ${t[2] + 1}`);
-  M.FS.writeFile('/in.obj', lines.join('\n'));
-  const status = M.ccall('qf_remesh', 'number', ['string', 'string', 'number', 'number', 'number'], ['/in.obj', '/out.obj', faces, 0, seed]);
-  M.FS.unlink('/in.obj');
+  // only the vertices the triangles use, renumbered (QuadriFlow's hierarchy has no place for loose points)
+  const used = new Int32Array(vertices.length).fill(-1);
+  let nv = 0;
+  for (const t of triangles) for (const v of t) if (used[v] < 0) used[v] = nv++;
+  const pV = M._malloc(nv * 24), pT = M._malloc(triangles.length * 12);
+  const V = new Float64Array(M.HEAPF64.buffer, pV, nv * 3), T = new Int32Array(M.HEAP32.buffer, pT, triangles.length * 3);
+  vertices.forEach((p, i) => { const j = used[i]; if (j >= 0) { V[j * 3] = p[0]; V[j * 3 + 1] = p[1]; V[j * 3 + 2] = p[2]; } });
+  triangles.forEach((t, i) => { T[i * 3] = used[t[0]]; T[i * 3 + 1] = used[t[1]]; T[i * 3 + 2] = used[t[2]]; });
+  const status = M.ccall('qf_remesh', 'number', ['number', 'number', 'number', 'number', 'number', 'number', 'string'],
+    [pV, nv, pT, triangles.length, faces, seed, '/out.obj']);
+  M._free(pV); M._free(pT);
   if (status !== 0) return { error: `QuadriFlow failed (status ${status})` };
   const cage = parseQuadCage(M.FS.readFile('/out.obj', { encoding: 'utf8' }));
   M.FS.unlink('/out.obj');
