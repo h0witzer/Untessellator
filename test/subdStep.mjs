@@ -1,10 +1,11 @@
 // Cage -> NURBS patches (js/subd/fastNurbs.js) -> closed solid (js/knit/patches.js) -> STEP, timed per stage.
-// node test/subdStep.mjs <dir-with-cage.json> ... [--out <dir>]
+// node test/subdStep.mjs <dir-with-cage.json | cage.obj> ... [--out <dir>]
 import fs from 'node:fs';
 import path from 'node:path';
 import { fastSubdToNurbs } from '../js/subd/fastNurbs.js';
 import { patchSolid } from '../js/knit/patches.js';
 import { loadOcct, writeStep } from '../js/knit/index.js';
+import { parseQuadCage } from '../js/subd/objCage.js';
 
 const args = process.argv.slice(2);
 const oi = args.indexOf('--out');
@@ -13,7 +14,9 @@ const t0 = performance.now();
 const oc = await loadOcct();
 console.log(`OCCT loaded in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
 for (const dir of args) {
-  const cage = JSON.parse(fs.readFileSync(path.join(dir, 'cage.json'), 'utf8'));
+  const cage = dir.toLowerCase().endsWith('.obj') ? parseQuadCage(fs.readFileSync(dir, 'utf8'))
+    : JSON.parse(fs.readFileSync(path.join(dir, 'cage.json'), 'utf8'));
+  if (cage.error) { console.log(path.basename(dir), 'not a quad cage:', cage.error); continue; }
   const ta = performance.now();
   const r = fastSubdToNurbs(cage.vertices, cage.faces);
   const tb = performance.now();
