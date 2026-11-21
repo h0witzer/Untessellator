@@ -1,36 +1,38 @@
 /**
- * retopo.js — a quad cage for a triangle mesh, by Instant Meshes (Jakob, Tarini, Panozzo, Sorkine-Hornung 2015;
- * BSD-3-Clause, built to WebAssembly by tools/instant-meshes/build.sh, licences in tools/instant-meshes/NOTICE).
- * Single-threaded; the module (about 0.5 MB) loads on first use.
+ * retopo.js — a quad cage for a triangle mesh, by QuadriFlow (Huang, Zhou, Niessner, Shewchuk, Guibas 2018;
+ * BSD-3-Clause, built to WebAssembly by tools/quadriflow/build.sh, licenses in tools/quadriflow/NOTICE). It comes
+ * close to the quad count asked for and places few star points, which keeps the NURBS caps few and apart.
+ * Single-threaded; the module (about 0.6 MB) loads on first use.
  */
 import { parseQuadCage } from './objCage.js';
 
 let loading = null;
-export function loadInstantMeshes() {
-  if (!loading) loading = import('../vendor/instant-meshes/instant-meshes.mjs').then((m) => m.default({ print: () => {}, printErr: () => {} }));
+export function loadQuadriFlow() {
+  if (!loading) loading = import('../vendor/quadriflow/quadriflow.mjs').then((m) => m.default({ print: () => {}, printErr: () => {} }));
   return loading;
 }
 
 /**
- * Remesh. vertices: [[x, y, z]...]; triangles: [[a, b, c]...] (0-based). faces: the target quad count.
- * Returns { vertices, faces } (a pure quad cage, Instant Meshes' extrinsic 4-RoSy/4-PoSy mode) or { error }.
+ * Remesh. vertices: [[x, y, z]...]; triangles: [[a, b, c]...] (0-based). faces: the quad count to aim for.
+ * Returns { vertices, faces } (a pure quad cage) or { error }.
  */
-export async function quadRemesh(vertices, triangles, { faces = 300, creaseDegrees = -1 } = {}) {
-  const M = await loadInstantMeshes();
+export async function quadRemesh(vertices, triangles, { faces = 300, seed = 0 } = {}) {
+  const M = await loadQuadriFlow();
   const lines = [];
   for (const v of vertices) lines.push(`v ${v[0]} ${v[1]} ${v[2]}`);
   for (const t of triangles) lines.push(`f ${t[0] + 1} ${t[1] + 1} ${t[2] + 1}`);
   M.FS.writeFile('/in.obj', lines.join('\n'));
-  const status = M.ccall('im_remesh', 'number', ['string', 'string', 'number', 'number', 'number'], ['/in.obj', '/out.obj', faces, 1, creaseDegrees]);
-  if (status !== 0) return { error: `Instant Meshes failed (status ${status})` };
+  const status = M.ccall('qf_remesh', 'number', ['string', 'string', 'number', 'number', 'number'], ['/in.obj', '/out.obj', faces, 0, seed]);
+  M.FS.unlink('/in.obj');
+  if (status !== 0) return { error: `QuadriFlow failed (status ${status})` };
   const cage = parseQuadCage(M.FS.readFile('/out.obj', { encoding: 'utf8' }));
-  M.FS.unlink('/in.obj'); M.FS.unlink('/out.obj');
+  M.FS.unlink('/out.obj');
   return cage.error ? cage : dissolveValence2(cage);
 }
 
 /**
- * Instant Meshes can leave a vertex on just two quads, [v, a, x, b] and [v, b, y, a]: dropping v leaves the one quad
- * [a, x, b, y]. Repeats until none is left; unused vertices are dropped and the rest renumbered.
+ * A vertex on just two quads, [v, a, x, b] and [v, b, y, a], is a fold the NURBS can't use: dropping v leaves the
+ * one quad [a, x, b, y]. Repeats until none is left; unused vertices are dropped and the rest renumbered.
  */
 export function dissolveValence2({ vertices, faces }) {
   let F = faces.map((q) => [...q]);

@@ -4,8 +4,8 @@
  * cap of js/subd/kpCap.js, a precomputed matrix per valence applied to the data along the cap's outer sides. No
  * iteration: the cost is a few small matrix products per face.
  *
- * The cap needs its star point's faces and the faces across their outer sides to be otherwise regular; a cage
- * whose star points are closer than that is subdivided once (Catmull-Clark) until they are not.
+ * The cap needs one layer of regular points round its star point (no face with two star corners); a cage whose
+ * star points are closer than that is subdivided (Catmull-Clark) until they are not.
  *
  * Output faces are Bezier patches as clamped B-splines: { uKnots, vKnots, uCount, vCount, poles } with poles
  * row-major, u from corner 0 to corner 1 of the face and v from corner 0 to corner 3.
@@ -51,20 +51,13 @@ function topology(V, F) {
   return { ring, valence, facesAt, corner, sideOwner };
 }
 
-/** The faces' neighbourhoods are fine for the cap: every star face has one star corner, every face across its outer sides is regular. */
+/**
+ * The paper's condition: every star point is surrounded by one layer of regular points, i.e. no face has two star
+ * corners. The faces across a star face's outer sides may be other stars' faces: the cap's data there is the
+ * B-spline's along the shared side (sideNet), so two caps meeting on a side both meet that jet, and each other, G2.
+ */
 function isolated(F, T) {
-  for (let v = 0; v < T.valence.length; v++) {
-    if (T.valence[v] === 4) continue;
-    for (const [f, k] of T.facesAt[v]) {
-      const q = F[f];
-      for (let j = 1; j < 4; j++) if (T.valence[q[(k + j) % 4]] !== 4) return false;
-      for (const s of [1, 2]) {                    // the outer sides q[k+1] -> q[k+2] and q[k+2] -> q[k+3]
-        const a = q[(k + s) % 4], b = q[(k + s + 1) % 4], g = T.sideOwner.get(`${b},${a}`);
-        if (!g || F[g[0]].some((x) => T.valence[x] !== 4)) return false;
-      }
-    }
-  }
-  return true;
+  return F.every((q) => q.filter((v) => T.valence[v] !== 4).length <= 1);
 }
 
 /** Bicubic Bezier net (4 x 4, row-major u then v) of a regular face from its 4 x 4 control-point neighbourhood. */
@@ -85,6 +78,28 @@ function regularPatch(V, q, T) {
   for (let a = 0; a < 4; a++) for (let b = 0; b < 4; b++) for (let c = 0; c < 3; c++) {
     let s = 0;
     for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) s += B2BB[a][i] * B2BB[b][j] * V[G[i][j]][c];
+    net[(a * 4 + b) * 3 + c] = s;
+  }
+  return net;
+}
+
+/**
+ * The uniform B-spline's Bezier net on face q seen from its side k, valid in the three rows next to that side: those
+ * rows need only the control points round the side's two ends (both regular), so the face's far corners may be star
+ * points. The net is in the face's frame turned so that side k is side 0; row 3 is a placeholder.
+ */
+function sideNet(V, q, k, T) {
+  const [c0, c1, c2, c3] = [0, 1, 2, 3].map((j) => q[(k + j) % 4]);
+  const opp = (c, x) => { const r = T.ring(c); return r[(r.indexOf(x) + 2) % 4]; };
+  const four = (c, a, b) => T.corner.get(`${c},${a},${b}`) ?? T.corner.get(`${c},${b},${a}`);
+  const G = Array.from({ length: 4 }, () => new Array(4));
+  G[1][1] = c0; G[2][1] = c1; G[2][2] = c2; G[1][2] = c3;
+  G[0][1] = opp(c0, c1); G[1][0] = opp(c0, c3); G[0][0] = four(c0, G[0][1], G[1][0]); G[0][2] = four(c0, G[0][1], c3);
+  G[3][1] = opp(c1, c0); G[2][0] = opp(c1, c2); G[3][0] = four(c1, G[3][1], G[2][0]); G[3][2] = four(c1, G[3][1], c2);
+  const net = new Float64Array(48);
+  for (let a = 0; a < 4; a++) for (let b = 0; b < 3; b++) for (let c = 0; c < 3; c++) {
+    let s = 0;
+    for (let i = 0; i < 4; i++) for (let j = 0; j < 3; j++) s += B2BB[a][i] * B2BB[b][j] * V[G[i][j]][c];
     net[(a * 4 + b) * 3 + c] = s;
   }
   return net;
@@ -157,12 +172,12 @@ export function fastSubdToNurbs(vertices, cageFaces, options = {}) {
       const q = F[f], w0 = q[(k + 1) % 4], x = q[(k + 2) % 4], w1 = q[(k + 3) % 4];
       const rowsFor = (a, b, tOf) => {            // the outer side a -> b of F_k (loop order), neighbour across: b -> a
         const [g, kg] = T.sideOwner.get(`${b},${a}`);
-        const net = patchOf(g), rows = [[], [], []];
+        const net = sideNet(V, F[g], kg, T), rows = [[], [], []];
         for (let j = 0; j <= 6; j++) {
           const pos = j / 6, t = tOf(pos);         // t: 0 at the far corner, 1 at the spoke's end
           // the neighbour's side runs b -> a; its parameter is 0 at b
           const sg = a === x ? 1 - t : t;           // U1: a = w0, b = x  -> s_g = t;  V1: a = x, b = w1 -> s_g = 1 - t
-          const J = sideJets(net, kg, sg);
+          const J = sideJets(net, 0, sg);
           const dsdt = a === x ? -1 : 1;
           const bn = J.t.map((y) => -y), bnn = J.tt, bt = J.s.map((y) => dsdt * y);
           const R0 = J.p, R1 = R0.map((y, c) => y + bn[c] / 6);

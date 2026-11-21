@@ -155,5 +155,5 @@ export function fitCage(cage, points, { rounds = 5, grid = 7 } = {}) {
     const xs = b.map((bb) => solve(bb));
     X = X.map((_, j) => [xs[0][j], xs[1][j], xs[2][j]]);
   }
-  return { vertices: X, faces: nurbs.faces, cageFaces: nurbs.cageFaces, stats: { history, ms: { map: tMap, total: performance.now() - t0 } } };
+  return { vertices: X, faces: nurbs.faces, cageFaces: nurbs.cageFaces, stats: { history, subdivisions: nurbs.stats.subdivisions, ms: { map: tMap, total: performance.now() - t0 } } };
 }
