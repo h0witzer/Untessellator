@@ -17,7 +17,7 @@
  */
 import { findBodies } from '../bodies.js';
 import { quadRemesh } from './retopo.js';
-import { isotropicRemesh } from './isotropic.js';
+import { isotropicRemesh, projector } from './isotropic.js';
 import { fitCage, fitMap } from './fitCage.js';
 import { groupCage } from './groupCage.js';
 import { groupLinearMap } from './groupNurbs.js';
@@ -112,7 +112,7 @@ function groupSolid(vertices, faces, labels, target, onStatus, name) {
   onStatus(`${name}: cage from its faces…`);
   const cage = groupCage(vertices, faces, labels, { quads: target });
   if (cage.error) return cage;
-  const map = groupLinearMap(cage.vertices.length, cage.groups);
+  const map = groupLinearMap(cage.vertices.length, cage.groups, { ends: cage.ends });
   const h = Math.sqrt(meshArea(vertices, faces) / map.faces.length) / 2;
   const points = [], weights = [], pointGroup = [];
   cage.groups.forEach((g, gi) => {
@@ -121,12 +121,19 @@ function groupSolid(vertices, faces, labels, target, onStatus, name) {
   });
   onStatus(`${name}: fitting ${cage.groups.length} faces…`);
   const tb = performance.now();
+  // two-sided: each group's faces are also pulled onto that group's triangles
+  const onGroup = cage.groups.map((g) => {
+    const T = g.triangles.map((t) => faces[t]);
+    let lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+    for (const t of T) for (const v of t) for (let d = 0; d < 3; d++) { lo[d] = Math.min(lo[d], vertices[v][d]); hi[d] = Math.max(hi[d], vertices[v][d]); }
+    return projector(vertices, T, Math.max(Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) / 24, 1e-9));
+  });
   const fit = fitMap(map, cage.vertices, cage.groups.flatMap((g) => g.faces), points,
-    { rounds: 4, weights: Float64Array.from(weights), pointGroup: Int32Array.from(pointGroup) });
+    { rounds: 4, weights: Float64Array.from(weights), pointGroup: Int32Array.from(pointGroup), project: (g, p) => onGroup[g](p) });
   const tc = performance.now();
   const last = fit.stats.history[fit.stats.history.length - 1], diag = fitDiag(vertices);
   return { fit, faceGroup: map.faceGroup, row: { groups: cage.groups.length, n: cage.n, quads: map.faces.length, faces: fit.faces.length,
-    stars: cage.groups.filter((g) => g.k !== 4).length, subdivisions: 0, rms: last.rms * diag, max: last.max * diag,
+    kinds: cage.groups.reduce((m, g) => ({ ...m, [g.kind]: (m[g.kind] ?? 0) + 1 }), {}), subdivisions: 0, rms: last.rms * diag, max: last.max * diag,
     relRms: last.rms, relMax: last.max, ms: { remesh: tb - ta, fit: tc - tb } } };
 }
 

@@ -103,29 +103,53 @@ function continuity({ faces, loops, faceGroup }, diag) {
       r.gap = Math.max(r.gap, Math.hypot(...sub(dA['00'], dB['00'])) / diag);
       const nA = unit(cross(dA['10'], dA['01'])), nB = unit(cross(dB['10'], dB['01']));
       const angle = Math.acos(Math.max(-1, Math.min(1, dot(nA, nB)))) * 180 / Math.PI;
+      const sine = (d) => Math.hypot(...cross(d['10'], d['01'])) / ((Math.hypot(...d['10']) * Math.hypot(...d['01'])) || 1);
+      if (!same && Math.min(sine(dA), sine(dB)) < 0.05) { r.degenerate = (r.degenerate ?? 0) + 1; continue; }
       if (!same) {
-        if (m > 0 && m < 16) { r.borderMin = Math.min(r.borderMin, angle); r.borderMax = Math.max(r.borderMax, angle); }
+        if (m > 0 && m < 16) {
+          if (angle < r.borderMin) { r.borderMin = angle; r.minAt = dA['00']; }
+          if (angle > r.borderMax) { r.borderMax = angle; r.maxAt = dA['00']; }
+        }
         continue;
       }
       r.innerAngle = Math.max(r.innerAngle, angle);
       const along = dA['10'].map((x, c) => x * (p1[0] - p0[0]) + dA['01'][c] * (p1[1] - p0[1]));
       const D = unit(cross(nA, unit(along)));
       const [kA, mA] = curvatureAcross(dA, nA, D), [kB, mB] = curvatureAcross(dB, nB, D);
-      r.innerG2 = Math.max(r.innerG2, Math.abs(kA - kB) / Math.max(mA, mB, 1 / diag));
+      const g2 = Math.abs(kA - kB) / Math.max(mA, mB, 1 / diag);
+      if (g2 > r.innerG2) { r.innerG2 = g2; r.g2At = dA['00']; r.g2Group = faceGroup[f]; r.g2Face = f; }
     }
   }
+  // skew: the smallest sine of the angle between a face's two directions, over a 5 x 5 grid of each face
+  r.skewed = 0; r.minSine = 1;
+  faces.forEach((f) => {
+    let m = 1;
+    for (let i = 0; i <= 4; i++) for (let j = 0; j <= 4; j++) {
+      const d = evalPatch(f, i / 4, j / 4), c = Math.hypot(...cross(d['10'], d['01'])) / ((Math.hypot(...d['10']) * Math.hypot(...d['01'])) || 1);
+      m = Math.min(m, c);
+    }
+    r.minSine = Math.min(r.minSine, m);
+    if (m < 0.1) r.skewed++;
+  });
   return r;
 }
 
 let oc = null;
 for (const file of files) {
-  const P = readStl(file), { groups, count } = floodGroups(P, crease);
+  // an STL's faces come from the flood fill; a mesh.json { vertices, faces, labels } brings its own
+  let P, groups, count;
+  if (file.endsWith('.json')) {
+    const m = JSON.parse(fs.readFileSync(file, 'utf8'));
+    P = new Float64Array(m.faces.length * 9);
+    m.faces.forEach((t, i) => t.forEach((v, k) => P.set(m.vertices[v], i * 9 + k * 3)));
+    groups = Int32Array.from(m.labels); count = new Set(m.labels).size;
+  } else ({ groups, count } = floodGroups(P = readStl(file), crease));
   const t0 = performance.now();
   const r = await freeformSolid(P, { groups, part: 'Test', quads: quads ? Number(quads) : null });
   const ms = performance.now() - t0;
   console.log(`${file.split(/[\\/]/).pop()}: ${count} faces at ${crease} deg, ${(ms / 1000).toFixed(2)} s`);
   for (const b of r.report.bodies) {
-    console.log('  ', b.error ? `${b.name}: ${b.error}` : `${b.name}: ${b.groups ?? 1} groups, n ${b.n ?? '-'}, ${b.faces} patches, `
+    console.log('  ', b.error ? `${b.name}: ${b.error}` : `${b.name}: ${b.groups ?? 1} groups ${JSON.stringify(b.kinds ?? {})}, ${b.faces} patches, `
       + `rms ${(b.relRms * 100).toFixed(3)} % max ${(b.relMax * 100).toFixed(3)} % of size, cage ${b.ms.remesh.toFixed(0)} ms, fit ${b.ms.fit.toFixed(0)} ms`);
   }
   if (!r.solids?.length) continue;
@@ -136,7 +160,8 @@ for (const file of files) {
     if (!s.faceGroup) continue;
     const c = continuity(s, diag);
     console.log(`   edges: ${c.inner} inside faces (angle ${c.innerAngle.toExponential(1)} deg, G2 ${(100 * c.innerG2).toExponential(1)} %), `
-      + `${c.border} on borders (faces meet at ${c.borderMin.toFixed(1)}-${c.borderMax.toFixed(1)} deg), gap ${c.gap.toExponential(1)} of size, open ${c.open}`);
+      + `${c.border} on borders (faces meet at ${c.borderMin.toFixed(1)}-${c.borderMax.toFixed(1)} deg), gap ${c.gap.toExponential(1)} of size, open ${c.open}, ${c.degenerate ?? 0} border samples at degenerate points skipped; ${c.skewed} patches skewed past sine 0.1 (least ${c.minSine.toFixed(3)})`);
+    if (process.env.WHERE) console.log(`   least at ${c.minAt?.map((x) => x.toFixed(1))}, most at ${c.maxAt?.map((x) => x.toFixed(1))}; worst G2 at ${c.g2At?.map((x) => x.toFixed(1))} (group ${c.g2Group}, patch ${c.g2Face} of degree ${s.faces[c.g2Face]?.uCount - 1})`);
   }
   if (out && r.step) fs.writeFileSync(out, r.step);
   if (check && r.step) {

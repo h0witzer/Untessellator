@@ -11,6 +11,8 @@ import { subdLinearMap, applyLinearMap, bezierKnots } from './fastNurbs.js';
 import { envelope } from './envelopeCholesky.js';
 import { bern, evalAt, D } from './bezier.js';
 
+const SELF = [1 / 6, 1 / 2, 5 / 6];                 // a face's own points for the two-sided fit: 3 x 3 (midpoint rule)
+
 /** Closest point on a face to m by Newton from (u, v), clamped to the face. */
 function project(n, P, m, u, v) {
   for (let it = 0; it < 8; it++) {
@@ -162,8 +164,14 @@ export function fitCage(cage, points, options = {}) {
  * The fit on a given linear map (subdLinearMap, or groupLinearMap for a cage in groups). pointGroup (optional, one
  * per point, with map.faceGroup): each point's closest point is sought on its own group's faces only, so a point
  * near a border never pulls the face across it.
+ *
+ * project (optional, (group, point) -> the closest point on the input mesh's part for that group) makes the fit
+ * two-sided: besides the input's points pulling the surface (the integral of squared distance over the input),
+ * each face's own points are pulled to the input (the same integral over the surface, 3 x 3 points per face, each
+ * carrying its share of the face's area). A face that the input's points miss (a small one at a sharp tip) is
+ * then still held to the mesh, and a flap off it costs what it should.
  */
-export function fitMap(map, vertices, cageFaces, points, { rounds = 5, grid = 7, weights = null, pointGroup = null } = {}, t0 = performance.now()) {
+export function fitMap(map, vertices, cageFaces, points, { rounds = 5, grid = 7, weights = null, pointGroup = null, project = null } = {}, t0 = performance.now()) {
   const N = vertices.length;
   const sizes = map.faces.map((f) => f.uCount);
   // the normal equations' pattern: each face's support, and each cage vertex's Laplacian stencil
@@ -183,6 +191,7 @@ export function fitMap(map, vertices, cageFaces, points, { rounds = 5, grid = 7,
   const history = [];
   const foot = new Array(points.length);
   const totalWeight = weights ? weights.reduce((s, w) => s + w, 0) : points.length;
+  if (project && !weights) throw new Error('fitMap: the two-sided fit needs area weights on the points');
   let poles = null;
   for (let round = 0; round <= rounds; round++) {
     tick = performance.now();
@@ -202,13 +211,21 @@ export function fitMap(map, vertices, cageFaces, points, { rounds = 5, grid = 7,
     let trace = 0;
     const bu = new Float64Array(7), bv = new Float64Array(7);
     byFace.forEach((list, fi) => {
-      if (!list.length) return;
+      if (!list.length && !project) return;
       const { uCount: n, ids, W } = map.faces[fi], np = n * n, nl = ids.length;
       const G = new Float64Array(np * np), R = new Float64Array(np * 3), b = new Float64Array(np);
-      for (const i of list) {
-        bern(n - 1, foot[i].u, bu); bern(n - 1, foot[i].v, bv);
+      // the input's points on this face, then (two-sided) the face's own points pulled to the input
+      const rows = list.map((i) => [foot[i].u, foot[i].v, points[i], weights ? weights[i] : 1]);
+      if (project) {
+        for (const u of SELF) for (const v of SELF) {
+          const d = evalAt(n, poles[fi], u, v), at = [d[0], d[1], d[2]];
+          const area = Math.hypot(d[4] * d[8] - d[5] * d[7], d[5] * d[6] - d[3] * d[8], d[3] * d[7] - d[4] * d[6]) / 9;
+          rows.push([u, v, project(map.faceGroup ? map.faceGroup[fi] : 0, at), area]);
+        }
+      }
+      for (const [fu, fv, m, w] of rows) {
+        bern(n - 1, fu, bu); bern(n - 1, fv, bv);
         for (let a = 0; a < n; a++) for (let c = 0; c < n; c++) b[a * n + c] = bu[a] * bv[c];
-        const m = points[i], w = weights ? weights[i] : 1;
         for (let p = 0; p < np; p++) {
           const bp = w * b[p];
           if (!bp) continue;
