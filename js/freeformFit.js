@@ -74,10 +74,11 @@ export function planeParam(V, T) {
 }
 
 /** Least-squares conformal map of a disk, two far-apart boundary vertices pinned; null if not a disk or it folds. */
-export function lscm(V, T, iters = 20000) {
+export function lscm(V, T, iters = 20000, holes = false) {
   const nV = V.length;
   const cnt = edgeCounts(T);
-  if (nV - cnt.size + T.length !== 1 || components(T, nV) !== 1) return null;
+  // a disk; with holes = true any connected face with borders (holes stay holes in the map; a fold fails it)
+  if ((!holes && nV - cnt.size + T.length !== 1) || components(T, nV) !== 1) return null;
   const bset = new Set();
   for (const [k, c] of cnt) if (c === 1) for (const q of k.split('_').map(Number)) bset.add(q);
   const b = [...bset];
@@ -410,9 +411,13 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
     info.param = 'lscm';
     if (!uv) {
       const ap = annulusParam(V, T);
-      if (!ap) return { params: null, info: { ...info, fail: 'param' } };
-      ({ uv, period } = ap);
-      info.param = 'periodic';
+      if (ap) { ({ uv, period } = ap); info.param = 'periodic'; }
+      else {
+        // a face with holes (or a ring the periodic map misses): its conformal map, holes and all
+        uv = lscm(V, T, 20000, true);
+        info.param = 'lscm-holes';
+        if (!uv) return { params: null, info: { ...info, fail: 'param' } };
+      }
     }
   }
   const lo = [Infinity, Infinity], hi = [-Infinity, -Infinity];
@@ -511,8 +516,8 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
   }
   const F = [...hold.keys()].filter((k) => !hold[k]);
   const err = new Float64Array(X.length);
-  const project = (S) => {
-    for (let k = 0; k < X.length; k++) {
+  const project = (S) => {                       // the mesh's own vertices only: added points keep their (u, v)
+    for (let k = 0; k < nOrig; k++) {
       const r = S.closest(X[k], [U[k], Vv[k]], 8);
       U[k] = r.u; Vv[k] = r.v;
       err[k] = norm(sub(r.S, X[k]));
@@ -574,7 +579,11 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
   for (let k = 0; k < nOrig; k++) { maxErr = Math.max(maxErr, err[k]); sq += err[k] * err[k]; }
   Object.assign(info, { spans: [distinct(tu).length - 1, wrap || distinct(tv).length - 1], rounds: best.rnd,
     holdout: hold.reduce((s, h) => s + h, 0), max_err: maxErr / scale, rms_err: Math.sqrt(sq / nOrig) / scale });
-  return { params: wrap ? uPeriodic(S) : S.toParams(), info };
+  // where each of the mesh's own vertices sits on the surface (the parameter correction's last projection), in the
+  // returned surface's (u, v): the round direction first when it wraps
+  const vertexUV = new Map();
+  for (let k = 0; k < nOrig; k++) if (idx[k] >= 0) vertexUV.set(idx[k], wrap ? [Vv[k], U[k]] : [U[k], Vv[k]]);
+  return { params: wrap ? uPeriodic(S) : S.toParams(), info, vertexUV };
 }
 
 /** A v-wrapped net as Python's params: transposed so u goes round, flagged u_periodic (unclamped form). */

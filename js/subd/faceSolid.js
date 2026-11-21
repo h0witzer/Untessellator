@@ -229,125 +229,231 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
       const r = S.closest([0, 1, 2].map((d) => (a[d] + b[d] + c[d]) / 3));
       vote += Math.sign(dot(n, S.normal(r.u, r.v)[1])) * len(n);
     }
-    return { g, gi, S, params: fit.params, periodic, sense: vote >= 0, info: fit.info };
+    const seed = new Map();
+    for (const [v, l] of local) { const uv = fit.vertexUV.get(l); if (uv) seed.set(v, uv); }
+    return { g, gi, S, params: fit.params, periodic, sense: vote >= 0, info: fit.info, seed, shift: 0 };
   });
   if (problems.length) return { error: problems.join('; '), problems };
 
-  // edge curves; a ring on a closing-round surface starts where the surface's closing line crosses it
+  // working chains: their points and end vertices (ids into points). A face whose surface closes round has its
+  // seam on the surface's closing line (u = the domain's start); each of its two loops crosses that line once, and
+  // the chain crossing it is split there (a ring opens there), so every edge's pcurve stays inside the domain.
   const points = [], pointOf = new Map();
   const vertexAt = (v) => { if (!pointOf.has(v)) { pointOf.set(v, points.length); points.push([...vertices[v]]); } return pointOf.get(v); };
-  for (const [c, ch] of chains.entries()) {
-    let pts = ch.verts.map((v) => vertices[v]);
+  const work = chains.map((ch) => ({
+    pts: ch.verts.map((v) => [...vertices[v]]), vid: [...ch.verts], ring: ch.ring, closed: false,
+    v0: ch.ring ? -1 : vertexAt(ch.verts[0]), v1: ch.ring ? -1 : vertexAt(ch.verts[ch.verts.length - 1]),
+  }));
+  const loopsOf = groups.map((g) => g.loopChains.map((l) => l.map((e) => ({ ...e }))));
+  const split = (c, j, w) => {                     // between stored points j and j + 1 (cyclically for a ring)
+    const ch = work[c], n = ch.pts.length, X = lerp(ch.pts[j], ch.pts[(j + 1) % n], w), q = points.length;
+    points.push(X);
     if (ch.ring) {
-      const per = ch.uses.map((u) => faces[u.g]).filter((f) => f.periodic);
-      if (per.length > 1) { problems.push(`a ring border between two faces that both close round (not supported yet)`); continue; }
-      if (per.length) {
-        // u of each ring point on that surface, unwrapped; the seam (u = domain start) crossing becomes the start
-        const { S } = per[0], [u0, u1] = S.dom, P = u1 - u0;
-        let prev = null;
-        const us = pts.map((x) => { const r = S.closest(x, prev); prev = [r.u, r.v]; return r.u; });
-        let cut = -1, w = 0;
-        for (let i = 0; i < pts.length && cut < 0; i++) {
-          const a = us[i], b = us[(i + 1) % pts.length];
-          if (Math.abs(b - a) > P / 2) {                // wraps between i and i + 1: where it meets u0 (or u1)
-            const bb = b + (b < a ? P : -P), target = (b < a ? u1 : u0);
-            w = Math.min(1, Math.max(0, (target - a) / ((bb - a) || 1)));
-            cut = i;
-          }
-        }
-        if (cut < 0) { problems.push(`a ring border does not go round its face's surface`); continue; }
-        const start = lerp(pts[cut], pts[(cut + 1) % pts.length], w);
-        pts = [start, ...pts.slice(cut + 1), ...pts.slice(0, cut + 1)];
-      }
-      const id = points.length;
-      points.push(pts[0]);
-      ch.v0 = ch.v1 = id;
-      ch.curve = fitCurve([...pts, pts[0]], { closed: true, tol: absTol });
-    } else {
-      ch.v0 = vertexAt(ch.verts[0]); ch.v1 = vertexAt(ch.verts[ch.verts.length - 1]);
-      ch.curve = fitCurve(pts, { tol: absTol });
+      ch.pts = [X, ...ch.pts.slice(j + 1), ...ch.pts.slice(0, j + 1), X];
+      ch.vid = [-1, ...ch.vid.slice(j + 1), ...ch.vid.slice(0, j + 1), -1];
+      ch.ring = false; ch.closed = true; ch.v0 = ch.v1 = q;
+      return q;
     }
+    const c2 = work.length;
+    work.push({ pts: [X, ...ch.pts.slice(j + 1)], vid: [-1, ...ch.vid.slice(j + 1)], ring: false, closed: false, v0: q, v1: ch.v1 });
+    ch.pts = [...ch.pts.slice(0, j + 1), X]; ch.vid = [...ch.vid.slice(0, j + 1), -1]; ch.v1 = q;
+    for (const loops of loopsOf) for (const l of loops) for (let i = 0; i < l.length; i++) {
+      if (l[i].c !== c) continue;
+      l.splice(i, 1, ...(l[i].rev ? [{ c: c2, rev: true }, { c, rev: true }] : [{ c, rev: false }, { c: c2, rev: false }]));
+      i++;
+    }
+    return q;
+  };
+  const seedFor = (f, v) => {
+    const uv = v >= 0 ? f.seed.get(v) : null;
+    if (!uv) return null;
+    if (!f.periodic) return uv;
+    const [u0, u1] = f.S.dom, P = u1 - u0;
+    return [u0 + ((((uv[0] - f.shift - u0) % P) + P) % P), uv[1]];
+  };
+  const seamAt = new Map();                        // face -> the vertex where each of its loops crosses its seam
+  for (const f of faces) {
+    if (!f.periodic) continue;
+    placeSeam(f, loopsOf[f.gi]);
+    const { S } = f, [u0, u1] = S.dom, P = u1 - u0, crossings = [];
+    for (const l of loopsOf[f.gi]) {
+      // the loop's points in its direction, each with the stored chain segment it starts
+      const seq = [];
+      for (const e of l) {
+        const ch = work[e.c], n = ch.pts.length;
+        if (ch.ring) for (let k = 0; k < n; k++) { const i = e.rev ? (n - k) % n : k; seq.push({ x: ch.pts[i], v: ch.vid[i], c: e.c, j: e.rev ? (n - k - 1 + n) % n : k, rev: e.rev }); }
+        else for (let k = 0; k + 1 < n; k++) { const i = e.rev ? n - 1 - k : k; seq.push({ x: ch.pts[i], v: ch.vid[i], c: e.c, j: e.rev ? n - 2 - k : k, rev: e.rev }); }
+      }
+      let prev = null, last = null;
+      for (const s2 of seq) {
+        const r = S.closest(s2.x, seedFor(f, s2.v) ?? prev);
+        prev = [r.u, r.v];
+        let u = r.u;
+        if (last !== null) { while (u - last > P / 2) u -= P; while (last - u > P / 2) u += P; }
+        s2.u = last = u;
+      }
+      // the loop closes on itself having gone once round: its end is its start moved by +-P
+      const turn = Math.round((seq[seq.length - 1].u - seq[0].u) / P) || Math.sign(seq[seq.length - 1].u - seq[0].u);
+      const hits = [];
+      for (let k = 0; k < seq.length; k++) {
+        const a = seq[k].u, b = k + 1 < seq.length ? seq[k + 1].u : seq[0].u + turn * P;
+        const ka = Math.floor((a - u0) / P), kb = Math.floor((b - u0) / P);
+        if (ka !== kb) { const target = u0 + Math.max(ka, kb) * P; hits.push({ k, w: (target - a) / ((b - a) || 1) }); }
+      }
+      if (hits.length !== 1) { problems.push(`face ${f.g.label}: a border crosses its seam ${hits.length} times`); break; }
+      const { k } = hits[0], s2 = seq[k], s3 = seq[(k + 1) % seq.length];
+      const ua = s2.u, ub = k + 1 < seq.length ? s3.u : seq[0].u + turn * P;
+      const target = u0 + Math.max(Math.floor((ua - u0) / P), Math.floor((ub - u0) / P)) * P;
+      // where the segment's projection meets the seam (bisection; the mesh is not linear in u)
+      let lo3 = 0, hi3 = 1, seedUV = [((ua - u0) % P + P) % P + u0, null];
+      const r0 = S.closest(s2.x, seedFor(f, s2.v));
+      seedUV = [r0.u, r0.v];
+      for (let it = 0; it < 30; it++) {
+        const wm = (lo3 + hi3) / 2, r = S.closest(lerp(s2.x, s3.x, wm), seedUV);
+        let u = r.u;
+        const guess = ua + wm * (ub - ua);
+        while (u - guess > P / 2) u -= P;
+        while (guess - u > P / 2) u += P;
+        if ((u - target) * (ub - ua) < 0) lo3 = wm; else hi3 = wm;
+      }
+      const w = (lo3 + hi3) / 2, ww = Math.min(1 - 1e-6, Math.max(1e-6, s2.rev ? 1 - w : w));
+      crossings.push(split(s2.c, s2.j, ww));
+    }
+    seamAt.set(f.gi, crossings);
   }
   if (problems.length) return { error: problems.join('; '), problems };
+  function placeSeam(f, loops) {
+    // the seam may sit on any knot (rotating a uniform periodic net by whole spans moves it, the surface unchanged):
+    // the one each loop crosses once, its crossings furthest from the loops' corners (in points along the loop)
+    const { S } = f, [u0, u1] = S.dom, P = u1 - u0, rows = f.params.poles.length, wrap = rows - 3, h = P / wrap;
+    const seqs = loops.map((l) => {
+      const us = [], ends = [];
+      let prev = null, last = null;
+      for (const e of l) {
+        const ch = work[e.c], n = ch.pts.length, idx = ch.ring ? [...Array(n).keys()] : [...Array(n - 1).keys()];
+        ends.push(us.length);
+        for (const k of idx) {
+          const i = e.rev ? (ch.ring ? (n - k) % n : n - 1 - k) : k, x = ch.pts[i], r = S.closest(x, seedFor(f, ch.vid[i]) ?? prev);
+          prev = [r.u, r.v];
+          let u = r.u;
+          if (last !== null) { while (u - last > P / 2) u -= P; while (last - u > P / 2) u += P; }
+          us.push(last = u);
+        }
+      }
+      return { us, ends, turn: Math.round((us[us.length - 1] - us[0]) / P) || Math.sign(us[us.length - 1] - us[0]) };
+    });
+    let best = null;
+    for (let j = 0; j < wrap; j++) {
+      const us0 = u0 + j * h;
+      let bad = 0, room = Infinity;
+      for (const { us, ends, turn } of seqs) {
+        const hits = [];
+        for (let k = 0; k < us.length; k++) {
+          const a = us[k], b = k + 1 < us.length ? us[k + 1] : us[0] + turn * P;
+          if (Math.floor((a - us0) / P) !== Math.floor((b - us0) / P)) hits.push(k);
+        }
+        bad += Math.abs(hits.length - 1);
+        if (hits.length) room = Math.min(room, ...ends.map((e) => Math.min(Math.abs(hits[0] - e), us.length - Math.abs(hits[0] - e))));
+      }
+      if (!best || bad < best.bad || (bad === best.bad && room > best.room)) best = { j, bad, room };
+    }
+    if (!best.j) return;
+    const P2 = f.params.poles.slice(0, wrap), rot = P2.slice(best.j).concat(P2.slice(0, best.j));
+    f.params = { ...f.params, poles: rot.concat(rot.slice(0, 3)) };
+    f.S = Surface.fromParams(f.params);
+    f.shift = best.j * h;                          // a point at u on the old net is at u - shift on the new one
+  }
+  for (const ch of work) {
+    if (ch.ring) { const q = points.length; points.push(ch.pts[0]); ch.v0 = ch.v1 = q; ch.curve = fitCurve([...ch.pts, ch.pts[0]], { closed: true, tol: absTol }); }
+    else ch.curve = fitCurve(ch.pts, { closed: ch.closed, tol: absTol });
+  }
+  const usesOf = work.map(() => []);
+  loopsOf.forEach((loops, gi) => loops.forEach((l) => l.forEach((e) => usesOf[e.c].push({ g: gi, rev: e.rev }))));
 
   // pcurves: the edge curve's points projected onto each of its faces' surfaces, fitted on the edge's knots
   let edgeTol = 0;
-  const pcurveOn = (face, curve, ring) => {
+  const pcurveOn = (face, curve, ch) => {
     const { S, periodic } = face, [u0, u1] = S.dom, P = u1 - u0;
     const spans = new Set(curve.knots).size - 1, m = Math.max(24, 8 * spans);
     const ts = Array.from({ length: m + 1 }, (_, j) => j / m), uv = [];
-    let prev = null;
+    // the chain's points' chord-length parameters (as the curve was fitted), to find each sample's nearest vertex
+    const pts = ch.ring ? [...ch.pts, ch.pts[0]] : ch.pts, vid = ch.ring ? [...ch.vid, ch.vid[0]] : ch.vid, d = [0];
+    for (let i = 1; i < pts.length; i++) d.push(d[i - 1] + len(sub(pts[i], pts[i - 1])));
+    const tv = d.map((x) => x / (d[d.length - 1] || 1));
+    let prev = null, near = 0;
     for (const t of ts) {
-      const x = curveAt(curve, t)[0], r = S.closest(x, prev);
+      while (near + 1 < tv.length && Math.abs(tv[near + 1] - t) <= Math.abs(tv[near] - t)) near++;
+      let sd = null;
+      for (let o = 0; o < vid.length && !sd; o++) sd = seedFor(face, vid[near - o] ?? -1) ?? seedFor(face, vid[near + o] ?? -1);
+      const x = curveAt(curve, t)[0], r = S.closest(x, prev ?? sd);
       let u = r.u;
       if (periodic && uv.length) { while (u - uv[uv.length - 1][0] > P / 2) u -= P; while (uv[uv.length - 1][0] - u > P / 2) u += P; }
       uv.push([u, r.v]);
       prev = [r.u, r.v];
     }
     if (periodic) {
-      // a ring goes once round: from the seam to the seam; anything else must stay inside the domain
-      const span = uv[m][0] - uv[0][0];
-      if (ring) { const shift = (span > 0 ? u0 : u1) - uv[0][0]; uv.forEach((q) => { q[0] += shift; }); }
-      else {
-        const lo2 = Math.min(...uv.map((q) => q[0])), hi2 = Math.max(...uv.map((q) => q[0]));
-        const k = Math.floor((lo2 - u0) / P);
-        if (hi2 - k * P > u1 + 1e-9 * P) return { error: 'an edge crosses the seam of a face that closes round' };
-        uv.forEach((q) => { q[0] -= k * P; });
-      }
+      // inside the domain: an edge ending on the seam ends at u0 or u1, whichever side it comes from
+      // (placed by its middle: an end on the seam may project to either side of it, and is snapped onto it)
+      const lo2 = Math.min(...uv.map((q) => q[0])), hi2 = Math.max(...uv.map((q) => q[0]));
+      const k = Math.floor(((lo2 + hi2) / 2 - u0) / P);
+      if (hi2 - k * P > u1 + 1e-3 * P || lo2 - k * P < u0 - 1e-3 * P) return { error: 'an edge still crosses the seam of a face that closes round' };
+      uv.forEach((q) => {
+        q[0] -= k * P;
+        if (Math.abs(q[0] - u0) < 1e-3 * P) q[0] = u0;
+        if (Math.abs(q[0] - u1) < 1e-3 * P) q[0] = u1;
+        q[0] = Math.min(u1, Math.max(u0, q[0]));
+      });
     }
     const pc = fitCurve(uv, { ts, spans, maxSpans: spans });
     pc.knots = curve.knots;
     for (const t of ts) edgeTol = Math.max(edgeTol, len(sub(S.eval(...curveAt(pc, t)[0]).S, curveAt(curve, t)[0])));
     return { pc, dir: Math.sign(uv[m][0] - uv[0][0]) };
   };
-  const edges = chains.map((ch) => ({ curve: ch.curve, v0: ch.v0, v1: ch.v1, ring: ch.ring, pcurves: [] }));
-  for (const [c, ch] of chains.entries()) {
-    for (const use of ch.uses) {
-      const r = pcurveOn(faces[use.g], ch.curve, ch.ring);
+  const edges = work.map((ch) => ({ curve: ch.curve, v0: ch.v0, v1: ch.v1, pcurves: [] }));
+  work.forEach((ch, c) => {
+    for (const use of usesOf[c]) {
+      const r = pcurveOn(faces[use.g], ch.curve, ch);
       if (r.error) { problems.push(`face ${faces[use.g].g.label}: ${r.error}`); continue; }
       edges[c].pcurves.push({ face: use.g, pc: r.pc, rev: use.rev, dir: r.dir });
     }
-  }
+  });
   if (problems.length) return { error: problems.join('; '), problems };
 
-  // each face's bounds; a closing-round face: its two rings joined by a seam edge along the closing line
+  // each face's bounds; a closing-round face: one loop, its two borders joined by a seam edge on the closing line
   const out = faces.map((f) => ({ params: f.params, sense: f.sense, bounds: [], label: f.g.label, info: f.info }));
+  const pcOf = (e, gi) => edges[e.c].pcurves.find((x) => x.face === gi && x.rev === e.rev).pc;
+  const uvAt = (e, gi, t) => curveAt(pcOf(e, gi), e.rev ? 1 - t : t)[0];
   for (const f of faces) {
-    const loops = f.g.loopChains;
+    const loops = loopsOf[f.gi];
     if (!f.periodic) {
       const areas = loops.map((entries) => {
         let a = 0;
-        for (const e of entries) {
-          const pc = edges[e.c].pcurves.find((x) => x.face === f.gi && x.rev === e.rev).pc;
-          const n = 16;
-          for (let j = 0; j < n; j++) {
-            const [p, q] = [j / n, (j + 1) / n].map((t) => curveAt(pc, e.rev ? 1 - t : t)[0]);
-            a += p[0] * q[1] - p[1] * q[0];
-          }
-        }
+        for (const e of entries) for (let j = 0; j < 16; j++) { const p = uvAt(e, f.gi, j / 16), q = uvAt(e, f.gi, (j + 1) / 16); a += p[0] * q[1] - p[1] * q[0]; }
         return Math.abs(a);
       });
       const outer = areas.indexOf(Math.max(...areas));
       loops.forEach((entries, li) => out[f.gi].bounds.push({ outer: li === outer, edges: entries.map((e) => ({ e: e.c, forward: !e.rev })) }));
       continue;
     }
-    if (loops.length !== 2 || loops.some((l) => l.length !== 1 || !edges[l[0].c].ring)) {
-      problems.push(`face ${f.g.label}: closes round but its borders are not two plain rings (not supported yet)`);
-      continue;
-    }
-    // ring A: the one whose u rises in the loop's direction (it ends at the far side of the seam)
-    const uses = loops.map((l) => { const e = l[0]; const p = edges[e.c].pcurves.find((x) => x.face === f.gi && x.rev === e.rev); return { e, dir: p.dir * (e.rev ? -1 : 1) }; });
-    const [A, B] = uses[0].dir > 0 ? uses : [uses[1], uses[0]];
+    if (loops.length !== 2) { problems.push(`face ${f.g.label}: closes round with ${loops.length} borders`); continue; }
+    // each loop from its seam vertex; A: the one whose u rises along it (it ends on the far side of the seam)
+    const q = seamAt.get(f.gi);
+    const fromSeam = loops.map((l, li) => {
+      const i = l.findIndex((e) => (e.rev ? edges[e.c].v1 : edges[e.c].v0) === q[li]);
+      return l.slice(i).concat(l.slice(0, i));
+    });
+    const rise = fromSeam.map((l) => uvAt(l[l.length - 1], f.gi, 1)[0] - uvAt(l[0], f.gi, 0)[0]);
+    const [A, B, qa, qb] = rise[0] > 0 ? [fromSeam[0], fromSeam[1], q[0], q[1]] : [fromSeam[1], fromSeam[0], q[1], q[0]];
     const { S } = f, [u0, u1, v0, v1] = S.dom;
-    const va = points[edges[A.e.c].v0], vb = points[edges[B.e.c].v0];
+    const va = points[qa], vb = points[qb];
     const wa = S.closest(va, [u0, (v0 + v1) / 2]).v, wb = S.closest(vb, [u0, (v0 + v1) / 2]).v;
     const m = 24, ts = Array.from({ length: m + 1 }, (_, j) => j / m);
     const samples = ts.map((t, j) => (j === 0 ? va : j === m ? vb : S.eval(u0, wa + t * (wb - wa)).S));
     const curve = fitCurve(samples, { ts, tol: absTol });
     const line = (u) => ({ p: 1, knots: [0, 0, 1, 1], poles: [[u, wa], [u, wb]] });
     const seam = edges.length;
-    edges.push({ curve, v0: edges[A.e.c].v0, v1: edges[B.e.c].v0, ring: false, seam: { face: f.gi, pcurves: [line(u1), line(u0)] } });
-    out[f.gi].bounds.push({ outer: true, edges: [{ e: A.e.c, forward: !A.e.rev }, { e: seam, forward: true }, { e: B.e.c, forward: !B.e.rev }, { e: seam, forward: false }] });
+    edges.push({ curve, v0: qa, v1: qb, seam: { face: f.gi, pcurves: [line(u1), line(u0)] } });
+    out[f.gi].bounds.push({ outer: true, edges: [...A.map((e) => ({ e: e.c, forward: !e.rev })), { e: seam, forward: true }, ...B.map((e) => ({ e: e.c, forward: !e.rev })), { e: seam, forward: false }] });
   }
   if (problems.length) return { error: problems.join('; '), problems };
   const report = {

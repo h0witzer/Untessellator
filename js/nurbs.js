@@ -22,44 +22,54 @@ export function spanOf(t, p, x) {
   return s;
 }
 
+/** Scratch tables per degree, so a basis evaluation allocates only its result (it runs millions of times a fit). */
+const scratch = new Map();
+function buffers(p) {
+  let b = scratch.get(p);
+  if (!b) {
+    b = { ndu: new Float64Array((p + 1) * (p + 1)), left: new Float64Array(p + 1), right: new Float64Array(p + 1), a: new Float64Array(2 * (p + 1)) };
+    scratch.set(p, b);
+  }
+  return b;
+}
+
 /** The p + 1 nonzero basis functions at x and their derivatives up to nder (NURBS Book A2.3). */
 export function nzBasis(t, p, x, nder = 0) {
   const n = t.length - p - 1;
   if (x < t[p]) x = t[p];
   if (x > t[n]) x = t[n];
-  const s = spanOf(t, p, x);
-  const ndu = Array.from({ length: p + 1 }, () => new Float64Array(p + 1));
-  const left = new Float64Array(p + 1), right = new Float64Array(p + 1);
-  ndu[0][0] = 1;
+  const s = spanOf(t, p, x), P1 = p + 1;
+  const { ndu, left, right, a } = buffers(p);
+  ndu[0] = 1;
   for (let j = 1; j <= p; j++) {
     left[j] = x - t[s + 1 - j];
     right[j] = t[s + j] - x;
     let saved = 0;
     for (let r = 0; r < j; r++) {
-      ndu[j][r] = right[r + 1] + left[j - r];
-      const tmp = ndu[r][j - 1] / ndu[j][r];
-      ndu[r][j] = saved + right[r + 1] * tmp;
+      ndu[j * P1 + r] = right[r + 1] + left[j - r];
+      const tmp = ndu[r * P1 + j - 1] / ndu[j * P1 + r];
+      ndu[r * P1 + j] = saved + right[r + 1] * tmp;
       saved = left[j - r] * tmp;
     }
-    ndu[j][j] = saved;
+    ndu[j * P1 + j] = saved;
   }
-  const ders = Array.from({ length: nder + 1 }, () => new Float64Array(p + 1));
-  for (let j = 0; j <= p; j++) ders[0][j] = ndu[j][p];
-  const a = [new Float64Array(p + 1), new Float64Array(p + 1)];
+  const ders = [];
+  for (let k = 0; k <= nder; k++) ders.push(new Float64Array(P1));
+  for (let j = 0; j <= p; j++) ders[0][j] = ndu[j * P1 + p];
   for (let r = 0; r <= p; r++) {
-    let s1 = 0, s2 = 1;
-    a[0].fill(0); a[1].fill(0);
-    a[0][0] = 1;
+    let s1 = 0, s2 = P1;
+    a.fill(0);
+    a[0] = 1;
     for (let k = 1; k <= nder; k++) {
       let d = 0;
       const rk = r - k, pk = p - k;
-      if (r >= k) { a[s2][0] = a[s1][0] / ndu[pk + 1][rk]; d = a[s2][0] * ndu[rk][pk]; }
+      if (r >= k) { a[s2] = a[s1] / ndu[(pk + 1) * P1 + rk]; d = a[s2] * ndu[rk * P1 + pk]; }
       const j1 = rk >= -1 ? 1 : -rk;
       const j2 = r - 1 <= pk ? k - 1 : p - r;
-      for (let j = j1; j <= j2; j++) { a[s2][j] = (a[s1][j] - a[s1][j - 1]) / ndu[pk + 1][rk + j]; d += a[s2][j] * ndu[rk + j][pk]; }
-      if (r <= pk) { a[s2][k] = -a[s1][k - 1] / ndu[pk + 1][r]; d += a[s2][k] * ndu[r][pk]; }
+      for (let j = j1; j <= j2; j++) { a[s2 + j] = (a[s1 + j] - a[s1 + j - 1]) / ndu[(pk + 1) * P1 + rk + j]; d += a[s2 + j] * ndu[(rk + j) * P1 + pk]; }
+      if (r <= pk) { a[s2 + k] = -a[s1 + k - 1] / ndu[(pk + 1) * P1 + r]; d += a[s2 + k] * ndu[r * P1 + pk]; }
       ders[k][r] = d;
-      [s1, s2] = [s2, s1];
+      const tmp = s1; s1 = s2; s2 = tmp;
     }
   }
   let f = p;
