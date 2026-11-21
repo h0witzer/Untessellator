@@ -31,13 +31,14 @@ export function cageTopology(nv, faces) {
   return { edges, valence };
 }
 
-/** One Catmull-Clark step. V: Float64Array (3 per vertex); faces: Int32Array (4 per face); uv: 8 per face. */
-function step(V, faces, uv) {
-  const nv = V.length / 3, nf = faces.length / 4;
-  const edgeIndex = new Map();
-  const edgeEnds = [];
-  const edgeFaces = [];
-  const faceEdges = new Int32Array(nf * 4);
+/**
+ * One Catmull-Clark step as stencils: rows[i] = [[old vertex, weight], ...] for new vertex i (vertex points
+ * 0..nv-1, then edge points, then face points), the new faces (Int32Array, 4 per face; children of face f are
+ * 4f..4f+3, child k at old corner k) and their uv in the root face (8 per face).
+ */
+export function stepStencils(nv, faces, uv) {
+  const nf = faces.length / 4;
+  const edgeIndex = new Map(), edgeEnds = [], edgeFaces = [], faceEdges = new Int32Array(nf * 4);
   for (let f = 0; f < nf; f++) {
     for (let k = 0; k < 4; k++) {
       const a = faces[f * 4 + k], b = faces[f * 4 + ((k + 1) & 3)];
@@ -52,42 +53,31 @@ function step(V, faces, uv) {
       faceEdges[f * 4 + k] = e;
     }
   }
-  const ne = edgeEnds.length / 2;
-  const out = new Float64Array((nv + ne + nf) * 3);
-  const fp = nv + ne;                                         // face points after vertices and edges
-  for (let f = 0; f < nf; f++) {
-    for (let c = 0; c < 3; c++) {
-      let s = 0;
-      for (let k = 0; k < 4; k++) s += V[faces[f * 4 + k] * 3 + c];
-      out[(fp + f) * 3 + c] = s / 4;
-    }
+  const ne = edgeEnds.length / 2, fp = nv + ne;
+  const rows = new Array(nv + ne + nf);
+  const corners = (f) => [0, 1, 2, 3].map((k) => faces[f * 4 + k]);
+  for (let f = 0; f < nf; f++) rows[fp + f] = corners(f).map((v) => [v, 1 / 4]);
+  for (let e = 0; e < ne; e++) {                               // (a + b + face point + face point) / 4
+    const a = edgeEnds[e * 2], b = edgeEnds[e * 2 + 1], w = new Map([[a, 1 / 4], [b, 1 / 4]]);
+    for (const f of [edgeFaces[e * 2], edgeFaces[e * 2 + 1]]) for (const v of corners(f)) w.set(v, (w.get(v) ?? 0) + 1 / 16);
+    rows[nv + e] = [...w];
   }
-  for (let e = 0; e < ne; e++) {
-    const a = edgeEnds[e * 2], b = edgeEnds[e * 2 + 1], f0 = edgeFaces[e * 2], f1 = edgeFaces[e * 2 + 1];
-    for (let c = 0; c < 3; c++) {
-      out[(nv + e) * 3 + c] = (V[a * 3 + c] + V[b * 3 + c] + out[(fp + f0) * 3 + c] + out[(fp + f1) * 3 + c]) / 4;
-    }
-  }
-  // vertex points: (Q + 2R + (n - 3) S) / n
+  // vertex points: (Q + 2R + (n - 3) S) / n, Q the mean face point, R the mean edge midpoint
   const n = new Int32Array(nv);
-  const Q = new Float64Array(nv * 3), R = new Float64Array(nv * 3);
+  for (let i = 0; i < nf * 4; i++) n[faces[i]]++;
+  const acc = Array.from({ length: nv }, (_, v) => new Map([[v, (n[v] - 3) / n[v]]]));
   for (let f = 0; f < nf; f++) {
     for (let k = 0; k < 4; k++) {
       const v = faces[f * 4 + k], next = faces[f * 4 + ((k + 1) & 3)], prev = faces[f * 4 + ((k + 3) & 3)];
-      n[v]++;
-      for (let c = 0; c < 3; c++) {
-        Q[v * 3 + c] += out[(fp + f) * 3 + c];
-        // each incident edge is seen from both of its faces: half a midpoint from each
-        R[v * 3 + c] += (V[v * 3 + c] + V[next * 3 + c]) / 4 + (V[v * 3 + c] + V[prev * 3 + c]) / 4;
-      }
+      const w = acc[v], nn = n[v] * n[v];
+      for (const c of corners(f)) w.set(c, (w.get(c) ?? 0) + 1 / (4 * nn));
+      // each incident edge is seen from both of its faces: half a midpoint from each
+      w.set(v, w.get(v) + 2 * (1 / 4 + 1 / 4) / nn);
+      w.set(next, (w.get(next) ?? 0) + 2 / (4 * nn));
+      w.set(prev, (w.get(prev) ?? 0) + 2 / (4 * nn));
     }
   }
-  for (let v = 0; v < nv; v++) {
-    for (let c = 0; c < 3; c++) {
-      const q = Q[v * 3 + c] / n[v], r = R[v * 3 + c] / n[v];
-      out[v * 3 + c] = (q + 2 * r + (n[v] - 3) * V[v * 3 + c]) / n[v];
-    }
-  }
+  for (let v = 0; v < nv; v++) rows[v] = [...acc[v]];
   const nfaces = new Int32Array(nf * 16);
   const nuv = new Float64Array(nf * 32);
   for (let f = 0; f < nf; f++) {
@@ -107,6 +97,18 @@ function step(V, faces, uv) {
       }
     }
   }
+  return { rows, faces: nfaces, uv: nuv };
+}
+
+/** One Catmull-Clark step. V: Float64Array (3 per vertex); faces: Int32Array (4 per face); uv: 8 per face. */
+function step(V, faces, uv) {
+  const { rows, faces: nfaces, uv: nuv } = stepStencils(V.length / 3, faces, uv);
+  const out = new Float64Array(rows.length * 3);
+  rows.forEach((row, i) => {
+    let x = 0, y = 0, z = 0;
+    for (const [j, w] of row) { x += w * V[j * 3]; y += w * V[j * 3 + 1]; z += w * V[j * 3 + 2]; }
+    out[i * 3] = x; out[i * 3 + 1] = y; out[i * 3 + 2] = z;
+  });
   return { V: out, faces: nfaces, uv: nuv };
 }
 

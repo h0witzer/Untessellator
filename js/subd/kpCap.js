@@ -270,21 +270,24 @@ export function capOperator(n, variant = {}) {
 }
 
 /** The n patches (each 49 coefficients, row-major P[i][j], per coordinate c) from the data, by the operator. */
-export function applyCap(op, data /* Float64Array ndata x 3 */) {
+export function applyCap(op, data /* Float64Array ndata x dim */, dim = 3) {
   const { K, nvar, ndata, src, n } = op;
-  const y = new Float64Array(nvar * 3);
+  const y = new Float64Array(nvar * dim);
   for (let v = 0; v < nvar; v++) {
-    let x = 0, yy = 0, z = 0;
-    const o = v * ndata;
-    for (let d = 0; d < ndata; d++) { const k = K[o + d]; x += k * data[d * 3]; yy += k * data[d * 3 + 1]; z += k * data[d * 3 + 2]; }
-    y[v * 3] = x; y[v * 3 + 1] = yy; y[v * 3 + 2] = z;
+    const o = v * ndata, yo = v * dim;
+    for (let d = 0; d < ndata; d++) {
+      const k = K[o + d];
+      if (k === 0) continue;
+      const dd = d * dim;
+      for (let c = 0; c < dim; c++) y[yo + c] += k * data[dd + c];
+    }
   }
   const patches = [];
   for (let k = 0; k < n; k++) {
-    const P = new Float64Array(49 * 3);
+    const P = new Float64Array(49 * dim);
     for (let i = 0; i <= DEG; i++) for (let j = 0; j <= DEG; j++) {
-      const s = src(k, i, j), from = s.variable !== undefined ? y.subarray(s.variable * 3, s.variable * 3 + 3) : data.subarray(s.data * 3, s.data * 3 + 3);
-      P.set(from, (i * 7 + j) * 3);
+      const s = src(k, i, j), from = s.variable !== undefined ? y.subarray(s.variable * dim, (s.variable + 1) * dim) : data.subarray(s.data * dim, (s.data + 1) * dim);
+      P.set(from, (i * 7 + j) * dim);
     }
     patches.push(P);
   }
