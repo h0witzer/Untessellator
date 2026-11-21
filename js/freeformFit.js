@@ -676,7 +676,23 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
     }
   };
   let best = null, stale = 0, S = null;
+  // the parameters corrected on one net carry to the next, except from a net that folds over part of the face (a
+  // coarse net cannot follow it, and parameters corrected onto the fold would carry it into every finer net): then
+  // the next starts again from the map's own. Folded: the surface's normal at a point's parameters against the
+  // mesh's there (area weighted), by more than one triangle's worth of the face's area facing the other way.
+  const U0 = Float64Array.from(U), V0 = Float64Array.from(Vv);
+  const { vn, va, trusted, area: meshArea } = meshNormals(V, T);
+  const folds = (S2) => {
+    let pos = 0, neg = 0;
+    for (let k = 0; k < X.length; k++) {
+      if (!trusted[idx[k]]) continue;
+      const d = S2.eval(U[k], Vv[k], 1), s1 = dot(cross(d.Su, d.Sv), vn[idx[k]]);
+      if (s1 > 0) pos += va[idx[k]]; else neg += va[idx[k]];
+    }
+    return Math.min(pos, neg) > meshArea / T.length;
+  };
   for (let rnd = 0; rnd <= FIT.REFINE_ROUNDS; rnd++) {
+    if (rnd > 0 && S && folds(S)) { U.set(U0); Vv.set(V0); }
     for (let it = 0; it < FIT.CORRECT_ITERS; it++) {
       const s2 = solveNet(tu, tv, F.map((k) => U[k]), F.map((k) => Vv[k]), F.map((k) => X[k]), lamAbs, wrap);
       if (!s2) break;
@@ -766,6 +782,24 @@ function exactPlane(V, uv, lo, hi, tol) {
   return { params: { poles, tu: clamped(lo[0], hi[0], 1), tv: clamped(lo[1], hi[1], 1), pu: P_, pv: P_, weights: null }, maxErr, rmsErr: Math.sqrt(sq / V.length) };
 }
 
+/**
+ * Each vertex's normal (its triangles' area-weighted), its share of the area, and whether it can be trusted: not
+ * where the mesh folds over itself (one of its triangles facing more than 90 degrees from that normal, as flipped
+ * slivers do), which leaves no way the surface ought to face there. area: the triangles' total.
+ */
+export function meshNormals(V, T) {
+  const vn = V.map(() => [0, 0, 0]), va = new Float64Array(V.length), trusted = new Uint8Array(V.length).fill(1);
+  let area = 0;
+  const tn = T.map((t) => cross(sub(V[t[1]], V[t[0]]), sub(V[t[2]], V[t[0]])));
+  T.forEach((t, i) => {
+    const A = norm(tn[i]) / 2;
+    area += A;
+    for (const q of t) { for (let k = 0; k < 3; k++) vn[q][k] += tn[i][k]; va[q] += A / 3; }
+  });
+  T.forEach((t, i) => { for (const q of t) if (dot(tn[i], vn[q]) < 0) trusted[q] = 0; });
+  return { vn, va, trusted, area };
+}
+
 /** A v-wrapped net as Python's params: transposed so u goes round, flagged u_periodic (unclamped form). */
 function uPeriodic(S) {
   const p = S.toParams();
@@ -831,7 +865,7 @@ function heapQueue() {
 }
 
 /** Two-proxy normal-cone clustering of the triangles `sel` into edge-connected pieces (Python's _split). */
-function splitNormals(V, T, sel) {
+export function splitNormals(V, T, sel) {
   const n = sel.length;
   const N = [], A = new Float64Array(n);
   for (let i = 0; i < n; i++) {

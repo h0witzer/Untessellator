@@ -1,11 +1,12 @@
 // One part of the face suite (test/faceSuite.mjs): an eval part (.pos/.fid/.typ) with its TRUE faces as the
-// painted groups, built as one trimmed B-spline face per face (js/subd/faceSolid.js, faceStep.js), the STEP read
+// painted groups, built as one trimmed B-spline face per face (js/subd/faceSolid.js faceSolidSplit: a face no single
+// surface carries is split, and counted), the STEP read
 // back with OCCT, every face graded by its surface's worst distance to the face's mesh vertices (exact samples of
 // the true surface), and the input plus OCCT's tessellation dumped for the two-way distance (scratch twosided.py).
 // node test/faceSuitePart.mjs <mesh dir> <stem> <out dir>   -> one JSON line on stdout
 import fs from 'node:fs';
 import path from 'node:path';
-import { faceSolid } from '../js/subd/faceSolid.js';
+import { faceSolidSplit } from '../js/subd/faceSolid.js';
 import { faceStep } from '../js/subd/faceStep.js';
 import { findBodies } from '../js/bodies.js';
 
@@ -30,7 +31,7 @@ const found = findBodies(idx, Vflat);
 out.bodies = found.bodies.length;
 
 const t0 = performance.now();
-const solids = [], faceRows = [];
+const solids = [], faceRows = [], splitFaces = [];
 let error = null;
 for (let b = 0; b < found.bodies.length && !error; b++) {
   const body = found.bodies[b];
@@ -46,18 +47,20 @@ for (let b = 0; b < found.bodies.length && !error; b++) {
     Lb.push(F[t]);
   }
   let r;
-  try { r = faceSolid(Vb, Tb, Lb, { scale: diag }); } catch (e) { error = `threw: ${String(e?.message ?? e).slice(0, 160)}`; break; }
+  try { r = faceSolidSplit(Vb, Tb, Lb, { scale: diag }); } catch (e) { error = `threw: ${String(e?.message ?? e).slice(0, 160)}`; break; }
+  for (const sp of r.splits ?? []) splitFaces.push(sp);
   if (r.error) { error = r.error.slice(0, 300); break; }
   solids.push({ faces: r.faces, edges: r.edges, points: r.points, name: `Body ${b + 1}`, tolerance: r.tolerance, report: r.report });
   // a face's stored type: the most common over its triangles
   const typeOf = new Map();
   tris.forEach((t) => { const m = typeOf.get(F[t]) ?? new Map(); m.set(TY[t], (m.get(TY[t]) ?? 0) + 1); typeOf.set(F[t], m); });
   for (const f of r.faces) {
-    const m = typeOf.get(f.label), type = TYPES[[...m].sort((x, y) => y[1] - x[1])[0][0]];
+    const m = typeOf.get(f.origin ?? f.label), type = TYPES[[...m].sort((x, y) => y[1] - x[1])[0][0]];
     faceRows.push({ type, err: f.info.max_err, param: f.info.param, spans: f.info.spans });
   }
 }
 out.ms = performance.now() - t0;
+if (splitFaces.length) out.splits = splitFaces;
 if (error) { out.error = error; console.log(JSON.stringify(out)); process.exit(0); }
 out.stepFaces = solids.reduce((s, x) => s + x.faces.length, 0);
 out.edgeTol = Math.max(...solids.map((s) => s.report.edgeTol));

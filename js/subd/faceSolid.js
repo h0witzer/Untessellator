@@ -14,7 +14,7 @@
  * In: vertices [[x, y, z]], triangles [[a, b, c]] wound outward, labels (one group per triangle).
  * Out: { faces, edges, points, report } for faceStep.js, or { error, problems }.
  */
-import { fitGroup, FIT } from '../freeformFit.js';
+import { fitGroup, splitNormals, meshNormals, FIT } from '../freeformFit.js';
 import { Surface, nzBasis } from '../nurbs.js';
 
 const sub = (a, b) => a.map((x, i) => x - b[i]);
@@ -40,7 +40,7 @@ export function faceTopology(vertices, triangles, labels) {
     }
     throw new Error('faceTopology: a vertex fan that does not close');
   };
-  const groups = [], problems = [];
+  const groups = [], problems = [], failed = [];
   for (const [label, tris] of byLabel) {
     const border = [];
     for (const f of tris) {
@@ -51,7 +51,7 @@ export function faceTopology(vertices, triangles, labels) {
         if (labels[g] !== label) border.push([a, b, f]);
       }
     }
-    if (!border.length) { problems.push(`face ${label} has no border (a whole closed body)`); continue; }
+    if (!border.length) { problems.push(`face ${label} has no border (a whole closed body)`); failed.push(label); continue; }
     const seen = new Set(), loops = [];
     for (const [a0, b0, f0] of border) {
       if (seen.has(a0 * nv + b0)) continue;
@@ -99,7 +99,7 @@ export function faceTopology(vertices, triangles, labels) {
     });
     g.loopChains.forEach((entries) => entries.forEach((e) => chains[e.c].uses.push({ g: gi, rev: e.rev })));
   });
-  return { groups, chains, problems };
+  return { groups, chains, problems, failed };
 }
 
 // ── B-spline curves: { p, knots (flat, clamped on [0, 1]), poles: [[...]] } ─────────────────────────────────────
@@ -240,12 +240,14 @@ export function fitCurve(pts, { ts = null, closed = false, tol = 0, spans = 1, m
 
 // ── the solid ────────────────────────────────────────────────────────────────────────────────────────────────
 
-export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT.TOL } = {}) {
+export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT.TOL, fits = null } = {}) {
   const t0 = performance.now();
   const topo = faceTopology(vertices, triangles, labels);
   if (topo.error) return topo;
-  const { groups, chains } = topo, problems = [...topo.problems];
-  if (problems.length) return { error: problems.join('; '), problems };
+  const { groups, chains } = topo, problems = [...topo.problems], failed = new Set(topo.failed);
+  const fail = (label, msg) => { problems.push(`face ${label}: ${msg}`); failed.add(label); };
+  const stop = () => ({ error: problems.join('; '), problems, failed: [...failed] });
+  if (problems.length) return stop();
   const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
   for (const p of vertices) for (let k = 0; k < 3; k++) { lo[k] = Math.min(lo[k], p[k]); hi[k] = Math.max(hi[k], p[k]); }
   const diag = scale ?? len(sub(hi, lo)), absTol = tol * diag;
@@ -255,22 +257,30 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
     const local = new Map(), Vg = [];
     const Tg = g.tris.map((f) => triangles[f].map((v) => { if (!local.has(v)) { local.set(v, Vg.length); Vg.push(vertices[v]); } return local.get(v); }));
     // the mesh's vertices are the data (a CAD mesh's are on the true surface; its triangles' insides are chords)
-    const fit = fitGroup(Vg, Tg, { scale: diag });
-    if (!fit.params) { problems.push(`face ${g.label}: no single surface fits it (${fit.info.fail})`); return null; }
+    // (fits: a cache by label across calls that differ only in other faces, faceSolidSplit's retries)
+    const fit = fits?.get(g.label) ?? fitGroup(Vg, Tg, { scale: diag });
+    fits?.set(g.label, fit);
+    if (!fit.params) { fail(g.label, `no single surface fits it (${fit.info.fail})`); return null; }
     const S = Surface.fromParams(fit.params), periodic = !!fit.params.u_periodic;
-    // which way the surface faces: its normal against the mesh's (outward) at a sample of triangles
-    let vote = 0;
-    const step = Math.max(1, Math.floor(Tg.length / 60));
-    for (let k = 0; k < Tg.length; k += step) {
-      const [a, b, c] = Tg[k].map((v) => Vg[v]), n = cross(sub(b, a), sub(c, a));
-      const r = S.closest([0, 1, 2].map((d) => (a[d] + b[d] + c[d]) / 3));
-      vote += Math.sign(dot(n, S.normal(r.u, r.v)[1])) * len(n);
+    // which way the surface faces: its normal at each vertex's place on it against the mesh's (outward, area
+    // weighted) there, by area. Where it faces the other way under more than one triangle's worth of the face, it
+    // folds under it (a fit across a cusp or crease the face has inside it): no surface for this face, which
+    // faceSolidSplit then cuts in two. (Not counted: vertices where the mesh itself folds over, meshNormals.)
+    const { vn, va, trusted, area } = meshNormals(Vg, Tg);
+    let vote = 0, against = 0, measured = 0;
+    for (const [l, uv] of fit.vertexUV) {
+      if (!trusted[l]) continue;
+      const s1 = Math.sign(dot(vn[l], S.normal(uv[0], uv[1])[1]));
+      vote += s1 * va[l]; measured += va[l];
+      if (s1 < 0) against += va[l];
     }
+    const folded = Math.min(against, measured - against);
+    if (folded > area / Tg.length) { fail(g.label, `its surface folds under it (${((100 * folded) / area).toFixed(1)} % of its area)`); return null; }
     const seed = new Map();
     for (const [v, l] of local) { const uv = fit.vertexUV.get(l); if (uv) seed.set(v, uv); }
     return { g, gi, S, params: fit.params, periodic, sense: vote >= 0, info: fit.info, seed, shift: 0 };
   });
-  if (problems.length) return { error: problems.join('; '), problems };
+  if (problems.length) return stop();
 
   // working chains: their points and end vertices (ids into points). A face whose surface closes round has its
   // seam on the surface's closing line (u = the domain's start); each of its two loops crosses that line once, and
@@ -333,15 +343,22 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
       const A = pts[i], AB = sub(pts[i + 1], A), L = len(AB);
       const sag = (L / 2) * Math.tan(Math.max(turn[i], turn[i + 1]) / 4) + absTol;
       const offChord = (y) => (L > 0 ? len(cross(sub(y, A), AB)) / L : len(sub(y, A)));
+      const ins = [];
       const refine = (ta, tb, depth) => {
         const x = curveAt(C, (ta + tb) / 2)[0], r = onBoth(x, fa, fb, sa, sb);
         if (!r || len(sub(x, r.y)) <= Math.max(absTol, r.unc) || offChord(r.y) > sag) return;
-        const y = r.y;
         if (depth < 2) refine(ta, (ta + tb) / 2, depth + 1);
-        outP.push(y); outV.push(-1);
+        ins.push(r.y);
         if (depth < 2) refine((ta + tb) / 2, tb, depth + 1);
       };
       refine(ts[i], ts[i + 1], 0);
+      // in order along the segment, strictly inside it (a point moved past its neighbour would fold the edge back
+      // on itself)
+      let last = 0;
+      for (const y of ins) {
+        const f = L > 0 ? dot(sub(y, A), AB) / (L * L) : 0;
+        if (f > last && f < 1) { outP.push(y); outV.push(-1); last = f; }
+      }
       outP.push(pts[i + 1]); outV.push(vid[i + 1]);
     }
     if (outP.length === pts.length) return;
@@ -410,8 +427,8 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
     seamAt.set(f.gi, at);
     loops.forEach((l, li) => {
       const tr = trace(f, l), { seq, turn } = tr, hits = crossings(tr, P, u0);
-      if (Math.abs(turn) > 1) { problems.push(`face ${f.g.label}: a border goes round its surface ${Math.abs(turn)} times`); return; }
-      if (hits.length !== Math.abs(turn)) { problems.push(`face ${f.g.label}: a border crosses its seam ${hits.length} times`); return; }
+      if (Math.abs(turn) > 1) { fail(f.g.label, `a border goes round its surface ${Math.abs(turn)} times`); return; }
+      if (hits.length !== Math.abs(turn)) { fail(f.g.label, `a border crosses its seam ${hits.length} times`); return; }
       if (!turn) return;                           // a hole in the wall
       const k = hits[0], s2 = seq[k], s3 = seq[(k + 1) % seq.length];
       const ua = s2.u, ub = k + 1 < seq.length ? s3.u : seq[0].u + turn * P;
@@ -438,7 +455,7 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
       at.set(li, split(s2.c, s2.j, curveAt(C, ta + w * (tb - ta))[0]));
     });
   }
-  if (problems.length) return { error: problems.join('; '), problems };
+  if (problems.length) return stop();
   function placeSeam(f, traces) {
     // the seam may sit on any knot (rotating a uniform periodic net by whole spans moves it, the surface unchanged):
     // the one each rim crosses once and no hole crosses, the rims' crossings furthest from their corners (in points
@@ -516,11 +533,11 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
   work.forEach((ch, c) => {
     for (const use of usesOf[c]) {
       const r = pcurveOn(faces[use.g], ch.curve, ch);
-      if (r.error) { problems.push(`face ${faces[use.g].g.label}: ${r.error}`); continue; }
+      if (r.error) { fail(faces[use.g].g.label, r.error); continue; }
       edges[c].pcurves.push({ face: use.g, pc: r.pc, rev: use.rev, dir: r.dir });
     }
   });
-  if (problems.length) return { error: problems.join('; '), problems };
+  if (problems.length) return stop();
 
   // each face's bounds; a closing-round face: one loop, its two borders joined by a seam edge on the closing line
   const out = faces.map((f) => ({ params: f.params, sense: f.sense, bounds: [], label: f.g.label, info: f.info }));
@@ -541,7 +558,7 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
     // its two rims, each from its seam vertex; A: the one whose u rises along it (it ends on the far side of the
     // seam); any other loop a hole in the wall
     const at = seamAt.get(f.gi), rims = [...at.keys()];
-    if (rims.length !== 2) { problems.push(`face ${f.g.label}: closes round with ${rims.length} rims`); continue; }
+    if (rims.length !== 2) { fail(f.g.label, `closes round with ${rims.length} rims`); continue; }
     const q = rims.map((li) => at.get(li));
     const fromSeam = rims.map((li, r) => {
       const l = loops[li], i = l.findIndex((e) => (e.rev ? edges[e.c].v1 : edges[e.c].v0) === q[r]);
@@ -549,9 +566,11 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
     });
     const rise = fromSeam.map((l) => uvAt(l[l.length - 1], f.gi, 1)[0] - uvAt(l[0], f.gi, 0)[0]);
     const [A, B, qa, qb] = rise[0] > 0 ? [fromSeam[0], fromSeam[1], q[0], q[1]] : [fromSeam[1], fromSeam[0], q[1], q[0]];
-    const { S } = f, [u0, u1, v0, v1] = S.dom;
+    const { S } = f, [u0, u1] = S.dom;
     const va = points[qa], vb = points[qb];
-    const wa = S.closest(va, [u0, (v0 + v1) / 2]).v, wb = S.closest(vb, [u0, (v0 + v1) / 2]).v;
+    // the seam's ends where the rims' own pcurves meet it (a fresh projection of the seam vertices can land on
+    // another part of the surface, and the wire would not close)
+    const wa = uvAt(A[0], f.gi, 0)[1], wb = uvAt(B[0], f.gi, 0)[1];
     const m = 24, ts = Array.from({ length: m + 1 }, (_, j) => j / m);
     const samples = ts.map((t, j) => (j === 0 ? va : j === m ? vb : S.eval(u0, wa + t * (wb - wa)).S));
     const curve = fitCurve(samples, { ts, tol: absTol });
@@ -561,10 +580,41 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
     out[f.gi].bounds.push({ outer: true, edges: [...A.map((e) => ({ e: e.c, forward: !e.rev })), { e: seam, forward: true }, ...B.map((e) => ({ e: e.c, forward: !e.rev })), { e: seam, forward: false }] });
     loops.forEach((l, li) => { if (!at.has(li)) out[f.gi].bounds.push({ outer: false, edges: l.map((e) => ({ e: e.c, forward: !e.rev })) }); });
   }
-  if (problems.length) return { error: problems.join('; '), problems };
+  if (problems.length) return stop();
   const report = {
     faces: out.length, edges: edges.length, maxFit: Math.max(...faces.map((f) => f.info.max_err)), edgeTol: edgeTol / diag,
     ms: performance.now() - t0,
   };
   return { faces: out, edges, points, tolerance: Math.max(edgeTol * 1.5, 1e-7 * diag), report };
+}
+
+/**
+ * faceSolid, splitting only the faces no single surface covers: a face whose map, fit or seam fails is cut in two
+ * where its normals turn most (freeformFit's splitNormals: normal-cone clustering) and the solid built again, the
+ * other faces' fits kept; up to `rounds` times. A painted face goes out as one STEP face wherever one surface can
+ * carry it, and as the fewest pieces this finds where not. Out as faceSolid's, each face with `origin` (its painted
+ * label) and `splits`: [{ origin, pieces }].
+ */
+export function faceSolidSplit(vertices, triangles, labels, { rounds = 4, ...opts } = {}) {
+  const lab = Array.from(labels), origin = new Map(), fits = new Map(), splits = new Map();
+  let next = Math.max(...lab) + 1, r = null;
+  for (let round = 0; ; round++) {
+    r = faceSolid(vertices, triangles, lab, { ...opts, fits });
+    if (!r.error || !r.failed?.length || round === rounds) break;
+    let cut = false;
+    for (const label of r.failed) {
+      const tris = [];
+      lab.forEach((l, t) => { if (l === label) tris.push(t); });
+      const pieces = tris.length > 1 ? splitNormals(vertices, triangles, tris) : [tris];
+      if (pieces.length < 2) continue;
+      const root = origin.get(label) ?? label;
+      for (const piece of pieces) { for (const t of piece) lab[t] = next; origin.set(next, root); next++; }
+      splits.set(root, (splits.get(root) ?? 1) - 1 + pieces.length);
+      cut = true;
+    }
+    if (!cut) break;
+  }
+  const out = { ...r, splits: [...splits].map(([o, pieces]) => ({ origin: o, pieces })) };
+  for (const f of r.faces ?? []) f.origin = origin.get(f.label) ?? f.label;
+  return out;
 }
