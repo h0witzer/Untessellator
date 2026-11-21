@@ -14,9 +14,19 @@ export function loadQuadriFlow() {
 
 /**
  * Remesh. vertices: [[x, y, z]...]; triangles: [[a, b, c]...] (0-based). faces: the quad count to aim for.
- * Returns { vertices, faces } (a pure quad cage) or { error }.
+ * Returns { vertices, faces } (a pure quad cage) or { error }. QuadriFlow starts its fields from a random seed and
+ * some starts fail on a mesh others handle (a trap, or a collapsed field): it tries seeds seed .. seed + tries - 1.
  */
-export async function quadRemesh(vertices, triangles, { faces = 300, seed = 0 } = {}) {
+export async function quadRemesh(vertices, triangles, { faces = 300, seed = 0, tries = 3 } = {}) {
+  let out = null;
+  for (let s = seed; s < seed + tries; s++) {
+    out = await remeshOnce(vertices, triangles, faces, s);
+    if (!out.error) return out;
+  }
+  return out;
+}
+
+async function remeshOnce(vertices, triangles, faces, seed) {
   const M = await loadQuadriFlow();
   // only the vertices the triangles use, renumbered (QuadriFlow's hierarchy has no place for loose points)
   const used = new Int32Array(vertices.length).fill(-1);
@@ -26,13 +36,23 @@ export async function quadRemesh(vertices, triangles, { faces = 300, seed = 0 } 
   const V = new Float64Array(M.HEAPF64.buffer, pV, nv * 3), T = new Int32Array(M.HEAP32.buffer, pT, triangles.length * 3);
   vertices.forEach((p, i) => { const j = used[i]; if (j >= 0) { V[j * 3] = p[0]; V[j * 3 + 1] = p[1]; V[j * 3 + 2] = p[2]; } });
   triangles.forEach((t, i) => { T[i * 3] = used[t[0]]; T[i * 3 + 1] = used[t[1]]; T[i * 3 + 2] = used[t[2]]; });
-  const status = M.ccall('qf_remesh', 'number', ['number', 'number', 'number', 'number', 'number', 'number', 'string'],
-    [pV, nv, pT, triangles.length, faces, seed, '/out.obj']);
+  let status;
+  try {
+    status = M.ccall('qf_remesh', 'number', ['number', 'number', 'number', 'number', 'number', 'number', 'string'],
+      [pV, nv, pT, triangles.length, faces, seed, '/out.obj']);
+  } catch (err) {
+    // a WebAssembly trap leaves the module's memory as it was mid-run: the next call gets a fresh instance
+    loading = null;
+    return { error: `QuadriFlow stopped on this mesh (${String(err?.message ?? err)})` };
+  }
   M._free(pV); M._free(pT);
   if (status !== 0) return { error: `QuadriFlow failed (status ${status})` };
   const cage = parseQuadCage(M.FS.readFile('/out.obj', { encoding: 'utf8' }));
   M.FS.unlink('/out.obj');
-  return cage.error ? cage : dissolveValence2(cage);
+  if (cage.error) return cage;
+  // QuadriFlow lands near the count asked for when its field follows the mesh; far below it, the field collapsed
+  if (cage.faces.length < faces / 4) return { error: `QuadriFlow made ${cage.faces.length} quads for the ${faces} asked: it could not follow this mesh` };
+  return dissolveValence2(cage);
 }
 
 /**

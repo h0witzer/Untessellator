@@ -69,18 +69,24 @@ function sampleIndex(poles, sizes, grid) {
     const l = hash.get(kk);
     if (l) l.push(i); else hash.set(kk, [i]);
   }
+  const nz = Math.floor((hi[2] - lo[2]) / cell) + 3;
   const nearest = (m) => {
     const cx = cellOf(m[0], 0), cy = cellOf(m[1], 1), cz = cellOf(m[2], 2);
     let best = -1, bd = Infinity;
-    for (let r = 0; r < 400; r++) {
-      for (let dx = -r; dx <= r; dx++) for (let dy = -r; dy <= r; dy++) for (let dz = -r; dz <= r; dz++) {
-        if (Math.max(Math.abs(dx), Math.abs(dy), Math.abs(dz)) !== r) continue;   // this shell only
-        const l = hash.get(key(cx + dx, cy + dy, cz + dz));
-        if (!l) continue;
-        for (const i of l) {
-          const d = (S[i * 3] - m[0]) ** 2 + (S[i * 3 + 1] - m[1]) ** 2 + (S[i * 3 + 2] - m[2]) ** 2;
-          if (d < bd) { bd = d; best = i; }
-        }
+    const look = (ix, iy, iz) => {
+      if (ix < 0 || iy < 0 || iz < 0 || ix >= nx || iy >= ny || iz >= nz) return;
+      const l = hash.get(key(ix, iy, iz));
+      if (l) for (const i of l) {
+        const d = (S[i * 3] - m[0]) ** 2 + (S[i * 3 + 1] - m[1]) ** 2 + (S[i * 3 + 2] - m[2]) ** 2;
+        if (d < bd) { bd = d; best = i; }
+      }
+    };
+    // shells of cells round the point's cell until nothing outside them can be closer; past the grid, all is seen
+    const reach = Math.max(cx, nx - 1 - cx, cy, ny - 1 - cy, cz, nz - 1 - cz);
+    for (let r = 0; r <= reach; r++) {
+      for (let dx = -r; dx <= r; dx++) for (let dy = -r; dy <= r; dy++) {
+        if (Math.abs(dx) === r || Math.abs(dy) === r) for (let dz = -r; dz <= r; dz++) look(cx + dx, cy + dy, cz + dz);
+        else { look(cx + dx, cy + dy, cz - r); look(cx + dx, cy + dy, cz + r); }
       }
       if (best >= 0 && bd <= (r * cell) ** 2) break;  // nothing outside the searched block is closer
     }
