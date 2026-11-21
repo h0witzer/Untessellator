@@ -7,7 +7,7 @@
  */
 
 /** Closest point on triangle abc to p (Ericson, Real-Time Collision Detection 5.1.5). */
-function closestOnTriangle(p, a, b, c) {
+export function closestOnTriangle(p, a, b, c) {
   const ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]], ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]], ap = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
   const dot = (x, y) => x[0] * y[0] + x[1] * y[1] + x[2] * y[2];
   const at = (s, t) => [a[0] + s * ab[0] + t * ac[0], a[1] + s * ab[1] + t * ac[1], a[2] + s * ab[2] + t * ac[2]];
@@ -28,7 +28,7 @@ function closestOnTriangle(p, a, b, c) {
 }
 
 /** Closest point on a triangle mesh: a uniform grid of its triangles, searched in shells of cells. */
-function projector(V, T, cell) {
+export function projector(V, T, cell) {
   const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
   for (const p of V) for (let c = 0; c < 3; c++) { lo[c] = Math.min(lo[c], p[c]); hi[c] = Math.max(hi[c], p[c]); }
   const n = [0, 1, 2].map((c) => Math.floor((hi[c] - lo[c]) / cell) + 1);

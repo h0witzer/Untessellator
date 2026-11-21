@@ -17,7 +17,7 @@ import { capOperator, applyCap, bernstein } from './kpCap.js';
 
 const K3 = [0, 0, 0, 0, 1, 1, 1, 1];
 const K6 = [0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1];
-const B2BB = [[1, 4, 1, 0], [0, 4, 2, 0], [0, 2, 4, 0], [0, 1, 4, 1]].map((r) => r.map((x) => x / 6));
+export const B2BB = [[1, 4, 1, 0], [0, 4, 2, 0], [0, 2, 4, 0], [0, 1, 4, 1]].map((r) => r.map((x) => x / 6));
 
 /** Inverse of the 7 x 7 Bernstein collocation matrix at t = 0, 1/6, ..., 1. */
 const BINV6 = (() => {
@@ -31,7 +31,7 @@ const BINV6 = (() => {
   return A.map((row) => row.slice(n));
 })();
 
-function topology(nv, F) {
+export function topology(nv, F) {
   const nextToPrev = Array.from({ length: nv }, () => new Map()), facesAt = Array.from({ length: nv }, () => []);
   const corner = new Map();                         // "c,a,b" -> fourth vertex of the face through c with neighbours a, b
   const sideOwner = new Map();                      // "a,b" (directed, as in a loop) -> [face, side]
@@ -118,7 +118,7 @@ function capsOf(pl, run) {
 }
 
 /** Vertex ids of a regular face's 4 x 4 control-point neighbourhood, G[i * 4 + j], i along u and j along v. */
-function regularGrid(q, T) {
+export function regularGrid(q, T) {
   const opp = (c, x) => { const r = T.ring(c); return r[(r.indexOf(x) + 2) % 4]; };
   const G = new Array(16);
   const [c0, c1, c2, c3] = q;
@@ -190,7 +190,7 @@ function sideJets(net, s, dim) {
  * The bi-6 cap of star point v: for each face round v, [face, poles (49 x dim, face frame)]. V[i] is vertex i as a
  * vector of length dim (positions, or columns of a basis for the linear map).
  */
-function capFaces(V, F, T, v, dim, variant = {}) {
+export function capFaces(V, F, T, v, dim, variant = {}) {
   const n = T.valence[v];
   const nSign = variant.nSign ?? 1, eSign = variant.eSign ?? 1;
   const op = capOperator(n, { flipSpoke: !!variant.flipSpoke });

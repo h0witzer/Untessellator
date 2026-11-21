@@ -96,11 +96,31 @@ function sampleIndex(poles, sizes, grid) {
   return { nearest, diag };
 }
 
+/** sampleIndex per group of faces: nearest(m, group) searches only that group's faces. */
+function groupedIndex(poles, sizes, grid, faceGroup) {
+  const lists = new Map();
+  faceGroup.forEach((g, f) => { if (!lists.has(g)) lists.set(g, []); lists.get(g).push(f); });
+  const sub = new Map();
+  let diag2 = 0;
+  for (const [g, fs] of lists) {
+    const idx = sampleIndex(fs.map((f) => poles[f]), fs.map((f) => sizes[f]), grid);
+    sub.set(g, { fs, idx });
+    diag2 = Math.max(diag2, idx.diag);
+  }
+  // the whole surface's diagonal, for the fit's relative error
+  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  for (const P of poles) for (let i = 0; i < P.length; i += 3) for (let c = 0; c < 3; c++) { lo[c] = Math.min(lo[c], P[i + c]); hi[c] = Math.max(hi[c], P[i + c]); }
+  return {
+    nearest: (m, g) => { const s = sub.get(g); const [f, u, v] = s.idx.nearest(m); return [s.fs[f], u, v]; },
+    diag: Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) || diag2,
+  };
+}
+
 /**
  * Closest points: foot[i] = { fi, u, v, d2 } for points[i]. Warm-started from foot[i] when it is set (last
  * round's); the nearest sample's face is tried as well when that ends on a face edge or there is none.
  */
-function footpoints(poles, sizes, points, foot, index) {
+function footpoints(poles, sizes, points, foot, index, weights = null, pointGroup = null) {
   let worst = 0, sum = 0, searched = 0;
   points.forEach((m, i) => {
     let best = null;
@@ -110,11 +130,11 @@ function footpoints(poles, sizes, points, foot, index) {
     }
     if (!best || best.edge) {
       searched++;
-      const [f, u, v] = index.nearest(m), r = project(sizes[f], poles[f], m, u, v);
+      const [f, u, v] = index.nearest(m, pointGroup ? pointGroup[i] : undefined), r = project(sizes[f], poles[f], m, u, v);
       if (!best || r.d2 < best.d2) best = { fi: f, ...r };
     }
     foot[i] = best;
-    worst = Math.max(worst, best.d2); sum += best.d2;
+    worst = Math.max(worst, best.d2); sum += (weights ? weights[i] : 1) * best.d2;
   });
   return { worst, sum, searched };
 }
@@ -129,39 +149,49 @@ export function surfaceDistances(faces, points, { grid = 7 } = {}) {
 }
 
 /**
- * Fit. points: [[x, y, z]...] on the mesh. Returns { vertices (fitted cage), faces (NURBS), loops (each
+ * Fit. points: [[x, y, z]...] on the mesh; weights (optional, one per point): the area each point stands for, so
+ * the fit minimizes the integral of squared distance over the mesh (unweighted: over its vertices). Returns { vertices (fitted cage), faces (NURBS), loops (each
  * NURBS face's boundary: [vertex, u, v] round its square), stats }.
  */
-export function fitCage(cage, points, { rounds = 5, grid = 7 } = {}) {
+export function fitCage(cage, points, options = {}) {
   const t0 = performance.now();
-  const N = cage.vertices.length;
-  const map = subdLinearMap(N, cage.faces);
+  return fitMap(subdLinearMap(cage.vertices.length, cage.faces), cage.vertices, cage.faces, points, options, t0);
+}
+
+/**
+ * The fit on a given linear map (subdLinearMap, or groupLinearMap for a cage in groups). pointGroup (optional, one
+ * per point, with map.faceGroup): each point's closest point is sought on its own group's faces only, so a point
+ * near a border never pulls the face across it.
+ */
+export function fitMap(map, vertices, cageFaces, points, { rounds = 5, grid = 7, weights = null, pointGroup = null } = {}, t0 = performance.now()) {
+  const N = vertices.length;
   const sizes = map.faces.map((f) => f.uCount);
   // the normal equations' pattern: each face's support, and each cage vertex's Laplacian stencil
   const adj = Array.from({ length: N }, () => new Set());
   const clique = (ids) => { for (const a of ids) for (const b of ids) if (a !== b) adj[a].add(b); };
   for (const f of map.faces) clique(f.ids);
   const neighbours = Array.from({ length: N }, () => new Set());
-  for (const q of cage.faces) for (let k = 0; k < 4; k++) { neighbours[q[k]].add(q[(k + 1) % 4]); neighbours[q[(k + 1) % 4]].add(q[k]); }
+  for (const q of cageFaces) for (let k = 0; k < 4; k++) { neighbours[q[k]].add(q[(k + 1) % 4]); neighbours[q[(k + 1) % 4]].add(q[k]); }
   neighbours.forEach((nb, j) => clique([j, ...nb]));
   const A = envelope(N, adj);
   const ms = { map: performance.now() - t0, samples: 0, foot: 0, assemble: 0, solve: 0 };
   let tick = performance.now();
   const lap = (k) => { const t = performance.now(); ms[k] += t - tick; tick = t; };
 
-  let X = cage.vertices.map((p) => [...p]);
-  const X0 = cage.vertices.map((p) => [...p]);
+  let X = vertices.map((p) => [...p]);
+  const X0 = vertices.map((p) => [...p]);
   const history = [];
   const foot = new Array(points.length);
+  const totalWeight = weights ? weights.reduce((s, w) => s + w, 0) : points.length;
   let poles = null;
   for (let round = 0; round <= rounds; round++) {
     tick = performance.now();
     poles = applyLinearMap(map, X);
-    const index = sampleIndex(poles, sizes, grid);
+    const index = pointGroup ? groupedIndex(poles, sizes, grid, map.faceGroup) : sampleIndex(poles, sizes, grid);
     lap('samples');
-    const { worst, sum, searched } = footpoints(poles, sizes, points, foot, index);
+    const { worst, sum, searched } = footpoints(poles, sizes, points, foot, index, weights, pointGroup);
     lap('foot');
-    history.push({ round, max: Math.sqrt(worst) / index.diag, rms: Math.sqrt(sum / points.length) / index.diag, searched });
+    history.push({ round, max: Math.sqrt(worst) / index.diag, rms: Math.sqrt(sum / totalWeight) / index.diag, searched });
     if (round === rounds) break;
     // normal equations for the cage, coordinate by coordinate (the rows are the same for x, y, z): per face,
     // G = sum over its points of b b^T (b: the pole basis at the footpoint) and R = sum b m^T, then W^T G W, W^T R
@@ -178,9 +208,9 @@ export function fitCage(cage, points, { rounds = 5, grid = 7 } = {}) {
       for (const i of list) {
         bern(n - 1, foot[i].u, bu); bern(n - 1, foot[i].v, bv);
         for (let a = 0; a < n; a++) for (let c = 0; c < n; c++) b[a * n + c] = bu[a] * bv[c];
-        const m = points[i];
+        const m = points[i], w = weights ? weights[i] : 1;
         for (let p = 0; p < np; p++) {
-          const bp = b[p];
+          const bp = w * b[p];
           if (!bp) continue;
           for (let q = 0; q <= p; q++) G[p * np + q] += bp * b[q];
           R[p * 3] += bp * m[0]; R[p * 3 + 1] += bp * m[1]; R[p * 3 + 2] += bp * m[2];

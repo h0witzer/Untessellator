@@ -18,7 +18,9 @@
 import { findBodies } from '../bodies.js';
 import { quadRemesh } from './retopo.js';
 import { isotropicRemesh } from './isotropic.js';
-import { fitCage } from './fitCage.js';
+import { fitCage, fitMap } from './fitCage.js';
+import { groupCage } from './groupCage.js';
+import { groupLinearMap } from './groupNurbs.js';
 import { patchStep } from './patchStep.js';
 import { patchPreview } from './preview.js';
 
@@ -34,18 +36,18 @@ function weld(positions) {
   return { V: Float64Array.from(V), idx };
 }
 
-export async function freeformSolid(positions, { bodies = null, names = null, part = 'Part', quads = null, onStatus = () => {} } = {}) {
+export async function freeformSolid(positions, { bodies = null, names = null, groups = null, part = 'Part', quads = null, onStatus = () => {} } = {}) {
   const t0 = performance.now();
   const { V, idx } = weld(positions);
   const found = findBodies(idx, V);
   const bodyOf = bodies ?? found.bodyOf;
-  const groups = new Map();
+  const byBody = new Map();
   for (let t = 0; t < bodyOf.length; t++) {
-    if (!groups.has(bodyOf[t])) groups.set(bodyOf[t], []);
-    groups.get(bodyOf[t]).push(t);
+    if (!byBody.has(bodyOf[t])) byBody.set(bodyOf[t], []);
+    byBody.get(bodyOf[t]).push(t);
   }
   const solids = [], report = [];
-  for (const [id, tris] of groups) {
+  for (const [id, tris] of byBody) {
     const name = names?.[id] ?? `Body ${solids.length + report.filter((r) => r.error).length + 1}`;
     const row = { name, triangles: tris.length };
     report.push(row);
@@ -60,6 +62,18 @@ export async function freeformSolid(positions, { bodies = null, names = null, pa
       faces.push(found.flip[t] ? [at(a), at(c), at(b)] : [at(a), at(b), at(c)]);
     }
     const target = quads ?? Math.max(100, Math.min(1000, Math.round(vertices.length / 4)));
+    const labels = groups ? tris.map((t) => groups[t]) : null;
+    if (labels && new Set(labels).size > 1) {
+      try {
+        const r = groupSolid(vertices, faces, labels, target, onStatus, name);
+        if (r.error) { row.error = r.error; continue; }
+        Object.assign(row, r.row);
+        solids.push({ name, faces: r.fit.faces, loops: r.fit.loops, faceGroup: r.faceGroup });
+      } catch (err) {
+        row.error = String(err?.message ?? err);
+      }
+      continue;
+    }
     try {
       onStatus(`${name}: quad cage…`);
       const ta = performance.now();
@@ -67,7 +81,8 @@ export async function freeformSolid(positions, { bodies = null, names = null, pa
       if (cage.error) { row.error = cage.error; continue; }
       onStatus(`${name}: fitting ${cage.faces.length} quads…`);
       const tb = performance.now();
-      const fit = fitCage(cage, vertices, { rounds: 4 });
+      const data = quadrature(vertices, faces, Math.sqrt(meshArea(vertices, faces) / cage.faces.length) / 2);
+      const fit = fitCage(cage, data.points, { rounds: 4, weights: data.weights });
       const tc = performance.now();
       const h = fit.stats.history[fit.stats.history.length - 1], diag = fitDiag(vertices);
       Object.assign(row, { quads: cage.faces.length, faces: fit.faces.length, stars: starCount(cage.faces),
@@ -85,7 +100,34 @@ export async function freeformSolid(positions, { bodies = null, names = null, pa
   const te = performance.now();
   const preview = patchPreview(solids);
   const tf = performance.now();
-  return { step, preview, report: { bodies: report, ms: { step: te - td, preview: tf - te, total: tf - t0 } } };
+  return { step, preview, solids, report: { bodies: report, ms: { step: te - td, preview: tf - te, total: tf - t0 } } };
+}
+
+/**
+ * A body painted in groups (its faces): a cage laid out from the groups' borders (groupCage.js), converted with
+ * sharp borders (groupNurbs.js) and fitted with each group's surface points held to its own faces.
+ */
+function groupSolid(vertices, faces, labels, target, onStatus, name) {
+  const ta = performance.now();
+  onStatus(`${name}: cage from its faces…`);
+  const cage = groupCage(vertices, faces, labels, { quads: target });
+  if (cage.error) return cage;
+  const map = groupLinearMap(cage.vertices.length, cage.groups);
+  const h = Math.sqrt(meshArea(vertices, faces) / map.faces.length) / 2;
+  const points = [], weights = [], pointGroup = [];
+  cage.groups.forEach((g, gi) => {
+    const d = quadrature(vertices, g.triangles.map((t) => faces[t]), h);
+    d.points.forEach((p, i) => { points.push(p); weights.push(d.weights[i]); pointGroup.push(gi); });
+  });
+  onStatus(`${name}: fitting ${cage.groups.length} faces…`);
+  const tb = performance.now();
+  const fit = fitMap(map, cage.vertices, cage.groups.flatMap((g) => g.faces), points,
+    { rounds: 4, weights: Float64Array.from(weights), pointGroup: Int32Array.from(pointGroup) });
+  const tc = performance.now();
+  const last = fit.stats.history[fit.stats.history.length - 1], diag = fitDiag(vertices);
+  return { fit, faceGroup: map.faceGroup, row: { groups: cage.groups.length, n: cage.n, quads: map.faces.length, faces: fit.faces.length,
+    stars: cage.groups.filter((g) => g.k !== 4).length, subdivisions: 0, rms: last.rms * diag, max: last.max * diag,
+    relRms: last.rms, relMax: last.max, ms: { remesh: tb - ta, fit: tc - tb } } };
 }
 
 /**
@@ -113,6 +155,50 @@ async function cageFor(vertices, faces, target, onStatus, name, row) {
   if (longest > 2 * quadSize) return conditioned();
   const cage = await quadRemesh(vertices, faces, { faces: target });
   return cage.error ? conditioned() : cage;
+}
+
+function meshArea(vertices, faces) {
+  let area = 0;
+  for (const [a, b, c] of faces) area += triArea(vertices[a], vertices[b], vertices[c]);
+  return area;
+}
+function triArea(A, B, C) {
+  const u = [B[0] - A[0], B[1] - A[1], B[2] - A[2]], w = [C[0] - A[0], C[1] - A[1], C[2] - A[2]];
+  return Math.hypot(u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]) / 2;
+}
+
+/**
+ * Points and weights for the integral of squared distance over the mesh, no two more than about h apart: a
+ * triangle no longer than h gives a third of its area to each corner; a longer one (a CAD face's long triangles,
+ * whose corners are all on the face's edges) is bisected on its longest edge until every piece is, and each
+ * piece's centroid carries the piece's area. h is the quadrature's spacing (half the quad size, so every
+ * patch has data inside it), not a smoothing weight.
+ */
+function quadrature(vertices, faces, h) {
+  const weight = new Float64Array(vertices.length), extra = [], extraWeight = [];
+  const len = (p, q) => Math.hypot(p[0] - q[0], p[1] - q[1], p[2] - q[2]);
+  const mid = (p, q) => [(p[0] + q[0]) / 2, (p[1] + q[1]) / 2, (p[2] + q[2]) / 2];
+  for (const [ia, ib, ic] of faces) {
+    const A = vertices[ia], B = vertices[ib], C = vertices[ic];
+    if (Math.max(len(A, B), len(B, C), len(C, A)) <= h) {
+      const a = triArea(A, B, C) / 3;
+      weight[ia] += a; weight[ib] += a; weight[ic] += a;
+      continue;
+    }
+    const stack = [[A, B, C]];
+    while (stack.length) {
+      const [p, q, r] = stack.pop(), e0 = len(p, q), e1 = len(q, r), e2 = len(r, p), m = Math.max(e0, e1, e2);
+      if (m <= h) {
+        extra.push([(p[0] + q[0] + r[0]) / 3, (p[1] + q[1] + r[1]) / 3, (p[2] + q[2] + r[2]) / 3]);
+        extraWeight.push(triArea(p, q, r));
+      } else if (e0 === m) { const s = mid(p, q); stack.push([p, s, r], [s, q, r]); }
+      else if (e1 === m) { const s = mid(q, r); stack.push([p, q, s], [p, s, r]); }
+      else { const s = mid(r, p); stack.push([p, q, s], [s, q, r]); }
+    }
+  }
+  const points = [], weights = [];
+  vertices.forEach((v, i) => { if (weight[i] > 0) { points.push(v); weights.push(weight[i]); } });
+  return { points: points.concat(extra), weights: Float64Array.from(weights.concat(extraWeight)) };
 }
 
 function starCount(faces) {
