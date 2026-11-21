@@ -123,8 +123,8 @@ export function surfaceDistances(faces, points, { grid = 7 } = {}) {
 }
 
 /**
- * Fit. points: [[x, y, z]...] on the mesh. Returns { vertices (fitted cage), faces (NURBS), cageFaces (the
- * NURBS faces' corners), stats }.
+ * Fit. points: [[x, y, z]...] on the mesh. Returns { vertices (fitted cage), faces (NURBS), loops (each
+ * NURBS face's boundary: [vertex, u, v] round its square), stats }.
  */
 export function fitCage(cage, points, { rounds = 5, grid = 7 } = {}) {
   const t0 = performance.now();
@@ -217,6 +217,6 @@ export function fitCage(cage, points, { rounds = 5, grid = 7 } = {}) {
     lap('solve');
   }
   const faces = map.faces.map(({ uCount, vCount }, f) => ({ uKnots: bezierKnots(uCount - 1), vKnots: bezierKnots(vCount - 1), uCount, vCount, poles: Array.from(poles[f]), weights: null }));
-  return { vertices: X, faces, cageFaces: map.cageFaces,
+  return { vertices: X, faces, loops: map.loops,
     stats: { history, subdivisions: map.subdivisions, envelope: A.size, ms: { ...ms, total: performance.now() - t0 } } };
 }

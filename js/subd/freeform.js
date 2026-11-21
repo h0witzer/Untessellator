@@ -67,7 +67,7 @@ export async function freeformSolid(positions, { bodies = null, names = null, pa
       const h = fit.stats.history[fit.stats.history.length - 1], diag = fitDiag(vertices);
       Object.assign(row, { quads: cage.faces.length, faces: fit.faces.length, stars: starCount(cage.faces),
         subdivisions: fit.stats.subdivisions, rms: h.rms * diag, max: h.max * diag, ms: { remesh: tb - ta, fit: tc - tb } });
-      solids.push({ name, faces: fit.faces, cageFaces: fit.cageFaces });
+      solids.push({ name, faces: fit.faces, loops: fit.loops });
     } catch (err) {
       row.error = String(err?.message ?? err);
     }

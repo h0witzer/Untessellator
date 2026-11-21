@@ -4,13 +4,13 @@
  * cap of js/subd/kpCap.js, a precomputed matrix per valence applied to the data along the cap's outer sides. No
  * iteration: the cost is a few small matrix products per face.
  *
- * The cap needs one layer of regular points round its star point (no face with two star corners); a cage whose
- * star points are closer than that is subdivided (Catmull-Clark) until they are not.
+ * The cap needs one layer of regular points round its star point (no face with two star corners). Where star points
+ * are closer, one Catmull-Clark step separates them and only the faces round them are output refined (plan()).
  *
  * Everything is linear in the cage: subdLinearMap gives each output pole as fixed weights on cage vertices.
  *
  * Output faces are Bezier patches as clamped B-splines: { uKnots, vKnots, uCount, vCount, poles } with poles
- * row-major, u from corner 0 to corner 1 of the face and v from corner 0 to corner 3.
+ * row-major, u from corner 0 to corner 1 of the face and v from corner 0 to corner 3, each with its boundary loop.
  */
 import { cageTopology, stepStencils } from './catmullClark.js';
 import { capOperator, applyCap, bernstein } from './kpCap.js';
@@ -62,34 +62,59 @@ function isolated(F, T) {
   return F.every((q) => q.filter((v) => T.valence[v] !== 4).length <= 1);
 }
 
+const UV = [[0, 0], [1, 0], [1, 1], [0, 1]];
+
 /**
- * Subdivide until isolated. Returns the final faces and topology, the step count, and (withRows) each final
- * vertex as weights on cage vertices: rows[i] = [[cage vertex, weight], ...].
+ * What to output, face by face. A cage whose stars are isolated is output as it is. Otherwise one Catmull-Clark
+ * step isolates every star (each new face has one original vertex), but only the faces round a star that shares a
+ * face with another star (a dipole star) are output refined, as their four children: elsewhere the limit surface is
+ * the coarse B-spline, so coarse bicubics and coarse caps stay, and their sides next to refined faces carry the same
+ * jet as the children (each child's three rows next to the side come from B-spline stencils of the side's regular
+ * ends), so they meet G2 at a T-junction.
+ * Returns { levels: [{F, T}] (coarse, and fine when refined), stencils (fine vertex -> cage weights) or null,
+ * outputs: [{level, face, star (cap) or -1 (bicubic), loop: [[vertex, u, v], ...]}], subdivisions }. Loop vertex ids
+ * are the finest level's (a cage vertex keeps its id; a side's midpoint is that edge's new point).
  */
-function refine(nv, cageFaces, maxSubdivisions, withRows) {
-  let F = cageFaces.map((q) => [...q]), T = topology(nv, F), steps = 0, rows = null;
-  const stencils = [];
-  while (!isolated(F, T)) {
-    if (steps === maxSubdivisions) throw new Error('SUBD_STARS_TOO_CLOSE: star points stay too close after subdividing');
-    const s = stepStencils(nv, Int32Array.from(F.flat()), new Float64Array(F.length * 8));
-    stencils.push(s.rows);
-    nv = s.rows.length;
-    F = Array.from({ length: s.faces.length / 4 }, (_, f) => [s.faces[f * 4], s.faces[f * 4 + 1], s.faces[f * 4 + 2], s.faces[f * 4 + 3]]);
-    T = topology(nv, F);
-    steps++;
+function plan(nv, cageFaces) {
+  const F0 = cageFaces.map((q) => [...q]), T0 = topology(nv, F0);
+  const loopOf = (q) => q.map((v, k) => [v, ...UV[k]]);
+  const starOf = (q, T) => { const s = q.filter((v) => T.valence[v] !== 4); return s.length ? s[0] : -1; };
+  if (isolated(F0, T0)) {
+    return { levels: [{ F: F0, T: T0 }], stencils: null, subdivisions: 0,
+      outputs: F0.map((q, f) => ({ level: 0, face: f, star: starOf(q, T0), loop: loopOf(q) })) };
   }
-  if (withRows && steps) {
-    rows = stencils[0];
-    for (let l = 1; l < stencils.length; l++) {
-      const prev = rows;
-      rows = stencils[l].map((row) => {
-        const w = new Map();
-        for (const [j, a] of row) for (const [c, b] of prev[j]) w.set(c, (w.get(c) ?? 0) + a * b);
-        return [...w];
-      });
+  const s = stepStencils(nv, Int32Array.from(F0.flat()), new Float64Array(F0.length * 8));
+  const F1 = Array.from({ length: s.faces.length / 4 }, (_, f) => [s.faces[f * 4], s.faces[f * 4 + 1], s.faces[f * 4 + 2], s.faces[f * 4 + 3]]);
+  const T1 = topology(s.rows.length, F1);
+  const dipole = new Set();
+  F0.forEach((q) => { const st = q.filter((v) => T0.valence[v] !== 4); if (st.length > 1) st.forEach((v) => dipole.add(v)); });
+  const refined = F0.map((q) => q.some((v) => dipole.has(v)));
+  const outputs = [];
+  F0.forEach((q, f) => {
+    if (refined[f]) {
+      for (let k = 0; k < 4; k++) outputs.push({ level: 1, face: 4 * f + k, star: starOf(F1[4 * f + k], T1), loop: loopOf(F1[4 * f + k]) });
+      return;
     }
+    const loop = [];
+    for (let k = 0; k < 4; k++) {
+      loop.push([q[k], ...UV[k]]);
+      const [g] = T0.sideOwner.get(`${q[(k + 1) % 4]},${q[k]}`);
+      if (refined[g]) loop.push([F1[4 * f + k][1], (UV[k][0] + UV[(k + 1) % 4][0]) / 2, (UV[k][1] + UV[(k + 1) % 4][1]) / 2]);
+    }
+    outputs.push({ level: 0, face: f, star: starOf(q, T0), loop });
+  });
+  return { levels: [{ F: F0, T: T0 }, { F: F1, T: T1 }], stencils: s.rows, subdivisions: 1, outputs };
+}
+
+/** For each (level, star) of the plan's caps, the cap's faces computed once: Map "level,star" -> Map face -> poles. */
+function capsOf(pl, run) {
+  const caps = new Map();
+  for (const o of pl.outputs) {
+    if (o.star < 0) continue;
+    const key = `${o.level},${o.star}`;
+    if (!caps.has(key)) caps.set(key, new Map(run(o.level, o.star)));
   }
-  return { F, T, steps, stencils, rows };
+  return caps;
 }
 
 /** Vertex ids of a regular face's 4 x 4 control-point neighbourhood, G[i * 4 + j], i along u and j along v. */
@@ -231,45 +256,45 @@ function capFaces(V, F, T, v, dim, variant = {}) {
   });
 }
 
+/**
+ * The conversion: { faces (Bezier patches, the plan's order), loops ([[vertex, u, v], ...] per face: the face's
+ * boundary, corners and any side midpoints where a refined neighbour meets it), stats }.
+ */
 export function fastSubdToNurbs(vertices, cageFaces, options = {}) {
   const t0 = performance.now();
   cageTopology(vertices.length, cageFaces);        // refuses open, non-manifold or non-quad cages
-  const { F, T, steps, stencils } = refine(vertices.length, cageFaces, options.maxSubdivisions ?? 2, false);
-  let V = vertices;
-  for (const rows of stencils) {
-    const P = V;
-    V = rows.map((row) => {
-      const x = [0, 0, 0];
-      for (const [j, w] of row) { x[0] += w * P[j][0]; x[1] += w * P[j][1]; x[2] += w * P[j][2]; }
-      return x;
-    });
-  }
+  const pl = plan(vertices.length, cageFaces);
+  const V = [vertices];
+  if (pl.stencils) V.push(pl.stencils.map((row) => {
+    const x = [0, 0, 0];
+    for (const [j, w] of row) { x[0] += w * vertices[j][0]; x[1] += w * vertices[j][1]; x[2] += w * vertices[j][2]; }
+    return x;
+  }));
   const t1 = performance.now();
-  const out = new Array(F.length);
-  let stars = 0;
-  F.forEach((q, f) => { if (q.every((v) => T.valence[v] === 4)) out[f] = { uKnots: K3, vKnots: K3, uCount: 4, vCount: 4, poles: bezierNet(V, regularGrid(q, T), 4, 3) }; });
-  for (let v = 0; v < V.length; v++) {
-    if (T.valence[v] === 4) continue;
-    stars++;
-    for (const [f, poles] of capFaces(V, F, T, v, 3, options.variant)) out[f] = { uKnots: K6, vKnots: K6, uCount: 7, vCount: 7, poles };
-  }
+  const caps = capsOf(pl, (level, star) => capFaces(V[level], pl.levels[level].F, pl.levels[level].T, star, 3, options.variant));
+  const faces = pl.outputs.map(({ level, face, star }) => {
+    const { F, T } = pl.levels[level];
+    const poles = star < 0 ? bezierNet(V[level], regularGrid(F[face], T), 4, 3) : caps.get(`${level},${star}`).get(face);
+    const p = star < 0 ? 3 : 6;
+    return { uKnots: p === 3 ? K3 : K6, vKnots: p === 3 ? K3 : K6, uCount: p + 1, vCount: p + 1, poles: Array.from(poles), weights: null };
+  });
   const t2 = performance.now();
-  return { faces: out.map((o) => ({ ...o, poles: Array.from(o.poles), weights: null })), vertices: V, cageFaces: F,
-    stats: { subdivisions: steps, faces: F.length, stars, ms: { setup: t1 - t0, build: t2 - t1, total: t2 - t0 } } };
+  return { faces, loops: pl.outputs.map((o) => o.loop),
+    stats: { subdivisions: pl.subdivisions, faces: faces.length, stars: caps.size, ms: { setup: t1 - t0, build: t2 - t1, total: t2 - t0 } } };
 }
 
 /**
- * The conversion as a linear map. faces[f] (same order as fastSubdToNurbs) = { uCount, vCount, ids, W } with
- * pole p = sum over a of W[p * ids.length + a] * cage vertex ids[a]; cageFaces: the output faces' corners (the
- * subdivided cage when star points were too close). Built directly: the regular faces' fixed 16 x 16 weights, each
- * cap evaluated once on a basis of its star's 2-ring, subdivision composed in.
+ * The conversion as a linear map: faces[f] (fastSubdToNurbs' order) = { uCount, vCount, ids, W } with pole p = sum
+ * over a of W[p * ids.length + a] * cage vertex ids[a]; loops as fastSubdToNurbs gives them. Built directly: the
+ * regular faces' fixed 16 x 16 weights, each cap evaluated once on a basis of its star's 2-ring, refined faces
+ * composed with the subdivision stencils.
  */
 export function subdLinearMap(nv, cageFaces, options = {}) {
   cageTopology(nv, cageFaces);
-  const { F, T, rows, steps } = refine(nv, cageFaces, options.maxSubdivisions ?? 2, true);
-  const compose = (fineIds, M, np) => {
-    if (!rows) return { ids: Int32Array.from(fineIds), W: M };
-    const col = new Map();
+  const pl = plan(nv, cageFaces);
+  const compose = (level, fineIds, M, np) => {
+    if (level === 0) return { ids: Int32Array.from(fineIds), W: M };
+    const rows = pl.stencils, col = new Map();
     for (const i of fineIds) for (const [c] of rows[i]) if (!col.has(c)) col.set(c, col.size);
     const nc = col.size, nf = fineIds.length, W = new Float64Array(np * nc);
     for (let a = 0; a < nf; a++) {
@@ -281,33 +306,35 @@ export function subdLinearMap(nv, cageFaces, options = {}) {
     }
     return { ids: Int32Array.from(col.keys()), W };
   };
-  const out = new Array(F.length);
   // regular faces: pole (a, b) = sum B2BB[a][i] B2BB[b][j] G[i][j]
   const R16 = new Float64Array(256);
   for (let a = 0; a < 4; a++) for (let b = 0; b < 4; b++) for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) R16[(a * 4 + b) * 16 + i * 4 + j] = B2BB[a][i] * B2BB[b][j];
-  F.forEach((q, f) => {
-    if (!q.every((v) => T.valence[v] === 4)) return;
-    const G = regularGrid(q, T), uniq = [...new Set(G)];
+  // caps: run once with V = the identity on the star's 2-ring (at the cap's level)
+  const Vloc = [new Array(nv), pl.stencils ? new Array(pl.stencils.length) : null];
+  const locals = new Map();
+  const caps = capsOf(pl, (level, v) => {
+    const { F, T } = pl.levels[level], local = new Set();
+    for (const [f] of T.facesAt[v]) for (const w of F[f]) for (const [g] of T.facesAt[w]) for (const x of F[g]) local.add(x);
+    const L = [...local], dim = L.length, Vl = Vloc[level];
+    L.forEach((x, a) => { const e = new Float64Array(dim); e[a] = 1; Vl[x] = e; });
+    const out = capFaces(Vl, F, T, v, dim, options.variant);
+    for (const x of L) Vl[x] = undefined;
+    locals.set(`${level},${v}`, L);
+    return out;
+  });
+  const faces = pl.outputs.map(({ level, face, star }) => {
+    const { F, T } = pl.levels[level];
+    if (star >= 0) return { uCount: 7, vCount: 7, ...compose(level, locals.get(`${level},${star}`), caps.get(`${level},${star}`).get(face), 49) };
+    const G = regularGrid(F[face], T), uniq = [...new Set(G)];
     let M = R16;
     if (uniq.length !== 16) {                       // a vertex twice in the neighbourhood (tiny cages): sum its columns
       M = new Float64Array(16 * uniq.length);
       const at = new Map(uniq.map((v, a) => [v, a]));
       for (let p = 0; p < 16; p++) for (let g = 0; g < 16; g++) M[p * uniq.length + at.get(G[g])] += R16[p * 16 + g];
     }
-    out[f] = { uCount: 4, vCount: 4, ...compose(uniq, M, 16) };
+    return { uCount: 4, vCount: 4, ...compose(level, uniq, M, 16) };
   });
-  // caps: run once with V = the identity on the star's 2-ring
-  const Vloc = new Array(T.valence.length);
-  for (let v = 0; v < T.valence.length; v++) {
-    if (T.valence[v] === 4) continue;
-    const local = new Set();
-    for (const [f] of T.facesAt[v]) for (const w of F[f]) for (const [g] of T.facesAt[w]) for (const x of F[g]) local.add(x);
-    const L = [...local], dim = L.length;
-    L.forEach((x, a) => { const e = new Float64Array(dim); e[a] = 1; Vloc[x] = e; });
-    for (const [f, poles] of capFaces(Vloc, F, T, v, dim, options.variant)) out[f] = { uCount: 7, vCount: 7, ...compose(L, poles, 49) };
-    for (const x of L) Vloc[x] = undefined;
-  }
-  return { faces: out, cageFaces: F, subdivisions: steps };
+  return { faces, loops: pl.outputs.map((o) => o.loop), subdivisions: pl.subdivisions };
 }
 
 /** Poles of every face for cage positions X ([[x, y, z]...]) through the map: Float64Array per face, 3 per pole. */

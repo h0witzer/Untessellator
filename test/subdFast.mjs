@@ -36,40 +36,38 @@ function curvatureAcross(d, n, D) {                 // normal curvature along D 
   const H = (E * N - 2 * F * M + G * L) / (2 * det), K = (L * N - M * M) / det;
   return [k, Math.abs(H) + Math.sqrt(Math.max(H * H - K, 0))];
 }
-const sideUV = (k, s) => [[s, 0], [1, s], [1 - s, 1], [0, 1 - s]][k];
 
 for (const dir of dirs) {
   const cage = JSON.parse(fs.readFileSync(path.join(dir, 'cage.json'), 'utf8'));
   const t = performance.now();
   const r = fastSubdToNurbs(cage.vertices, cage.faces, { variant });
   const ms = performance.now() - t;
-  const { faces, cageFaces, vertices } = r;
+  const { faces, loops } = r, vertices = cage.vertices;
   const lo = [0, 1, 2].map((c) => Math.min(...vertices.map((p) => p[c]))), hi = [0, 1, 2].map((c) => Math.max(...vertices.map((p) => p[c])));
   const diag = Math.hypot(...hi.map((h, c) => h - lo[c]));
+  // each loop segment a -> b with its uv ends; the face across runs it b -> a (T-junction sides included)
   const owner = new Map();
-  cageFaces.forEach((q, f) => { for (let k = 0; k < 4; k++) owner.set(`${q[k]},${q[(k + 1) % 4]}`, [f, k]); });
+  loops.forEach((loop, f) => loop.forEach(([a, u0, v0], i) => { const [b, u1, v1] = loop[(i + 1) % loop.length]; owner.set(`${a},${b}`, [f, [u0, v0], [u1, v1]]); }));
   let worstAngle = 0, worstG2 = 0, worstGap = 0, edges = 0;
-  cageFaces.forEach((q, f) => {
-    for (let k = 0; k < 4; k++) {
-      const a = q[k], b = q[(k + 1) % 4];
-      if (a > b) continue;
-      const [g, kg] = owner.get(`${b},${a}`);
-      edges++;
-      for (let m = 0; m <= 24; m++) {
-        const s = m / 24, [u, v] = sideUV(k, s), [ug, vg] = sideUV(kg, 1 - s);
-        const dA = evalPatch(faces[f], u, v), dB = evalPatch(faces[g], ug, vg);
-        worstGap = Math.max(worstGap, Math.hypot(...sub(dA['00'], dB['00'])) / diag);
-        const nA = unit(cross(dA['10'], dA['01'])); let nB = unit(cross(dB['10'], dB['01']));
-        if (dot(nA, nB) < 0) nB = nB.map((x) => -x);
-        worstAngle = Math.max(worstAngle, Math.acos(Math.min(1, dot(nA, nB))) * 180 / Math.PI);
-        const T = unit([[1, 0], [0, 1], [-1, 0], [0, -1]][k][0] ? dA['10'].map((x) => x * [1, 0, -1, 0][k] || x) : dA['01']);
-        const along = k === 0 ? dA['10'] : k === 1 ? dA['01'] : k === 2 ? dA['10'] : dA['01'];
-        const D = unit(cross(nA, unit(along)));
-        const [kA, mA] = curvatureAcross(dA, nA, D), [kB, mB] = curvatureAcross(dB, nB, D);
-        worstG2 = Math.max(worstG2, Math.abs(kA - kB) / Math.max(mA, mB, 1 / diag));
-      }
+  for (const [key, [f, p0, p1]] of owner) {
+    const [a, b] = key.split(',').map(Number);
+    if (a > b) continue;
+    const [g, q0, q1] = owner.get(`${b},${a}`);
+    edges++;
+    for (let m = 0; m <= 24; m++) {
+      const s = m / 24, u = p0[0] + s * (p1[0] - p0[0]), v = p0[1] + s * (p1[1] - p0[1]);
+      const ug = q1[0] + s * (q0[0] - q1[0]), vg = q1[1] + s * (q0[1] - q1[1]);
+      const dA = evalPatch(faces[f], u, v), dB = evalPatch(faces[g], ug, vg);
+      worstGap = Math.max(worstGap, Math.hypot(...sub(dA['00'], dB['00'])) / diag);
+      const nA = unit(cross(dA['10'], dA['01'])); let nB = unit(cross(dB['10'], dB['01']));
+      if (dot(nA, nB) < 0) nB = nB.map((x) => -x);
+      worstAngle = Math.max(worstAngle, Math.acos(Math.min(1, dot(nA, nB))) * 180 / Math.PI);
+      const along = dA['10'].map((x, c) => x * (p1[0] - p0[0]) + dA['01'][c] * (p1[1] - p0[1]));
+      const D = unit(cross(nA, unit(along)));
+      const [kA, mA] = curvatureAcross(dA, nA, D), [kB, mB] = curvatureAcross(dB, nB, D);
+      worstG2 = Math.max(worstG2, Math.abs(kA - kB) / Math.max(mA, mB, 1 / diag));
     }
-  });
+  }
   const cvs = faces.reduce((s, f) => s + f.uCount * f.vCount, 0);
   console.log(path.basename(dir), JSON.stringify(variant), `${ms.toFixed(1)} ms (build ${r.stats.ms.build.toFixed(1)}),`,
     `${faces.length} faces, ${r.stats.stars} stars, ${r.stats.subdivisions} subdivisions, ${cvs} CVs |`,
