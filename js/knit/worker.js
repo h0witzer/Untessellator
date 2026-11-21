@@ -4,8 +4,13 @@
  * the kernel's memory corrupt), but the kernel starts loading as soon as the worker does: the studio starts the
  * next worker when a mesh opens and after each build, so Export rarely waits for the 50 MB kernel.
  *
+ * A part with freeform groups (painted groups with no surface) goes the face path first (knit/facePath.js: one
+ * trimmed face per group, the STEP written without the kernel, which only reads it back to judge and tessellate it),
+ * and to the knitter when that is not closed, valid and of the mesh's volume (options.facePath false: the knitter
+ * only); report.info.path is 'faces' when it was taken, report.info.face_path why not when it was not.
+ *
  * Message in:  {positions: Float64Array (9 per triangle), labels: Int32Array, surfaces: [[id, [type,
- *               params]], ...], options: {budget?, fallback?, deadline?, mode?, keep?}, repair?: true,
+ *               params]], ...], options: {budget?, fallback?, deadline?, mode?, keep?, facePath?}, repair?: true,
  *               bodies?: Int32Array (a body id per triangle), names?: {id: name}, oriented?: true, part?: name}
  * Messages out: {type: 'status', text} while the kernel loads, {type: 'progress', builds, ok, trying?, body?} per
  *               build; with several bodies {type: 'body', id, name, brep, report} as each is built (BRep text: a
@@ -19,6 +24,7 @@
 
 import { loadOcct, knitSolid, repairGroups, writeStep, brepText } from './index.js';
 import { previewMesh } from './preview.js';
+import { hasFreeform, tryFacePath } from './facePath.js';
 
 // warm: loading now, before any build is asked for
 let ready = false;
@@ -39,15 +45,36 @@ self.onmessage = async ({ data }) => {
       self.postMessage({ type: 'done', repair: { ...r, surfaces: [...r.surfaces] } });
       return;
     }
-    self.postMessage({ type: 'status', text: 'Building the solid…' });
     const keep = options.keep ? new Map(options.keep) : null;
+    // a part with freeform groups: one face per painted group first (knit/facePath.js), taken when it is as good as
+    // the knitter's own bar; else the knitter, as before
+    let faceTried = null, faceSecs = 0;
+    if (options.facePath !== false && !keep && hasFreeform(labels, new Map(surfaces))) {
+      const tf = performance.now();
+      self.postMessage({ type: 'status', text: 'Building one face per painted group…' });
+      const fp = tryFacePath(oc, { positions, labels, surfaces: new Map(surfaces), oriented }, { part });
+      if (fp.step) {
+        const { preview } = fp;
+        const buffers = preview ? [preview.positions.buffer, preview.normals.buffer, preview.face.buffer, preview.edges.buffer] : [];
+        self.postMessage({ type: 'done', step: fp.step, report: fp.report, preview }, buffers);
+        return;
+      }
+      faceTried = fp;
+      faceSecs = (performance.now() - tf) / 1000;
+    }
+    // the studio's hard stop counts from the start: the knitter's deadline less what the face path took (a fifth of it
+    // at least), so it still ends when it would have
+    const knitOptions = { ...options };
+    if (faceSecs && Number.isFinite(options.deadline)) knitOptions.deadline = Math.max(options.deadline / 5, options.deadline - faceSecs);
+    self.postMessage({ type: 'status', text: 'Building the solid…' });
     const onBody = ({ id, name, solid: s, report: r }) => {
       let brep = null;
       try { brep = s ? brepText(oc, s) : null; } catch (err) { console.warn('no BRep for body', id, err?.message ?? err); }
       self.postMessage({ type: 'body', id, name, brep, report: r });
     };
     const { solid, report, names: solidNames } = knitSolid(oc, { positions, labels, surfaces: new Map(surfaces), bodies, names, oriented },
-      { ...options, keep, onProgress, onBody });
+      { ...knitOptions, keep, onProgress, onBody });
+    if (faceTried) report.info = { ...report.info, face_path: faceTried.rejected, face_path_info: faceTried.info };
     self.postMessage({ type: 'status', text: 'Writing STEP…' });
     const step = solid ? writeStep(oc, solid, solidNames ? { names: solidNames, part } : {}) : null;
     // the preview: tessellated to a thousandth of the part's diagonal; without one the studio saves at once

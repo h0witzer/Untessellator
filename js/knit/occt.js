@@ -90,6 +90,21 @@ export function brepText(oc, shape) {
   return text;
 }
 
+/** The shape STEP text holds (one shape for all its roots), as OCCT's reader gives it. */
+export function readStep(oc, text) {
+  const path = `/tmp/in-${Date.now()}-${Math.random().toString(36).slice(2)}.step`;
+  oc.FS.writeFile(path, text);
+  const reader = new oc.STEPControl_Reader_1();
+  try {
+    if (reader.ReadFile(path) !== oc.IFSelect_ReturnStatus.IFSelect_RetDone) return null;
+    reader.TransferRoots(new oc.Message_ProgressRange_1());
+    return reader.OneShape();
+  } finally {
+    try { oc.FS.unlink(path); } catch { /* the file is in memory; nothing to clean */ }
+    reader.delete();
+  }
+}
+
 /** The shape BRep text holds (brepText's). */
 export function readBrep(oc, text) {
   const path = `/tmp/body-${Date.now()}-${Math.random().toString(36).slice(2)}.brep`;

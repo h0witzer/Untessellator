@@ -1,6 +1,7 @@
 /**
  * faceStep.js — STEP (AP214) text for solids of trimmed B-spline faces (js/subd/faceSolid.js), written directly.
- * Each face: one B_SPLINE_SURFACE_WITH_KNOTS and its bounds (edge loops); each edge: its 3D B-spline curve and a
+ * Each face: one B_SPLINE_SURFACE_WITH_KNOTS (or its analytic surface: PLANE, CYLINDRICAL_SURFACE, CONICAL_SURFACE,
+ * SPHERICAL_SURFACE, TOROIDAL_SURFACE) and its bounds (edge loops); each edge: its 3D B-spline curve and a
  * pcurve on each face it bounds (SURFACE_CURVE), or two on one face for a seam (SEAM_CURVE). Faces point outward
  * through ADVANCED_FACE's sense; loops run counter-clockwise seen from outside.
  */
@@ -50,7 +51,19 @@ export function faceStep(solids, { name = 'Part', tol = 1e-6 } = {}) {
     const [k, m] = knotPairs(c.knots);
     return add(`B_SPLINE_CURVE_WITH_KNOTS('',${c.p},(${c.poles.map(point).join(',')}),.UNSPECIFIED.,.F.,.F.,(${m.join(',')}),(${k.map(real).join(',')}),.UNSPECIFIED.)`);
   };
+  const dirn = (d) => add(`DIRECTION('',(${d.map(real).join(',')}))`);
   const surface = (s) => {
+    if (s.analytic) {
+      // an analytic face's own surface (js/subd/analytic.js frames and parameterises it as STEP does)
+      const a = s.analytic, place = add(`AXIS2_PLACEMENT_3D('',${point(a.C)},${dirn(a.z)},${dirn(a.x)})`);
+      switch (a.type) {
+        case 'plane': return add(`PLANE('',${place})`);
+        case 'cylinder': return add(`CYLINDRICAL_SURFACE('',${place},${real(a.R)})`);
+        case 'cone': return add(`CONICAL_SURFACE('',${place},${real(a.R)},${real(a.angle)})`);
+        case 'sphere': return add(`SPHERICAL_SURFACE('',${place},${real(a.R)})`);
+        default: return add(`TOROIDAL_SURFACE('',${place},${real(a.R)},${real(a.r)})`);
+      }
+    }
     const rows = s.poles.map((row) => `(${row.map(point).join(',')})`);
     const [ku, mu] = knotPairs(s.tu), [kv, mv] = knotPairs(s.tv);
     return add(`B_SPLINE_SURFACE_WITH_KNOTS('',${s.pu ?? 3},${s.pv ?? 3},(${rows.join(',')}),.UNSPECIFIED.,.F.,.F.,.F.,(${mu.join(',')}),(${mv.join(',')}),(${ku.map(real).join(',')}),(${kv.map(real).join(',')}),.UNSPECIFIED.)`);

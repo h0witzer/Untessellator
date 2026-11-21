@@ -22,7 +22,7 @@ import { fitRegionAs } from '../gaussMap.js';
 import { fitPieces } from '../freeformFit.js';
 import { shareAxes } from './axes.js';
 
-export { loadOcct, writeStep, brepText, readBrep } from './occt.js';
+export { loadOcct, writeStep, brepText, readBrep, readStep } from './occt.js';
 export { BUILD } from './build.js';
 
 const TYPES = ['plane', 'cylinder', 'cone', 'sphere', 'torus'];
