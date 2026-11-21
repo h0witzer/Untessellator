@@ -42,7 +42,7 @@ export const SUBD = {
   LEVELS: 4,          // limit samples per face side: 2^LEVELS + 1
   G1_SAMPLES: 8,      // per edge half: the G1 residual is a polynomial of degree 7 there
   G2_SAMPLES: 20,     // per edge half: the G2 residual is a polynomial of degree 19 there
-  MAX_STEPS: 14,
+  MAX_STEPS: 24,
   TARGET: 'natural',  // 'natural': the level-2 natural net; 'limit': the exact limit surface
   METRIC: 'smooth',   // 'smooth' | 'samples' (+ FAIR_MU variation) | 'bending' | 'nproto' (see the header)
   ANCHORED: Infinity, // steps that pull towards the fit; later steps make the least move (NURBS Proto: 6)
@@ -50,6 +50,8 @@ export const SUBD = {
   PIN_STAR: 1,        // 1: each star point's control point held at its limit position
   FAIR_MU: 0,         // weight of the linearised curvature variation against the distance to the samples
   LINEAR_G2: 0,       // 1: G2 with the reparameterisation's tangential terms fixed from the fit (linear)
+  SECOND_ORDER: 0,    // GMRES iterations per step on the second-order system (measured worse so far: off)
+  ACCEPT: 'residual', // accept a step that lowers the largest condition residual ('merit': L1 merit, slower)
   STAB: 1e-8,         // stabilisation: diagonal shift on each condition, relative to its Schur diagonal
   TOL: 2e-6,          // largest scaled residual left (the checker reads G2 within about 0.001 % there)
   RIDGE: 0,           // extra relative ridge in the block factorisation (STAB already regularises)
@@ -540,10 +542,10 @@ export function subdToNurbs(vertices, cageFaces, options = {}) {
   function conditions(withG2 = true) {
     const rows = [];
     let dropped = 0;
-    const push = (edge, kind, value, terms, at) => {
+    const push = (edge, kind, value, terms, at, sec) => {
       const live = terms.filter((t) => t.vars.length);
       if (!live.length) { dropped = Math.max(dropped, Math.abs(value)); return; }
-      rows.push({ edge, kind, value, terms: live, s: at });
+      rows.push({ edge, kind, value, terms: live, s: at, sec });
     };
     cedges.forEach((ce, ei) => {
       const f = faces[ce.fi], g = faces[ce.gi];
@@ -617,7 +619,7 @@ export function subdToNurbs(vertices, cageFaces, options = {}) {
               if (w !== 0) { tg.vars.push(l * 3 + c); tg.w.push(w / L3); }
             }
           }
-          push(ei, 'g2', dot(ab, q) / L3, [tf, tg], s);
+          push(ei, 'g2', dot(ab, q) / L3, [tf, tg], s, { edge: true, fi: ce.fi, gi: ce.gi, F, G, sigma, beta, a, b, q, scale: 1 / L3 });
         }
       }
     });
@@ -658,7 +660,7 @@ export function subdToNurbs(vertices, cageFaces, options = {}) {
           if (l < 0 || sm.wqL[k] === 0) continue;
           for (let c = 0; c < 3; c++) { t.vars.push(l * 3 + c); t.w.push(sm.wqL[k] * ab[c] / L3); }
         }
-        push(cedges.length + ii, 'g2in', dot(ab, q) / L3, [t], sm.s);
+        push(cedges.length + ii, 'g2in', dot(ab, q) / L3, [t], sm.s, { edge: false, fi: ib.fi, sm, a, b, q, scale: 1 / L3 });
       }
     });
     return { rows, dropped };
@@ -683,6 +685,64 @@ export function subdToNurbs(vertices, cageFaces, options = {}) {
     c.residual = c.rows.reduce((m, r) => Math.max(m, Math.abs(r.value)), 0);
     return c;
   };
+  /**
+   * sum_r lam_r (Hessian of condition r) applied to a step, for the G2 rows (G0, G1 are linear). A condition
+   * a . (b x q), with a, b, q linear in the control points, has directional gradient terms
+   * da: db x q + b x dq,  db: q x da + dq x a,  dq: da x b + a x db.
+   */
+  function hessianTimes(rows, lam, step) {
+    const out = new Map();
+    const vec = (fi) => { if (!out.has(fi)) out.set(fi, new Float64Array(faces[fi].free.length * 3)); return out.get(fi); };
+    const gather = (fi, idx, w) => {
+      const face = faces[fi], dl = step.get(fi), x = [0, 0, 0];
+      if (!dl) return x;
+      for (let k = 0; k < idx.length; k++) {
+        const l = face.local[idx[k]];
+        if (l < 0 || w[k] === 0) continue;
+        x[0] += w[k] * dl[l * 3]; x[1] += w[k] * dl[l * 3 + 1]; x[2] += w[k] * dl[l * 3 + 2];
+      }
+      return x;
+    };
+    const scatter = (fi, idx, w, g, coef) => {
+      const face = faces[fi], o = vec(fi);
+      for (let k = 0; k < idx.length; k++) {
+        const l = face.local[idx[k]];
+        if (l < 0 || w[k] === 0) continue;
+        for (let c = 0; c < 3; c++) o[l * 3 + c] += coef * w[k] * g[c];
+      }
+    };
+    rows.forEach((r, ri) => {
+      const sec = r.sec, lm = lam[ri];
+      if (!sec || !lm) return;
+      const { a, b, q } = sec, coef = lm * sec.scale;
+      let da, db, dq;
+      if (sec.edge) {
+        const { F, G, sigma, beta } = sec;
+        if (!sec.wq) sec.wq = F.tt.map((x, k) => -x + 2 * beta * sigma * F.st[k] - beta * beta * F.ss[k]);
+        if (!sec.wa) sec.wa = F.s.map((x) => sigma * x);
+        da = gather(sec.fi, F.idx, sec.wa); db = gather(sec.fi, F.idx, F.t);
+        const dqf = gather(sec.fi, F.idx, sec.wq), dqg = gather(sec.gi, G.idx, G.tt);
+        dq = [dqf[0] + dqg[0], dqf[1] + dqg[1], dqf[2] + dqg[2]];
+        const ga = cross(db, q).map((x, c) => x + cross(b, dq)[c]);
+        const gb = cross(q, da).map((x, c) => x + cross(dq, a)[c]);
+        const gq = cross(da, b).map((x, c) => x + cross(a, db)[c]);
+        scatter(sec.fi, F.idx, sec.wa, ga, coef); scatter(sec.fi, F.idx, F.t, gb, coef);
+        scatter(sec.fi, F.idx, sec.wq, gq, coef); scatter(sec.gi, G.idx, G.tt, gq, coef);
+      } else {
+        const { sm } = sec;
+        da = gather(sec.fi, sm.idxR, sm.wa); db = gather(sec.fi, sm.idxR, sm.wb);
+        const q1 = gather(sec.fi, sm.idxR, sm.wqR), q2 = gather(sec.fi, sm.idxL, sm.wqL);
+        dq = [q1[0] + q2[0], q1[1] + q2[1], q1[2] + q2[2]];
+        const ga = cross(db, q).map((x, c) => x + cross(b, dq)[c]);
+        const gb = cross(q, da).map((x, c) => x + cross(dq, a)[c]);
+        const gq = cross(da, b).map((x, c) => x + cross(a, db)[c]);
+        scatter(sec.fi, sm.idxR, sm.wa, ga, coef); scatter(sec.fi, sm.idxR, sm.wb, gb, coef);
+        scatter(sec.fi, sm.idxR, sm.wqR, gq, coef); scatter(sec.fi, sm.idxL, sm.wqL, gq, coef);
+      }
+    });
+    return out;
+  }
+
   // The objective: squared distance to the limit samples over the star faces, (x - target)^T A (x - target).
   const objective = () => {
     let E = 0;
@@ -701,6 +761,8 @@ export function subdToNurbs(vertices, cageFaces, options = {}) {
   // lets slip is pulled back at the next step and the fixed point is exactly feasible); steps are accepted by an
   // exact L1 merit function, objective + penalty x sum |condition|, the penalty above twice the largest multiplier.
   let cond = evaluate(true), lamBar = new Float64Array(cond.rows.length), penalty = 0;
+  const alphas = [];
+  let newtonFallbacks = 0;
   for (; ; steps++) {
     const rows = cond.rows, residual = cond.residual;
     dropped = cond.dropped;
@@ -759,6 +821,7 @@ export function subdToNurbs(vertices, cageFaces, options = {}) {
     rows.forEach((r, ri) => {
       const D = block(r.edge, r.edge), k = r.at * sizes[r.edge] + r.at;
       const shift = opt.STAB * D[k];
+      r.shift = shift;
       D[k] += shift;
       rhs[r.edge][r.at] += r.value + shift * lamBar[ri];
     });
@@ -767,30 +830,154 @@ export function subdToNurbs(vertices, cageFaces, options = {}) {
     const solve = factorBlocks(sizes, blocks, adj, opt.RIDGE, opt.DROP);
     const nu = solve(rhs);
     ms.factor += performance.now() - tf;
-    const moves = [];
+    const deltas = new Map();
     for (const [fi, { list, Ws, d }] of W) {
       const delta = Float64Array.from(d);
       list.forEach(([ri], a) => {
         const l = nu[rows[ri].edge][rows[ri].at], w = Ws[a];
         for (let i = 0; i < delta.length; i++) delta[i] -= l * w[i];
       });
-      moves.push([faces[fi], delta, Float64Array.from(faces[fi].net)]);
+      deltas.set(fi, delta);
     }
+    // Second order (Newton-Krylov): GMRES on the true step system
+    //   [A + sum lam Hessian(c), J^T; J, -D] [step; nu] = [A d; -c - D lamBar]
+    // right-preconditioned by the factorisation above (the same system without the curvature term) and started
+    // from the Gauss-Newton step. lamBar: the multipliers of the previous step.
+    let gnDeltas = null, gnNu = null;
+    if (opt.SECOND_ORDER && steps > 0) {
+      const faceIds = [...W.keys()];
+      const offs = new Map();
+      let nx = 0;
+      for (const fi of faceIds) { offs.set(fi, nx); nx += faces[fi].free.length * 3; }
+      const n = nx + rows.length;
+      const split = (z) => {
+        const dm = new Map();
+        for (const fi of faceIds) dm.set(fi, z.subarray(offs.get(fi), offs.get(fi) + faces[fi].free.length * 3));
+        return dm;
+      };
+      const applyA = (face, vec, o, out, oo) => {
+        const m = face.free.length;
+        for (let c = 0; c < 3; c++) for (let i = 0; i < m; i++) {
+          let x = 0;
+          for (let j = 0; j < m; j++) x += face.A[i * m + j] * vec[o + j * 3 + c];
+          out[oo + i * 3 + c] = x;
+        }
+      };
+      const applyK = (z) => {                        // the true operator
+        const out = new Float64Array(n), dm = split(z), H = hessianTimes(rows, lamBar, dm);
+        for (const fi of faceIds) {
+          const o = offs.get(fi), h = H.get(fi);
+          applyA(faces[fi], z, o, out, o);
+          if (h) for (let i = 0; i < h.length; i++) out[o + i] += h[i];
+        }
+        rows.forEach((r, ri) => {
+          const l = z[nx + ri];
+          let jd = 0;
+          for (const t of r.terms) {
+            const o = offs.get(t.face);
+            for (let k = 0; k < t.vars.length; k++) { jd += t.w[k] * z[o + t.vars[k]]; out[o + t.vars[k]] += t.w[k] * l; }
+          }
+          out[nx + ri] = jd - r.shift * l;
+        });
+        return out;
+      };
+      const applyPinv = (v) => {                     // the factorised operator, inverted through the Schur complement
+        const U = new Map();
+        for (const fi of faceIds) {
+          const face = faces[fi], m = face.free.length, o = offs.get(fi), u = new Float64Array(m * 3);
+          for (let c = 0; c < 3; c++) for (let i = 0; i < m; i++) {
+            let x = 0;
+            for (let j = 0; j < m; j++) x += face.Ainv[i * m + j] * v[o + j * 3 + c];
+            u[i * 3 + c] = x;
+          }
+          U.set(fi, u);
+        }
+        const r2 = sizes.map((m) => new Float64Array(m));
+        rows.forEach((r, ri) => {
+          let x = -v[nx + ri];
+          for (const t of r.terms) { const u = U.get(t.face); for (let k = 0; k < t.vars.length; k++) x += t.w[k] * u[t.vars[k]]; }
+          r2[r.edge][r.at] = x;
+        });
+        const lam2 = solve(r2), out = new Float64Array(n);
+        for (const [fi, { list, Ws }] of W) {
+          const u = U.get(fi), o = offs.get(fi);
+          for (let i = 0; i < u.length; i++) out[o + i] = u[i];
+          list.forEach(([ri], q) => {
+            const l = lam2[rows[ri].edge][rows[ri].at], w = Ws[q];
+            for (let i = 0; i < w.length; i++) out[o + i] -= l * w[i];
+          });
+        }
+        rows.forEach((r, ri) => { out[nx + ri] = lam2[r.edge][r.at]; });
+        return out;
+      };
+      const bvec = new Float64Array(n);
+      for (const [fi, { d }] of W) applyA(faces[fi], d, 0, bvec, offs.get(fi));
+      rows.forEach((r, ri) => { bvec[nx + ri] = -r.value - r.shift * lamBar[ri]; });
+      const z0 = new Float64Array(n);                // the Gauss-Newton step
+      for (const fi of faceIds) z0.set(deltas.get(fi), offs.get(fi));
+      rows.forEach((r, ri) => { z0[nx + ri] = nu[r.edge][r.at]; });
+      const Kz0 = applyK(z0), r0 = bvec.map((x, i) => x - Kz0[i]);
+      const dotv = (x, y) => { let t = 0; for (let i = 0; i < x.length; i++) t += x[i] * y[i]; return t; };
+      const beta0 = Math.sqrt(dotv(r0, r0));
+      if (beta0 > 0) {
+        const V = [r0.map((x) => x / beta0)], Hh = [], cs = [], sn = [], g = [beta0];
+        let k = 0;
+        while (k < opt.SECOND_ORDER) {
+          const w = applyK(applyPinv(V[k]));
+          const h = new Float64Array(k + 2);
+          for (let i = 0; i <= k; i++) { h[i] = dotv(w, V[i]); for (let t = 0; t < n; t++) w[t] -= h[i] * V[i][t]; }
+          h[k + 1] = Math.sqrt(dotv(w, w));
+          for (let i = 0; i < k; i++) { const t = cs[i] * h[i] + sn[i] * h[i + 1]; h[i + 1] = -sn[i] * h[i] + cs[i] * h[i + 1]; h[i] = t; }
+          const rr = Math.hypot(h[k], h[k + 1]);
+          const hk1 = h[k + 1];
+          cs.push(h[k] / rr); sn.push(hk1 / rr);
+          h[k] = rr; h[k + 1] = 0;
+          g.push(-sn[k] * g[k]); g[k] = cs[k] * g[k];
+          Hh.push(h);
+          k++;
+          if (Math.abs(g[k]) < 1e-8 * beta0 || hk1 === 0) break;
+          V.push(w.map((x) => x / hk1));
+        }
+        const y = new Float64Array(k);
+        for (let i = k - 1; i >= 0; i--) { let t = g[i]; for (let j = i + 1; j < k; j++) t -= Hh[j][i] * y[j]; y[i] = t / Hh[i][i]; }
+        const corr = new Float64Array(n);
+        for (let i = 0; i < k; i++) for (let t = 0; t < n; t++) corr[t] += y[i] * V[i][t];
+        const dz = applyPinv(corr);
+        gnDeltas = new Map([...deltas].map(([fi, d]) => [fi, Float64Array.from(d)]));
+        gnNu = nu.map((x) => Float64Array.from(x));
+        for (const fi of faceIds) { const d = deltas.get(fi), o = offs.get(fi); for (let i = 0; i < d.length; i++) d[i] += dz[o + i]; }
+        rows.forEach((r, ri) => { nu[r.edge][r.at] += dz[nx + ri]; });
+      }
+    }
+    const moves = [];
+    for (const [fi, delta] of deltas) moves.push([faces[fi], delta, Float64Array.from(faces[fi].net)]);
     const newLam = new Float64Array(rows.length);
     let biggest = 0;
     rows.forEach((r, ri) => { newLam[ri] = nu[r.edge][r.at]; biggest = Math.max(biggest, Math.abs(newLam[ri])); });
     penalty = Math.max(penalty, 2 * biggest);
     const merit0 = objective() + penalty * l1(cond);
-    let alpha = 1, next;
-    for (let tries = 0; ; tries++) {
-      for (const [face, delta, before] of moves) {
-        face.net.set(before);
-        face.free.forEach((cv, l) => { for (let c = 0; c < 3; c++) face.net[cv * 3 + c] += alpha * delta[l * 3 + c]; });
+    const tryMoves = (lastTry) => {
+      let alpha = 1, next;
+      for (let tries = 0; tries <= 6; tries++) {
+        for (const [face, delta, before] of moves) {
+          face.net.set(before);
+          face.free.forEach((cv, l) => { for (let c = 0; c < 3; c++) face.net[cv * 3 + c] += alpha * delta[l * 3 + c]; });
+        }
+        next = evaluate(true);
+        if (opt.ACCEPT === "residual" ? next.residual < cond.residual : objective() + penalty * l1(next) < merit0) return { alpha, next, ok: true };
+        if (tries === 6 && lastTry) return { alpha, next, ok: false };
+        alpha /= 2;
       }
-      next = evaluate(true);
-      if (objective() + penalty * l1(next) < merit0 || tries === 6) break;
-      alpha /= 2;
+      return { alpha, next, ok: false };
+    };
+    let { alpha, next, ok } = tryMoves(!gnDeltas);
+    if (!ok && gnDeltas) {                            // the Newton step failed: take the Gauss-Newton step
+      newtonFallbacks++;
+      for (const mv of moves) mv[1] = gnDeltas.get(faces.indexOf(mv[0]));
+      ({ alpha, next } = tryMoves(true));
+      rows.forEach((r, ri) => { newLam[ri] = gnNu[r.edge][r.at]; });
     }
+    alphas.push(alpha);
     lamBar = newLam;
     cond = next;
   }
@@ -803,7 +990,7 @@ export function subdToNurbs(vertices, cageFaces, options = {}) {
     faces: out,
     stats: {
       faces: faces.length, starFaces: faces.filter((f) => f.star).length, edgesSolved: cedges.length,
-      steps, residual: history[history.length - 1], dropped, history, worst,
+      steps, residual: history[history.length - 1], dropped, history, worst, alphas, newtonFallbacks,
       maxDev: (() => {
         let worst = 0;
         faces.forEach((face, fi) => {
