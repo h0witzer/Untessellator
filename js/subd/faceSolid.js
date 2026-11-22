@@ -305,7 +305,7 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
       ins.push(seg);
     }
     if (!follows) return;
-    extraOf[gF].push(...extra);
+    for (const x of extra) extraOf[gF].push(x);
     onA.set(c, { ins, g: gF });
     analyticNbrs[gF].add(groups[ua.g === gF ? ub.g : ua.g].label);
   });
@@ -718,7 +718,8 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
 export function faceSolidSplit(vertices, triangles, labels, { rounds = 4, split = null, ...opts } = {}) {
   const lab = Array.from(labels), origin = new Map(), fits = new Map(), splits = new Map(), retyped = [];
   const surfaces = new Map(opts.surfaces ?? []);
-  let next = Math.max(...lab) + 1, r = null;
+  let next = 1, r = null;
+  for (const l of lab) if (l + 1 > next) next = l + 1;   // (a loop: too many triangles to spread into Math.max in a browser)
   const cutFace = (label) => {
     const tris = [];
     lab.forEach((l, t) => { if (l === label) tris.push(t); });

@@ -46,7 +46,9 @@ export function faceExport({ positions, labels, surfaces }, { part = 'Part', spl
   });
   // unpainted triangles: a group per connected run, labelled past the painted ones
   const lab = Int32Array.from(labels);
-  let next = Math.max(0, ...lab) + 1;
+  // (a loop, not Math.max(...lab): a browser takes only so many arguments, and a part has more triangles)
+  let next = 1;
+  for (const g of lab) if (g + 1 > next) next = g + 1;
   {
     const nbr = new Map(), runOf = new Int32Array(nT).fill(-1);
     for (let t = 0; t < nT; t++) if (lab[t] < 0) for (let k = 0; k < 3; k++) {

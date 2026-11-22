@@ -74,7 +74,8 @@ export function planeParam(V, T) {
   if (ln < 1e-300) return null;
   const nu = [n[0] / ln, n[1] / ln, n[2] / ln];
   const areas = N.map(norm);
-  const amax = Math.max(...areas);
+  let amax = 0;
+  for (const a of areas) if (a > amax) amax = a;      // (a loop: too many triangles to spread in a browser)
   for (let i = 0; i < N.length; i++) if (areas[i] > 1e-12 * amax && dot(N[i], nu) / areas[i] <= FIT.PLANE_MIN_COS) return null;
   const [x, y] = frame(nu);
   return V.map((p) => [dot(p, x), dot(p, y)]);
@@ -228,7 +229,8 @@ const LSCM_DIRECT_MAX = 1.5e7;
 function lscmSystem(V, T, pinned) {
   const nV = V.length, good = [], rcol = [], rval = [];   // 6 columns per row, two rows per good triangle
   const A2s = T.map(([a, bb, c]) => norm(cross(sub(V[bb], V[a]), sub(V[c], V[a]))));
-  const A2max = Math.max(...A2s, 0);
+  let A2max = 0;
+  for (const a of A2s) if (a > A2max) A2max = a;
   T.forEach(([a, bb, c], ti) => {
     const p0 = V[a], p1 = V[bb], p2 = V[c];
     const e1 = sub(p1, p0), l1 = norm(e1);
@@ -651,7 +653,7 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
       if (period) v2 = ((v2 % period) + period) % period;
       ex.push(x); eu.push(ua + w * (ub - ua)); ev.push(v2);
     }
-    X.push(...ex);
+    for (const x of ex) X.push(x);
     idx = [...idx, ...ex.map(() => -1)];
     U = Float64Array.from([...U, ...eu]); Vv = Float64Array.from([...Vv, ...ev]);
   }
