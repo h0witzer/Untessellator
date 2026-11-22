@@ -74,6 +74,15 @@ export function faceStep(solids, { name = 'Part', tol = 1e-6 } = {}) {
     const surf = faces.map((f) => surface(f.params));
     const vtx = points.map((p) => add(`VERTEX_POINT('',${point(p)})`));
     const edgeIds = edges.map((e) => {
+      // an edge between two analytic faces that is a line or circle: written as one, with no pcurves (a reader
+      // projects a line or circle onto an analytic surface exactly), its sense from its start vertex to its end
+      if (e.exact && !e.seam) {
+        const x = e.exact;
+        const geom = x.line
+          ? add(`LINE('',${point(x.line.o)},${add(`VECTOR('',${dirn(x.line.d)},${real(x.line.len)})`)})`)
+          : add(`CIRCLE('',${add(`AXIS2_PLACEMENT_3D('',${point(x.circle.c)},${dirn(x.circle.n)},${dirn(x.circle.x)})`)},${real(x.circle.r)})`);
+        return add(`EDGE_CURVE('',${vtx[e.v0]},${vtx[e.v1]},${geom},.T.)`);
+      }
       const c3 = curve(e.curve);
       const geometry = e.seam
         ? add(`SEAM_CURVE('',${c3},(${e.seam.pcurves.map((pc) => pcurve(surf[e.seam.face], pc)).join(',')}),.PCURVE_S1.)`)

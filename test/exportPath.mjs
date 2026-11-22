@@ -27,7 +27,7 @@ if (!KNIT_ONLY && row.freeform) {
   if (fp.step) { step = fp.step; report = fp.report; } else row.face_rejected = fp.rejected;
   const fi = fp.info ?? fp.report?.info;
   row.face_info = fi ? { faces: fi.step_faces, analytic: fi.analytic_faces, fitted: fi.fitted_faces,
-    splits: fi.splits?.length ?? 0, edge_tol: fi.edge_tol, face_ms: fi.face_ms, check_ms: fi.check_ms, kernel_rounds: fi.kernel_rounds } : null;
+    splits: fi.splits?.length ?? 0, edge_tol: fi.edge_tol, edge_gaps: fi.edge_gaps, face_ms: fi.face_ms, check_ms: fi.check_ms, kernel_rounds: fi.kernel_rounds } : null;
 }
 if (!step && !FACE_ONLY) {
   const { solid, report: r } = knitSolid(oc, { positions, labels, surfaces }, { deadline: DEADLINE });

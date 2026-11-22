@@ -1,7 +1,8 @@
 /**
  * faceExport.js — the face path: the studio's export payload (a painted mesh and its groups' surfaces) as a STEP
  * solid of trimmed faces, written here, with no geometry kernel. One STEP face per painted group (faceSolid.js
- * faceSolidSplit): an analytic group on its own surface exactly as the studio fitted it, any other group a fitted
+ * faceSolidSplit): an analytic group on its own surface, as the studio fitted it and the knitter's shared-axes step
+ * then makes exact (shared axes and planes, tangencies, equal sizes: js/knit/axes.js), any other group a fitted
  * B-spline (split only where no single surface carries it). The mesh gives the topology, so every edge is shared
  * by its two faces by construction; nothing is sewn or healed.
  *
@@ -18,6 +19,8 @@ import { findBodies } from '../bodies.js';
 import { faceSolidSplit } from './faceSolid.js';
 import { faceStep } from './faceStep.js';
 import { ANALYTIC } from './analytic.js';
+import { KnitMesh } from '../knit/mesh.js';
+import { shareAxes } from '../knit/axes.js';
 
 export function faceExport({ positions, labels, surfaces }, { part = 'Part', split = null } = {}) {
   const t0 = performance.now();
@@ -37,6 +40,13 @@ export function faceExport({ positions, labels, surfaces }, { part = 'Part', spl
   const surfs = surfaces instanceof Map ? surfaces : new Map(Object.entries(surfaces ?? {}).map(([k, v]) => [Number(k), v]));
   const given = new Map([...surfs].filter(([, s]) => s && (ANALYTIC.has(s[0]) || s[0] === 'bspline')));
   const info = { path: 'faces', bodies: found.bodies.length, splits: [], analytic_faces: 0, fitted_faces: 0 };
+  // the analytic surfaces made exact together, as the knitter does before building: an edge between two of them is
+  // then their exact intersection (faceSolid.js), which raw fits a hair apart do not have
+  if ([...given.values()].some((s) => ANALYTIC.has(s[0]))) {
+    const ta = performance.now(), r = shareAxes(new KnitMesh(positions, labels), given);
+    for (const [g, s] of r.surfaces) if (s) given.set(g, s);
+    Object.assign(info, r.info, { axes_ms: Math.round(performance.now() - ta) });
+  }
   const retyped = [];
   const report = (extra) => ({
     tier: 'none', bestTier: 'none', facetTris: 0, facetArea: 0, closed: false, valid: false, vol_err: null, free_edges: null,
@@ -69,7 +79,7 @@ export function faceExport({ positions, labels, surfaces }, { part = 'Part', spl
       }
     }
   }
-  const solids = [], final = [], rows = [], loose = [], faceKeys = [];
+  const solids = [], final = [], rows = [], loose = [], faceKeys = [], gaps = {}, exactN = {};
   let bulge = 0;
   let edgeTol = 0;
   for (let b = 0; b < found.bodies.length; b++) {
@@ -98,11 +108,14 @@ export function faceExport({ positions, labels, surfaces }, { part = 'Part', spl
     }
     edgeTol = Math.max(edgeTol, r.report.edgeTol);
     loose.push(...r.report.looseEdges);
+    for (const [k, g] of Object.entries(r.report.edgeGaps ?? {})) { for (const x of g.gaps) (gaps[k] ??= []).push(x); exactN[k] = (exactN[k] ?? 0) + (g.exact ?? 0); }
     bulge += r.report.bulgeVolume;
     solids.push({ faces: r.faces, edges: r.edges, points: r.points, name: `Body ${b + 1}`, tolerance: r.tolerance });
     rows.push({ id: b, name: `Body ${b + 1}`, tier: 'analytic', bestTier: 'analytic', facetTris: 0, facetArea: 0, triangles: Tb.length });
   }
   info.edge_tol = edgeTol;
+  // the edges by what meets there (faceSolid's edgeGaps): count, median and worst gap, x the diagonal
+  info.edge_gaps = Object.fromEntries(Object.entries(gaps).map(([k, xs]) => { xs.sort((a, b) => a - b); return [k, { n: xs.length, exact: exactN[k] ?? 0, median: xs[xs.length >> 1], max: xs[xs.length - 1] }]; }));
   info.bulge_volume = bulge;
   info.loose_edges = loose.sort((a, b) => b.tol - a.tol).slice(0, 10);
   const tol = Math.max(...solids.map((s) => s.tolerance));

@@ -18,11 +18,13 @@
 import { fitGroup, splitNormals, meshNormals, FIT } from './faceFit.js';
 import { Surface, nzBasis } from '../nurbs.js';
 import { AnalyticSurface, ANALYTIC } from './analytic.js';
+import { projectOnto, tangentLocus, ontoLocus, exactCurve, distNormal } from '../knit/geometry.js';
 
 const sub = (a, b) => a.map((x, i) => x - b[i]);
 const dot = (a, b) => a.reduce((s, x, i) => s + x * b[i], 0);
 const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
 const len = (a) => Math.hypot(...a);
+const add3 = (a, b) => a.map((x, i) => x + b[i]), scale3 = (a, s) => a.map((x) => x * s), unit3 = (a) => scale3(a, 1 / (len(a) || 1));
 const CORNER_TURN = Math.PI / 9;                   // 20 degrees
 
 /** Groups, their border loops (group on the left) as chains, and the chains (corner to corner, or a ring). */
@@ -657,12 +659,133 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
     f.S = Surface.fromParams(f.params);
     f.shift = best.j * h;                          // a point at u on the old net is at u - shift on the new one
   }
-  for (const ch of work) {
-    if (ch.ring) { const q = points.length; points.push(ch.pts[0]); ch.v0 = ch.v1 = q; ch.curve = fitCurve([...ch.pts, ch.pts[0]], { closed: true, tol: absTol }); }
-    else ch.curve = fitCurve(ch.pts, { closed: ch.closed, tol: absTol });
-  }
   const usesOf = work.map(() => []);
   loopsOf.forEach((loops, gi) => loops.forEach((l) => l.forEach((e) => usesOf[e.c].push({ g: gi, rev: e.rev }))));
+  for (const ch of work) if (ch.ring) { const q = points.length; points.push(ch.pts[0]); ch.v0 = ch.v1 = q; }
+
+  // EXACT EDGES where two analytic faces meet. Their surfaces are given exactly (and made exact together:
+  // faceExport.js runs the shared-axes step), so where they meet is known exactly: the curve through the mesh's
+  // border points left gaps of 1e-4 to 5e-4 of the part on cylinder-plane, torus-plane and cylinder-torus edges (the
+  // painted lab parts' face path), where the knitter builds the true line or circle. So, as the knitter does:
+  // - a corner where only analytic faces meet goes onto all their surfaces (one least-squares point; a seam vertex onto
+  //   its closing-round face's seam plane too), when that moves it by the fits' tolerance at most. Not where a fitted
+  //   face meets them: its surface does not pass through the moved point, and five of the lab's sixteen face-path
+  //   parts went invalid or untessellable that way;
+  // - each border between two analytic faces goes onto their intersection: a tangent pair's contact line or circle,
+  //   else every border point projected onto both; where those points make one line or circle (within 1e-9 of the
+  //   part), that is the edge, written as such (faceStep.js: a LINE or CIRCLE, no pcurves: a reader projects those onto
+  //   analytic surfaces exactly); else the curve through them, refined onto both until within 1e-9 between them.
+  const givenOf = (gi) => (faces[gi].analytic ? surfaces.get(faces[gi].g.label) : null);
+  const EXACT_TOL = 1e-9 * diag;
+  {
+    const facesAt = new Map(), seamPlanes = new Map();
+    work.forEach((ch, c) => {
+      for (const q of [ch.v0, ch.v1]) for (const u of usesOf[c]) (facesAt.get(q) ?? facesAt.set(q, new Set()).get(q)).add(u.g);
+    });
+    for (const [gi, at] of seamAt) {
+      const f = faces[gi];
+      if (!f.analytic) continue;
+      for (const q of at.values()) (seamPlanes.get(q) ?? seamPlanes.set(q, []).get(q)).push(['plane', { origin: f.S.C, normal: f.S.y }]);
+    }
+    for (const [q, fs] of facesAt) {
+      if ([...fs].some((gi) => !faces[gi].analytic)) continue;
+      const surfs = [...[...fs].map(givenOf), ...(seamPlanes.get(q) ?? [])];
+      const x = projectOnto(surfs, points[q], diag);
+      // a CAD mesh's corner vertex is on the true corner: moved by the fits' error at most, else the fits meet
+      // elsewhere (a loose torus fit put its corners 1e-3 of the part away, and the solid went invalid)
+      if (Math.max(...surfs.map(([k, p]) => Math.abs(distNormal(k, p, x)[0]))) <= absTol && len(sub(x, points[q])) <= absTol) points[q] = x;
+    }
+    for (const ch of work) { ch.pts[0] = points[ch.v0]; if (!ch.ring) ch.pts[ch.pts.length - 1] = points[ch.v1]; }
+  }
+  work.forEach((ch, c) => {
+    const us = usesOf[c];
+    if (us.length !== 2 || !faces[us[0].g].analytic || !faces[us[1].g].analytic) return;
+    const s1 = givenOf(us[0].g), s2 = givenOf(us[1].g);
+    const locus = tangentLocus(s1, s2, diag);
+    const onBothExact = (x) => (locus ? ontoLocus(locus, x) : projectOnto([s1, s2], x, diag));
+    const off = (x) => Math.max(Math.abs(distNormal(s1[0], s1[1], x)[0]), Math.abs(distNormal(s2[0], s2[1], x)[0]));
+    // (a ring's points do not repeat its first; a closed chain, a ring split at a seam, starts and ends on that vertex)
+    const closedLoop = ch.ring || ch.closed, loop = (P) => (ch.ring ? [...P, P[0]] : P);
+    const pts = ch.pts.map((x, i) => (i === 0 || (!ch.ring && i === ch.pts.length - 1) ? x : onBothExact(x) ?? x));
+    // a CAD mesh's border vertices are on the true edge: onto both surfaces they move by the fits' error at most. More
+    // means the surfaces meet elsewhere (two that nearly touch, not made tangent: their nearest common point runs off
+    // along the border's normal, and 00004411_009's solid left its mesh); and the border keeps its curve
+    if (pts.some((x, i) => off(x) > absTol || len(sub(x, ch.pts[i])) > absTol)) return;
+    ch.pts = pts;
+    // three points onto both inside each segment first: two or three points always make a circle (a short border
+    // between a cylinder and an oblique plane passed as one, and the solid left the mesh)
+    const dense = [];
+    const L0 = loop(pts);
+    for (let i = 0; i + 1 < L0.length; i++) {
+      dense.push(L0[i]);
+      const seg = len(sub(L0[i + 1], L0[i]));
+      for (const w of [0.25, 0.5, 0.75]) {
+        const x = L0[i].map((v, k) => v + w * (L0[i + 1][k] - v)), y = onBothExact(x);
+        if (y && off(y) <= EXACT_TOL && len(sub(y, x)) <= seg / 4 + absTol) dense.push(y);
+      }
+    }
+    dense.push(L0[L0.length - 1]);
+    // a tangent pair's contact line or circle is its edge as it stands (its points are on both surfaces only to the
+    // tangency's own tolerance, 1e-7 of the part, which a 1e-9 test of the points refused: 64 of 8 parts' borders)
+    const ex = locus ? (locus.line ? { line: locus.line } : { circle: { ...locus.circle } }) : exactCurve(dense, EXACT_TOL);
+    if (ex) {
+      // the arc's way round: from the first point through the border's own points (a circle's normal turned to it)
+      if (ex.circle) {
+        const { c: C, n, r } = ex.circle, x0 = unit3(sub(pts[0], C)), y0 = cross(n, x0);
+        const ang = (x) => { const d = sub(x, C); const a = Math.atan2(dot(d, y0), dot(d, x0)); return a < 0 ? a + 2 * Math.PI : a; };
+        const mid = ang(pts[Math.max(1, pts.length >> 1)]), end = closedLoop ? 2 * Math.PI : ang(points[ch.v1]);
+        const ccw = closedLoop ? ang(pts[1]) < Math.PI : mid < end;
+        ch.exact = { circle: { c: C, n: ccw ? n : n.map((v) => -v), r, x: x0 } };
+        const span = closedLoop ? 2 * Math.PI : ccw ? end : 2 * Math.PI - end;
+        const N = ccw ? n : n.map((v) => -v), Y = cross(N, x0);
+        ch.exactSpan = span;
+        ch.sample = (t) => add3(C, add3(scale3(x0, r * Math.cos(t * span)), scale3(Y, r * Math.sin(t * span))));
+      } else {
+        const a = points[ch.v0], d = sub(points[ch.v1], a), L = len(d);
+        ch.exact = { line: { o: a, d: unit3(d), len: L } };
+        ch.sample = (t) => add3(a, scale3(d, t));
+      }
+      // the arc as written must run through the border's own points (not the rest of its circle): each point's
+      // distance from the arc itself (measured against a polygon of it, its sag past the tolerance on large radii
+      // refused 56 good circles)
+      const on = (x) => {
+        if (ch.exact.line) { const { o, d, len: L } = ch.exact.line, t = Math.max(0, Math.min(L, dot(sub(x, o), d))); return len(sub(x, add3(o, scale3(d, t)))); }
+        const { c: C, n: N, r, x: X0 } = ch.exact.circle, Y = cross(N, X0), d = sub(x, C), z = dot(d, N), rad = sub(d, scale3(N, z));
+        let a = Math.atan2(dot(rad, Y), dot(rad, X0));
+        if (a < 0) a += 2 * Math.PI;
+        if (a <= ch.exactSpan + 1e-9) return Math.hypot(len(rad) - r, z);
+        return Math.min(len(sub(x, ch.sample(0))), len(sub(x, ch.sample(1))));
+      };
+      if (dense.every((x) => on(x) <= absTol)) return;
+      delete ch.exact; delete ch.sample; delete ch.exactSpan;
+    }
+    // a general intersection: points onto both between the border's, until the curve through them is within
+    // EXACT_TOL of both surfaces between them (four halvings at most)
+    for (let round = 0; round < 4; round++) {
+      const P = loop(ch.pts), V = loop(ch.vid), C = fitCurve(P, { closed: closedLoop, tol: EXACT_TOL }), d = [0];
+      for (let i = 1; i < P.length; i++) d.push(d[i - 1] + len(sub(P[i], P[i - 1])));
+      const outP = [P[0]], outV = [V[0]];
+      let added = 0;
+      for (let i = 0; i + 1 < P.length; i++) {
+        const x = curveAt(C, (d[i] + d[i + 1]) / 2 / (d[d.length - 1] || 1))[0];
+        if (off(x) > EXACT_TOL) { const y = onBothExact(x); if (y && off(y) <= EXACT_TOL && len(sub(y, x)) <= absTol) { outP.push(y); outV.push(-1); added++; } }
+        outP.push(P[i + 1]); outV.push(V[i + 1]);
+      }
+      if (!added) break;
+      ch.pts = ch.ring ? outP.slice(0, -1) : outP;
+      ch.vid = ch.ring ? outV.slice(0, -1) : outV;
+    }
+    ch.onBothExact = true;
+  });
+  for (const ch of work) {
+    const closedLoop = ch.ring || ch.closed;
+    if (ch.sample) {
+      // the exact curve's own points, enough for the B-spline the pcurves are fitted against to follow it closely
+      const m = 64, ts = Array.from({ length: m + 1 }, (_, j) => j / m), P = ts.map((t) => ch.sample(t));
+      if (closedLoop) P[m] = P[0];
+      ch.curve = fitCurve(P, { ts, closed: closedLoop, tol: EXACT_TOL });
+    } else ch.curve = fitCurve(ch.ring ? [...ch.pts, ch.pts[0]] : ch.pts, { closed: closedLoop, tol: ch.onBothExact ? EXACT_TOL : absTol });
+  }
 
   // pcurves: the edge curve's points projected onto each of its faces' surfaces, fitted on the edge's knots
   let edgeTol = 0;
@@ -688,9 +811,29 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
     if (tipIn && cand) { const tu = so.held.get(so.tip)?.[0]; cand = cand.filter(([k, x]) => !(k === 0 && x !== tu)); }
     return cand?.length === 1 ? cand[0] : null;
   };
+  // a pcurve on the edge curve's knots, each span split f ways: an edge whose curve is on both surfaces exactly (between
+  // analytic faces) is refined until its pcurves are too (on its own knots they missed by 1e-5 of the part)
+  const refined = (knots, f) => {
+    if (f === 1) return knots;
+    const u = [...new Set(knots)], lo = knots.filter((k) => k === knots[0]).length, out = [];
+    for (let i = 0; i + 1 < u.length; i++) for (let j = 0; j < f; j++) out.push(u[i] + ((u[i + 1] - u[i]) * j) / f);
+    return [...Array(lo - 1).fill(u[0]), ...out, ...Array(lo).fill(u[u.length - 1])];
+  };
   const pcurveOn = (face, curve, ch) => {
+    const target = ch.onBothExact || ch.exact ? 10 * EXACT_TOL : Infinity;
+    let best = null;
+    for (const f of [1, 2, 4, 8]) {
+      const r = pcurveAt(face, curve, ch, f);
+      if (r.error) return r;
+      if (!best || r.tol < best.tol) best = r;
+      if (best.tol <= target) break;
+    }
+    edgeTol = Math.max(edgeTol, best.tol);
+    return best;
+  };
+  const pcurveAt = (face, curve, ch, f) => {
     const { S, periodic } = face, [u0, u1] = S.dom, P = u1 - u0;
-    const spans = new Set(curve.knots).size - 1, m = Math.max(24, 8 * spans);
+    const knots = refined(curve.knots, f), spans = new Set(knots).size - 1, m = Math.max(24, 8 * spans);
     const ts = Array.from({ length: m + 1 }, (_, j) => j / m), uv = [];
     const iso = isoOf(face, ch);
     if (iso) {
@@ -705,11 +848,10 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
         t = isoClosest(S, x, k, val, t, a, b);
         uv.push(k === 0 ? [val, t] : [t, val]);
       }
-      const pc = fitCurve(uv, { ts, knots: curve.knots });
+      const pc = fitCurve(uv, { ts, knots });
       let et = 0;
       for (const s of ts) et = Math.max(et, len(sub(S.eval(...curveAt(pc, s)[0]).S, curveAt(curve, s)[0])));
-      edgeTol = Math.max(edgeTol, et);
-      return { pc, dir: Math.sign(uv[m][0] - uv[0][0]), tol: et };
+      return { pc, dir: Math.sign(uv[m][0] - uv[0][0]), tol: et, iso: true };
     }
     // the chain's points' chord-length parameters (as the curve was fitted), to find each sample's nearest vertex
     const pts = ch.ring ? [...ch.pts, ch.pts[0]] : ch.pts, vid = ch.ring ? [...ch.vid, ch.vid[0]] : ch.vid, d = [0];
@@ -749,18 +891,27 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
       const k = Math.round((mid - S.vRef) / (2 * Math.PI));
       if (k) for (const q of uv) q[1] -= 2 * Math.PI * k;
     }
-    const pc = fitCurve(uv, { ts, knots: curve.knots });
+    const pc = fitCurve(uv, { ts, knots });
     let et = 0;
     for (const t of ts) et = Math.max(et, len(sub(S.eval(...curveAt(pc, t)[0]).S, curveAt(curve, t)[0])));
-    edgeTol = Math.max(edgeTol, et);
     return { pc, dir: Math.sign(uv[m][0] - uv[0][0]), tol: et };
   };
-  const edges = work.map((ch) => ({ curve: ch.curve, v0: ch.v0, v1: ch.v1, pcurves: [] }));
+  const edges = work.map((ch, c) => {
+    const e = { curve: ch.curve, v0: ch.v0, v1: ch.v1, pcurves: [] };
+    if (ch.exact) {
+      // written as the line or circle itself; its gap, its own distance from both surfaces
+      const [s1, s2] = usesOf[c].map((u) => givenOf(u.g));
+      let gap = 0;
+      for (let j = 0; j <= 32; j++) { const x = ch.sample(j / 32); for (const [k, p] of [s1, s2]) gap = Math.max(gap, Math.abs(distNormal(k, p, x)[0])); }
+      Object.assign(e, { exact: ch.exact, exactGap: gap });
+    }
+    return e;
+  });
   work.forEach((ch, c) => {
     for (const use of usesOf[c]) {
       const r = pcurveOn(faces[use.g], ch.curve, ch);
       if (r.error) { fail(faces[use.g].g.label, r.error); continue; }
-      edges[c].pcurves.push({ face: use.g, pc: r.pc, rev: use.rev, dir: r.dir, tol: r.tol });
+      edges[c].pcurves.push({ face: use.g, pc: r.pc, rev: use.rev, dir: r.dir, tol: r.tol, iso: !!r.iso });
     }
   });
   if (problems.length) return stop();
@@ -820,6 +971,18 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
   const loose = edges.filter((e) => e.pcurves?.length).map((e) => ({ tol: Math.max(...e.pcurves.map((p) => p.tol)) / diag,
     faces: e.pcurves.map((p) => faces[p.face].g.label), on: e.pcurves.map((p) => (faces[p.face].analytic ? faces[p.face].S.type : `fit (${faces[p.face].info.param})`)) }));
   loose.sort((a, b) => b.tol - a.tol);
+  // the edges by what meets there, each side 'side' (a side of a four- or three-sided face's net), 'trimmed' (any
+  // other fitted face), or its analytic type: how many, and their gaps (each edge's worst distance from either face)
+  const edgeGaps = {};
+  for (const e of edges) {
+    if (e.pcurves?.length !== 2) continue;
+    const k = e.pcurves.map((p) => (faces[p.face].analytic ? faces[p.face].S.type : p.iso ? 'side' : 'trimmed')).sort().join('-');
+    const g = edgeGaps[k] ?? (edgeGaps[k] = { n: 0, gaps: [] });
+    g.n++;
+    g.gaps.push((e.exact ? e.exactGap : Math.max(...e.pcurves.map((p) => p.tol))) / diag);
+    if (e.exact) g.exact = (g.exact ?? 0) + 1;
+  }
+
   // the volume between the mesh (its triangles are chords) and the faces' surfaces: per triangle its area times the
   // surface's mean offset outward from it, the mean of the offsets at its sides' midpoints (exact for a quadratic
   // bulge). A solid on these surfaces has the mesh's volume plus this; what a volume check sees beyond it is no fit.
@@ -840,6 +1003,7 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
   const report = {
     bulgeVolume: bulge,
     looseEdges: loose.slice(0, 10),
+    edgeGaps,
     faces: out.length, edges: edges.length, maxFit: Math.max(...faces.map((f) => f.info.max_err)), edgeTol: edgeTol / diag,
     ms: performance.now() - t0,
   };
