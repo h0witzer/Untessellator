@@ -17,12 +17,15 @@
  *                with offsets within OFFSET, become the same surface exactly
  *   check        a snapped surface is kept only if its RMS distance to its own vertices stays within
  *                ACCEPT x the original + FLOOR x diagonal; otherwise it keeps its own fit and the shared
- *                values are recomputed without it
+ *                values are recomputed without it (a member of a pooled line first splits the line)
+ *   tangency     faces that meet smoothly made exactly tangent, all at once, with the equal sizes among
+ *                them (knit/tangency.js); equal sizes elsewhere shared as before
  *
  * Bsplines and surfaceless groups are left alone.
  */
 
 import { dot, sub, add, scale, cross, norm, unit, distNormal } from './geometry.js';
+import { solveTangency } from './tangency.js';
 
 export const AXES = { ANGLE_DEG: 1, OFFSET: 1e-3, RADIUS: 1e-3, ACCEPT: 1.5, FLOOR: 1e-6, ROUNDS: 3, INLIER: 5, TANGENT_DEG: 3,
   CHORD_Q: 0.9,
@@ -296,14 +299,17 @@ export function shareAxes(mesh, surfaces, opts = {}) {
   const angTol = (s1, s2) => Math.min((cfg.ANGLE_DEG * Math.PI) / 180, cfg.SIGMA_K * (s1 + s2));
   const angleOf = (a, b) => Math.atan2(norm(cross(a, b)), Math.abs(dot(a, b)));
   const lenTol = (r1, r2, cap) => Math.min(cap, cfg.SIGMA_K * (r1 + r2) + 10 * cfg.FLOOR * mesh.diag);
-  const rejected = new Set();
-  const locks = { dir: new Set(), line: new Set(), plane: new Set(), lines: [], planeSet: new Map(), perpTo: new Map() };
+  const rejected = new Set(), tight = new Set(), lineMates = new Map();
+  // dirOf: each label's direction cluster {d, items, perpOf (the heavier clusters it was squared to), frame}; a frame
+  // direction (the part's main ones, or one an intent or mirror relation set) stays where this step put it
+  // lines: the shared axis lines and their members; planeSet: each plane's labels sharing one plane
+  const locks = { lines: [], planeSet: new Map(), dirOf: new Map() };
   let out = new Map(surfaces), info;
   for (let round = 0; round < cfg.ROUNDS; round++) {
     out = new Map(surfaces);
     info = { axes_surfaces: 0, axes_directions: 0, axes_lines_shared: 0, axes_snapped: 0, axes_rejected: 0,
       axes_same_radius: 0, axes_same_plane: 0, axes_perpendicular: 0 };
-    locks.dir.clear(); locks.line.clear(); locks.plane.clear(); locks.lines.length = 0; locks.planeSet.clear(); locks.perpTo.clear();
+    locks.lines.length = 0; locks.planeSet.clear(); locks.dirOf.clear(); lineMates.clear();
     intent.clear();
     const items = [];
     for (const [g, s] of surfaces) {
@@ -336,7 +342,7 @@ export function shareAxes(mesh, surfaces, opts = {}) {
         if (norm(c) > 0.5) k.d = scale(unit(c), Math.sign(dot(c, k.d)) || 1);
         else k.d = unit(sub(k.d, scale(perp[0].d, dot(perp[0].d, k.d))));
       }
-      if (perp.length) { info.axes_perpendicular++; k.changed = true; k.perpTo = perp.slice(0, 2).map((f) => f.d); }
+      if (perp.length) { info.axes_perpendicular++; k.changed = true; k.perpTo = perp.slice(0, 2).map((f) => f.d); k.perpOf = perp.slice(0, 2); }
       fixed.push(k);
     }
     // 1b. Mirror symmetry: two directions that are mirror images across one of the part's main directions
@@ -380,6 +386,7 @@ export function shareAxes(mesh, surfaces, opts = {}) {
     // exactly square to it (an oblique chamfer direction with four faces once mirrored the frame's x onto z)
     const shared = dirs.filter((k) => k.items.length > 1).sort((u, v) => v.w - u.w);
     const mains = shared.length ? [shared[0], ...shared.slice(1).filter((k) => Math.abs(dot(k.d, shared[0].d)) <= 1e-12)].slice(0, 3) : [];
+    for (const k of mains) k.frame = true;
     const reflect = (v, m) => sub(v, scale(m, 2 * dot(v, m)));
     // (only on inexact meshes: on exact CAD tessellations mirror pairs are already exact by the data, and
     // averaging them cost exact perpendiculars to oblique axes - fill perpendicular 98.9 -> 98.4%)
@@ -403,6 +410,7 @@ export function shareAxes(mesh, surfaces, opts = {}) {
           const avg = fa ? a.d : fb ? scale(mb, sg) : unit(add(scale(a.d, a.w), scale(mb, sg * best.w)));
           a.d = avg; best.d = scale(reflect(avg, m.d), sg);
           a.changed = best.changed = true;
+          a.frame = best.frame = true;
           for (const it of fa ? best.items : fb ? a.items : [...a.items, ...best.items]) intent.add(it.g);
           used.add(a).add(best);
           if (round === 0) info.axes_mirror_pairs = (info.axes_mirror_pairs ?? 0) + 1;
@@ -410,31 +418,34 @@ export function shareAxes(mesh, surfaces, opts = {}) {
       }
     }
     info.axes_directions = dirs.length;
-    // a direction several faces share is locked; one only squared to another may turn while it stays square
-    for (const k of dirs) for (const it of k.items) {
-      if (k.items.length > 1) locks.dir.add(it.g);
-      else if (k.perpTo) locks.perpTo.set(it.g, k.perpTo);
-    }
+    // the direction clusters, for the tangency step (a frame direction never turns there)
+    for (const k of dirs) if (k.merged) k.frame = true;
+    for (const k of dirs) for (const it of k.items) locks.dirOf.set(it.g, k);
     // 2. axis lines inside each direction; 3. refits
     const lines = [];
     for (const k of dirs) {
       const d = k.d;
       const axial = k.items.filter((it) => it.kind !== 'plane');
       const flat = (o) => sub(o, scale(d, dot(o, d)));   // the line's point in the plane through 0, normal d
-      const ls = greedy(axial.map((it) => ({ ...it, q: flat(it.o) })), (L, it) => norm(sub(L.q, it.q)) <= offTol, (L, it, first) => {
-        if (first) { L.sq = scale(it.q, it.w); L.w = it.w; } else { L.sq = add(L.sq, scale(it.q, it.w)); L.w += it.w; }
-        L.q = scale(L.sq, 1 / L.w);
-      });
+      // one line within OFFSET; the members of a line that failed the check last round are pooled only within their
+      // axes' precision (AXIS_COND times worse than their RMS, as for directions), capped at OFFSET. The Base's inner
+      // and outer corner axes, 0.106 apart, pooled into one line that failed every member, so none was made
+      // tangent; but a precision cap from the start split a shaft's narrow cones (00000270_015: axes 1-2e-3 off,
+      // truly coaxial, whose axis their RMS places far better than they are) and cost the solid
+      const ls = greedy(axial.map((it) => ({ ...it, q: flat(it.o), u: cfg.AXIS_COND * it.r0, tight: tight.has(it.g) })),
+        (L, it) => norm(sub(L.q, it.q)) <= (L.tight || it.tight ? lenTol(L.u, it.u, offTol) : offTol), (L, it, first) => {
+          if (first) { L.sq = scale(it.q, it.w); L.w = it.w; L.u = it.u; L.tight = it.tight; }
+          else { L.sq = add(L.sq, scale(it.q, it.w)); L.w += it.w; L.u = Math.min(L.u, it.u); L.tight ||= it.tight; }
+          L.q = scale(L.sq, 1 / L.w);
+        });
       for (const L of ls) {
+        for (const it of L.items) lineMates.set(it.g, L.items.map((m) => m.g));
         lines.push({ o: L.q, d });
         if (L.items.length > 1) info.axes_lines_shared++;
         else if (!k.changed) continue;          // alone on its line and in its direction: its own fit stands
         const cyl = [];
         for (const it of L.items) {
-          if (L.items.length > 1) {
-            locks.line.add(it.g);
-            if (it === L.items[0]) locks.lines.push({ o: L.q, d, members: L.items.map((m) => m.g) });
-          }
+          if (L.items.length > 1 && it === L.items[0]) locks.lines.push({ o: L.q, d, members: L.items.map((m) => m.g) });
           const np = refitAbout(it.kind, it.p, pts.get(it.g), L.q, d, cfg.FLOOR * mesh.diag);
           if (np) { out.set(it.g, [it.kind, np]); if (it.kind === 'cylinder') cyl.push(it.g); }
         }
@@ -460,7 +471,7 @@ export function shareAxes(mesh, surfaces, opts = {}) {
         if (c.items.length > 1) {
           info.axes_same_plane += c.items.length - 1;
           const set = c.items.map((it) => it.g);
-          for (const it of c.items) { locks.plane.add(it.g); locks.planeSet.set(it.g, set); }
+          for (const it of c.items) locks.planeSet.set(it.g, set);
         }
         else if (!k.changed) continue;
         for (const it of c.items) {
@@ -497,8 +508,12 @@ export function shareAxes(mesh, surfaces, opts = {}) {
     // another type: a type change is the studio's Repair, where the user sees it (the Manta report: two
     // rim-only bands passed as tori about the fan axis on their vertices, 90 degrees off their normals)
     let newly = 0;
+    const tightBefore = new Set(tight);
     for (const [g, s] of out) {
       if (s === surfaces.get(g) || accepts(g, s[0], s[1])) continue;
+      // a member of a pooled line splits it first (its members pool by precision next round), then is rejected
+      const mates = lineMates.get(g) ?? [];
+      if (mates.length > 1 && !tightBefore.has(g) && round < cfg.ROUNDS - 1) { for (const h of mates) tight.add(h); newly++; continue; }
       rejected.add(g);
       newly++;
     }
@@ -506,10 +521,16 @@ export function shareAxes(mesh, surfaces, opts = {}) {
   }
   for (const g of rejected) out.set(g, surfaces.get(g));
   info.axes_rejected = rejected.size;
-  for (const g of rejected) { locks.dir.delete(g); locks.line.delete(g); locks.plane.delete(g); }
-  const tangentSet = new Set();
-  if (cfg.TANGENT_DEG > 0) Object.assign(info, makeTangent(mesh, out, weight, accepts, pts, cfg, locks, tangentSet));
-  if (cfg.VALUE_REL > 0) Object.assign(info, shareValues(mesh, out, weight, accepts, pts, rms0, noisy ? cfg : { ...cfg, INTENT_REL: 0, INTENT_DEG: 0 }, locks, tangentSet, intent));
+  for (const g of rejected) { locks.dirOf.delete(g); locks.planeSet.delete(g); }
+  for (const L of locks.lines) L.members = L.members.filter((g) => !rejected.has(g));
+  for (const [g, set] of locks.planeSet) locks.planeSet.set(g, set.filter((h) => !rejected.has(h)));
+  const tangentSet = new Set(), solvedSet = new Set();
+  const sigmaOf = (g) => Math.max(noiseOf.get(g), cfg.PRECISION_MIN * mesh.diag);
+  const groups = cfg.VALUE_REL > 0 ? valueGroups(mesh, out, weight, pts, rms0, noisy ? cfg : { ...cfg, INTENT_REL: 0, INTENT_DEG: 0 }) : [];
+  for (const k of groups) for (const it of k.items) if (it.byIntent) intent.add(it.g);
+  // faces that meet smoothly made exactly tangent, all at once, with the equal sizes among them (knit/tangency.js)
+  if (cfg.TANGENT_DEG > 0) Object.assign(info, solveTangency(mesh, out, { sigma: sigmaOf, accepts, pts, cfg, locks, tangentSet, values: groups, solvedSet }));
+  if (cfg.VALUE_REL > 0) Object.assign(info, shareValues(out, groups, accepts, pts, solvedSet));
   Object.assign(info, info0);
   const byKind = {};
   for (const g of rejected) { const k = surfaces.get(g)[0]; byKind[k] = (byKind[k] ?? 0) + 1; }
@@ -519,338 +540,27 @@ export function shareAxes(mesh, surfaces, opts = {}) {
 }
 
 
-// ── tangency ────────────────────────────────────────────────────────────────────────────────────────
-//
-// Faces that meet smoothly in the mesh (their surfaces' normals within TANGENT_DEG along the shared
-// boundary) are made exactly tangent: a gap g between a plane and a cylinder of radius R shows as a
-// crease of sqrt(2 g / R) radians, so 0.0002 on the user's chain was a 0.3-degree kink. Members are taken
-// most precise first and each is refitted against its MORE precise tangent partners only; the partners'
-// constraints are linear in the member's parameters:
-//   cylinder   its cross-section circle (centre, radius), tangent to planes along its axis
-//   torus      its profile circle (R, zc, r), tangent to a coaxial cylinder (R +- r = Rc) and to planes
-//              square to the axis (zc +- r = z)
-//   sphere     the same profile with R = 0
-//   cone       on its fixed axis, one tangent plane fixes it: the apex where the axis meets the plane,
-//              the half-angle from the plane's normal
-//   plane      moved (and, for a cone, turned) onto its more precise cylinder or cone
-// Every result passes the same acceptance as the shared axes, or the member keeps its surface.
-
-/** label pair "a|b" (a < b) -> Set of mesh vertices on their shared boundary. */
-function boundaries(mesh) {
-  const out = new Map();
-  for (let t = 0; t < mesh.T.length; t++) {
-    const [a, b, c] = mesh.T[t];
-    for (const [u, v] of [[a, b], [b, c], [c, a]]) {
-      const o = mesh.across(t, u, v);
-      if (o < 0 || mesh.F[o] === mesh.F[t] || o < t) continue;
-      const g1 = Math.min(mesh.F[t], mesh.F[o]), g2 = Math.max(mesh.F[t], mesh.F[o]);
-      const k = `${g1}|${g2}`;
-      let set = out.get(k);
-      if (!set) out.set(k, (set = new Set()));
-      set.add(u).add(v);
-    }
-  }
-  return out;
-}
-
-const dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-
-/** Circle fit, sum (|q - c| - r)^2 over 2D points q, subject to linear constraints A [cx, cy, r] = b. */
-function constrainedCircle(Q, x0, A, b) {
-  // project x0 onto the constraint set (least-norm correction)
-  const M = A.map((a) => A.map((c) => dot3(a, c)));
-  const res = A.map((a, i) => b[i] - dot3(a, x0));
-  const y = solve(M, res);
-  if (!y) return null;
-  let x = x0.map((xi, j) => xi + A.reduce((s, a, i) => s + a[j] * y[i], 0));
-  // an orthonormal basis of the null space of A
-  const rows = [];
-  for (const a of A) {
-    let v = a.slice();
-    for (const r of rows) { const d = dot3(v, r); v = v.map((xx, i) => xx - d * r[i]); }
-    const l = Math.hypot(...v);
-    if (!(l > 1e-12)) return null;                     // dependent constraints
-    rows.push(v.map((xx) => xx / l));
-  }
-  const N = [];
-  for (const e of [[1, 0, 0], [0, 1, 0], [0, 0, 1]]) {
-    let w = e.slice();
-    for (const r of [...rows, ...N]) { const d = dot3(w, r); w = w.map((xx, i) => xx - d * r[i]); }
-    const l = Math.hypot(...w);
-    if (l > 1e-9) N.push(w.map((xx) => xx / l));
-  }
-  for (let it = 0; it < 30 && N.length; it++) {
-    const k = N.length, JtJ = Array.from({ length: k }, () => new Array(k).fill(0)), Jtr = new Array(k).fill(0);
-    for (const [u, v] of Q) {
-      const du = u - x[0], dv = v - x[1], l = Math.hypot(du, dv) || 1e-300, r = l - x[2];
-      const Jx = [-du / l, -dv / l, -1];
-      const Jz = N.map((n) => dot3(Jx, n));
-      for (let i = 0; i < k; i++) { Jtr[i] += Jz[i] * r; for (let j = 0; j < k; j++) JtJ[i][j] += Jz[i] * Jz[j]; }
-    }
-    for (let i = 0; i < k; i++) JtJ[i][i] = JtJ[i][i] * (1 + 1e-9) + 1e-300;
-    const z = solve(JtJ, Jtr.map((v) => -v));
-    if (!z) break;
-    x = x.map((xi, j) => xi + N.reduce((s2, n, i) => s2 + n[j] * z[i], 0));
-    if (Math.max(...z.map(Math.abs)) < 1e-14 * (Math.abs(x[2]) + 1)) break;
-  }
-  return x;
-}
-
-/**
- * Least squares sum r(x)^2 subject to linear constraints A x = b, x in R^n: x projected onto the
- * constraints, then Gauss-Newton in their null space. resid(x) -> {r: [], J: [[n]]}. null if the
- * constraints are dependent.
- */
-function constrainedLsq(n, resid, x0, A0, b0) {
-  const dotn = (u, v) => u.reduce((s2, ui, i) => s2 + ui * v[i], 0);
-  // an independent subset of the constraints (redundant ones, e.g. two rims on one line touching the same
-  // pair of planes, are checked after the solve instead)
-  const A = [], b = [], basis = [];
-  A0.forEach((a, k) => {
-    let v = a.slice();
-    for (const r of basis) { const d = dotn(v, r); v = v.map((x, i) => x - d * r[i]); }
-    const l = Math.hypot(...v);
-    if (l > 1e-9 * Math.hypot(...a)) { basis.push(v.map((x) => x / l)); A.push(a); b.push(b0[k]); }
-  });
-  if (A.length) {
-    const M = A.map((a) => A.map((c) => dotn(a, c)));
-    const y = solve(M, A.map((a, i) => b[i] - dotn(a, x0)));
-    if (!y) return null;
-    x0 = x0.map((xi, j) => xi + A.reduce((s2, a, i) => s2 + a[j] * y[i], 0));
-  }
-  const rows = [];
-  for (const a of A) {
-    let v = a.slice();
-    for (const r of rows) { const d = dotn(v, r); v = v.map((x, i) => x - d * r[i]); }
-    const l = Math.hypot(...v);
-    if (!(l > 1e-12)) return null;
-    rows.push(v.map((x) => x / l));
-  }
-  const N = [];
-  for (let k = 0; k < n; k++) {
-    let w = Array.from({ length: n }, (_, i) => (i === k ? 1 : 0));
-    for (const r of [...rows, ...N]) { const d = dotn(w, r); w = w.map((x, i) => x - d * r[i]); }
-    const l = Math.hypot(...w);
-    if (l > 1e-9) N.push(w.map((x) => x / l));
-  }
-  let x = x0;
-  for (let it = 0; it < 30 && N.length; it++) {
-    const { r, J } = resid(x), k = N.length;
-    const JtJ = Array.from({ length: k }, () => new Array(k).fill(0)), Jtr = new Array(k).fill(0);
-    for (let m = 0; m < r.length; m++) {
-      const Jz = N.map((nn) => dotn(J[m], nn));
-      for (let i = 0; i < k; i++) { Jtr[i] += Jz[i] * r[m]; for (let j = 0; j < k; j++) JtJ[i][j] += Jz[i] * Jz[j]; }
-    }
-    for (let i = 0; i < k; i++) JtJ[i][i] = JtJ[i][i] * (1 + 1e-9) + 1e-300;
-    const z = solve(JtJ, Jtr.map((v) => -v));
-    if (!z) break;
-    x = x.map((xi, j) => xi + N.reduce((s2, nn, i) => s2 + nn[j] * z[i], 0));
-    if (Math.max(...z.map(Math.abs)) < 1e-14 * (Math.max(...x.map(Math.abs)) + 1)) break;
-  }
-  // the redundant constraints must hold too (they are consistent, or the case is not tangency)
-  const scale0 = Math.max(...x.map(Math.abs), 1);
-  for (let k = 0; k < A0.length; k++) if (Math.abs(dotn(A0[k], x) - b0[k]) > 1e-9 * scale0) return null;
-  return x;
-}
-
-/** Orthonormal (e1, e2) spanning the plane square to d. */
-function frameOf(d) {
-  const ref = Math.abs(d[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
-  const e1 = unit(cross(d, ref));
-  return [e1, cross(d, e1)];
-}
-
-function makeTangent(mesh, surfaces, weight, accepts, pts, cfg, locks, tangentSet = new Set()) {
-  const info = { tangent_pairs: 0, tangent_made: 0, tangent_rejected: 0 };
-  const cosT = Math.cos((cfg.TANGENT_DEG * Math.PI) / 180);
-  const par = 1e-9;                                    // "exactly" along / square, after the shared directions
-  const partners = new Map();                          // label -> labels meeting it tangentially
-  for (const [k, verts] of boundaries(mesh)) {
-    const [g1, g2] = k.split('|').map(Number);
-    const s1 = surfaces.get(g1), s2 = surfaces.get(g2);
-    if (!s1 || !s2 || !s1[1] || !s2[1] || !SNAPPABLE.has(s1[0]) || !SNAPPABLE.has(s2[0])) continue;
-    const cs = [...verts].map((v) => Math.abs(dot(distNormal(s1[0], s1[1], mesh.V[v])[1], distNormal(s2[0], s2[1], mesh.V[v])[1])));
-    cs.sort((a, b) => a - b);
-    if (!(cs[cs.length >> 1] >= cosT)) continue;      // median normal angle over TANGENT_DEG: a real edge
-    info.tangent_pairs++;
-    (partners.get(g1) ?? partners.set(g1, []).get(g1)).push(g2);
-    (partners.get(g2) ?? partners.set(g2, []).get(g2)).push(g1);
-  }
-  const W = (g) => weight.get(g) ?? 0;
-  // Shared lines first: the line's position in its cross-section and the radius of every cylinder on it,
-  // fitted to the cylinders' vertices subject to every tangent plane of any of them (a lug's rim is
-  // coaxial with its hole and tangent to both straight sides: the sides fix where the axis is). The other
-  // members are refitted about the moved line; the line moves only if every member still passes.
-  const doneLine = new Set();
-  for (const L of locks.lines) {
-    const d = L.d, [e1, e2] = frameOf(d), o = L.o;
-    const to2 = (x) => { const v = sub(x, o); return [dot(v, e1), dot(v, e2)]; };
-    const cyl = L.members.filter((g) => surfaces.get(g)?.[0] === 'cylinder' && pts.has(g));
-    const n = 2 + cyl.length, A = [], b = [], used = [];
-    cyl.forEach((g, i) => {
-      for (const h of partners.get(g) ?? []) {
-        const [k2, q] = surfaces.get(h);
-        if (k2 !== 'plane' || W(h) <= W(g) || L.members.includes(h)) continue;
-        const nn = unit(q.normal);
-        if (Math.abs(dot(nn, d)) > par) continue;
-        used.push(h);
-        const n2 = [dot(nn, e1), dot(nn, e2)], off = dot(sub(q.origin, o), nn), side = off > 0 ? -1 : 1;
-        const row = new Array(n).fill(0);
-        row[0] = side * n2[0]; row[1] = side * n2[1]; row[2 + i] = -1;
-        A.push(row); b.push(side * off);
-      }
-    });
-    if (!A.length) continue;
-    const Q = cyl.map((g) => pts.get(g).map(to2));
-    const resid = (x) => {
-      const r = [], J = [];
-      Q.forEach((qs, i) => {
-        for (const [u, v] of qs) {
-          const du = u - x[0], dv = v - x[1], l = Math.hypot(du, dv) || 1e-300;
-          r.push(l - x[2 + i]);
-          const row = new Array(n).fill(0);
-          row[0] = -du / l; row[1] = -dv / l; row[2 + i] = -1;
-          J.push(row);
-        }
-      });
-      return { r, J };
-    };
-    const x = constrainedLsq(n, resid, [0, 0, ...cyl.map((g) => surfaces.get(g)[1].radius)], A, b);
-    if (!x) continue;
-    const no = add(o, add(scale(e1, x[0]), scale(e2, x[1])));
-    const next = new Map();
-    let ok = true;
-    for (const g of L.members) {
-      const [kind, p] = surfaces.get(g);
-      const i = cyl.indexOf(g);
-      const np = i >= 0 ? { ...p, axisPoint: no, axis: d, radius: x[2 + i] } : refitAbout(kind, p, pts.get(g), no, d);
-      if (!np || !accepts(g, kind, np)) { ok = false; break; }
-      next.set(g, [kind, np]);
-    }
-    if (!ok) { info.tangent_lines_rejected = (info.tangent_lines_rejected ?? 0) + 1; continue; }
-    for (const [g, sp] of next) { surfaces.set(g, sp); doneLine.add(g); tangentSet.add(g); }
-    for (const h of used) tangentSet.add(h);
-    info.tangent_lines = (info.tangent_lines ?? 0) + 1;
-  }
-  for (const g of [...partners.keys()].sort((a, b) => W(b) - W(a))) {
-    if (doneLine.has(g) && surfaces.get(g)[0] === 'cylinder') continue;
-    if (!pts.has(g)) continue;
-    const [kind, p] = surfaces.get(g);
-    // references: more precise partners, and partners the shared step locked (they cannot move, so a
-    // movable member follows them whatever their precision)
-    const locked = (h) => locks.plane.has(h) || locks.dir.has(h) || locks.line.has(h);
-    const ref = partners.get(g).filter((h) => W(h) > W(g) || locked(h)).map((h) => [h, ...surfaces.get(h)]);
-    ref.sort((u, v) => (locked(v[0]) - locked(u[0])) || (W(v[0]) - W(u[0])));
-    if (!ref.length) continue;
-    const P = pts.get(g);
-    let np = null;
-    const used = [];                                   // the references the constraints came from
-    if (kind === 'cylinder') {
-      const d = unit(p.axis), [e1, e2] = frameOf(d), o = p.axisPoint;
-      const to2 = (x) => { const v = sub(x, o); return [dot(v, e1), dot(v, e2)]; };
-      const A = [], b = [];
-      for (const [h, k2, q] of ref) {
-        if (k2 !== 'plane') continue;
-        const n = unit(q.normal);
-        if (Math.abs(dot(n, d)) > par) continue;        // a tangent plane runs along the axis
-        used.push(h);
-        const n2 = [dot(n, e1), dot(n, e2)], off = dot(sub(q.origin, o), n);
-        const side = off > 0 ? -1 : 1;                  // the axis lies on this side of the plane
-        A.push([side * n2[0], side * n2[1], -1]); b.push(side * off);   // side (n2 . c - off) = r
-      }
-      if (A.length && locks.line.has(g)) { A.push([1, 0, 0], [0, 1, 0]); b.push(0, 0); }   // on a shared line: radius only
-      if (A.length && A.length <= (locks.line.has(g) ? 3 : 2)) {
-        const x = constrainedCircle(P.map(to2), [0, 0, p.radius], A, b);
-        if (x && x[2] > 0) np = { ...p, axisPoint: add(o, add(scale(e1, x[0]), scale(e2, x[1]))), radius: x[2] };
-      }
-    } else if (kind === 'torus' || kind === 'sphere') {
-      let axisD = kind === 'torus' ? unit(p.axis) : null;
-      if (!axisD) { const c = ref.find(([, k2]) => k2 === 'cylinder'); axisD = c ? unit(c[2].axis) : null; if (c) used.push(c[0]); }
-      if (axisD) {
-        const o = p.center;
-        const R0 = kind === 'torus' ? p.majorRadius : 0, r0 = kind === 'torus' ? p.minorRadius : p.radius;
-        const A = kind === 'sphere' ? [[1, 0, 0]] : [], b = kind === 'sphere' ? [0] : [];
-        for (const [h, k2, q] of ref) {
-          if (k2 === 'cylinder') {
-            const v = sub(q.axisPoint, o);
-            if (Math.abs(Math.abs(dot(unit(q.axis), axisD)) - 1) > par || norm(sub(v, scale(axisD, dot(v, axisD)))) > 1e-9 * mesh.diag) continue;
-            used.push(h);
-            A.push([1, 0, Math.sign(q.radius - R0) || 1]); b.push(q.radius);            // R + s r = Rc
-          } else if (k2 === 'plane') {
-            const n = unit(q.normal);
-            if (Math.abs(Math.abs(dot(n, axisD)) - 1) > par) continue;
-            used.push(h);
-            const zp = dot(sub(q.origin, o), axisD);
-            A.push([0, 1, Math.sign(zp) || 1]); b.push(zp);                              // zc + s r = z
-          }
-        }
-        const base = kind === 'sphere' ? 1 : 0;
-        if (A.length > base && A.length <= 2 + base) {
-          const Q = profile(P, o, axisD).map(([z, rho]) => [rho, z]);
-          const x = constrainedCircle(Q, [R0, 0, r0], A, b);
-          if (x && x[2] > 0) np = kind === 'torus'
-            ? { ...p, center: add(o, scale(axisD, x[1])), axis: axisD, majorRadius: x[0], minorRadius: x[2] }
-            : { ...p, center: add(o, scale(axisD, x[1])), radius: x[2] };
-        }
-      }
-    } else if (kind === 'cone') {
-      const d = unit(p.axis);
-      const pl = ref.find(([, k2, q]) => k2 === 'plane' && Math.abs(dot(unit(q.normal), d)) > 1e-3 && Math.abs(dot(unit(q.normal), d)) < 1 - 1e-3);
-      if (pl) {
-        const q = pl[2], n = unit(q.normal), t = dot(sub(q.origin, p.apex), n) / dot(d, n);
-        np = { ...p, apex: add(p.apex, scale(d, t)), halfAngle: Math.asin(Math.abs(dot(n, d))) };
-        used.push(pl[0]);
-      }
-    } else if (kind === 'plane') {
-      const n0 = unit(p.normal);
-      const cyl = ref.find(([, k2, q]) => k2 === 'cylinder' && Math.abs(dot(unit(q.axis), n0)) <= par);
-      const cone = ref.find(([, k2]) => k2 === 'cone');
-      if (cyl) {
-        const q = cyl[2], off = dot(sub(p.origin, q.axisPoint), n0), sgn = Math.sign(off) || 1;
-        np = { ...p, origin: add(p.origin, scale(n0, sgn * q.radius - off)) };
-        used.push(cyl[0]);
-      } else if (cone && !locks.dir.has(g)) {
-        const q = cone[2], a = unit(q.axis), sa = Math.sin(q.halfAngle), ca = Math.cos(q.halfAngle);
-        const s = Math.sign(dot(n0, a)) || 1, perp = sub(n0, scale(a, dot(n0, a)));
-        const nn = norm(perp) > 1e-9 ? add(scale(a, s * sa), scale(unit(perp), ca)) : null;
-        if (nn && (locks.perpTo.get(g) ?? []).every((f) => Math.abs(dot(nn, f)) <= 1e-9)) { np = { ...p, normal: nn, origin: q.apex }; used.push(cone[0]); }
-      }
-    }
-    if (!np) continue;
-    // a plane shared by several faces (one offset) moves as a whole, or not at all
-    const set = kind === 'plane' ? (locks.planeSet.get(g) ?? [g]) : [g];
-    if (set.every((h) => !pts.has(h) || accepts(h, kind, np))) {
-      for (const h of set) { surfaces.set(h, [kind, np]); tangentSet.add(h); }
-      // the references it was solved against hold the tangency too: the equal-size pass moving one leaves a
-      // near-tangent join the kernel builds slowly (00182468_37: 17 s -> 673 s)
-      for (const h of used) tangentSet.add(h);
-      info.tangent_made++;
-    } else info.tangent_rejected++;
-  }
-  return info;
-}
-
 // ── equal sizes ──────────────────────────────────────────────────────────────────────────────────────
 //
 // Design intent the part repeats: a pattern of identical holes, every chamfer at one angle, every fillet one
 // radius. Cylinder radii, cone half-angles and torus tube radii that agree within the fits' precision (capped
 // at VALUE_REL relative; cones at VALUE_ANGLE_DEG and CONE_REL) take one shared value, the precision-weighted
 // mean; each member then takes that value (nothing else moved) and must pass the usual acceptance.
-// Members of an exact tangency - the surface the tangency pass moved and the references its constraints came
-// from - keep their own value and share with no one:
-//   - moving a reference breaks the tangency, and the kernel builds the near-tangent join slowly (00182468_37:
-//     17 s -> 673 s);
-//   - a value the tangency fixed comes from the constraint, not the surface's own points: as a group's value it
-//     pulled twelve exact hole radii 6e-6 off on 00005406, and the build timed out (with it kept out, 77 s).
-// A joint solve that moves the tangent partners with the size would let them share too.
+// The groups are found before the tangency step. A group with a member in a set of tangent faces is solved with
+// that set (knit/tangency.js: the sizes held equal while the tangencies are made), since moving one member alone
+// breaks its tangency (and the kernel builds a near-tangent join slowly: 00182468_37, 17 s -> 673 s), and leaving
+// it out cost exact equality where it mattered most: two radius-4 pipes mitred at 30 degrees meet in two planar
+// ellipses only when the radii are equal (00009276_011, its elbow failed at 4.0000005 against 3.9999996).
+// The other groups are applied here.
 const VALUE_OF = { cylinder: (p) => p.radius, cone: (p) => p.halfAngle, torus: (p) => p.minorRadius };
 
-function shareValues(mesh, surfaces, weight, accepts, pts, rms0, cfg, locks, fixedSet, intent) {
-  const info = { values_shared: 0, values_rejected: 0 };
+/** The equal-size groups (two or more members): {kind, v, tol, items: [{g, p, v, tol, byIntent}]}. */
+function valueGroups(mesh, surfaces, weight, pts, rms0, cfg) {
+  const out = [];
   for (const kind of Object.keys(VALUE_OF)) {
     const items = [];
     for (const [g, sp] of surfaces) {
-      if (!sp || sp[0] !== kind || !sp[1] || !pts.has(g) || fixedSet.has(g)) continue;
+      if (!sp || sp[0] !== kind || !sp[1] || !pts.has(g)) continue;
       const P = pts.get(g);
       const c = scale(P.reduce((a, x) => add(a, x), [0, 0, 0]), 1 / P.length);
       const ext = Math.sqrt(P.reduce((a, x) => a + dot(sub(x, c), sub(x, c)), 0) / P.length) || mesh.diag;
@@ -860,7 +570,9 @@ function shareValues(mesh, surfaces, weight, accepts, pts, rms0, cfg, locks, fix
     // a cone's angle shares only within CONE_REL of itself too: near-zero angles (a cylinder fitted as a cone)
     // agree in absolute terms but pivoting one onto another moves its apex hundreds of times its distance
     const cap = (v) => (kind === 'cone' ? Math.min((cfg.VALUE_ANGLE_DEG * Math.PI) / 180, cfg.CONE_REL * Math.abs(v)) : cfg.VALUE_REL * Math.abs(v));
-    const floor = kind === 'cone' ? 1e-9 : 10 * cfg.FLOOR * mesh.diag;
+    // the floor, FLOOR x diagonal, is about ten times float32's rounding: at ten times that, radii of 0.5 and 0.4997
+    // that the fits tell apart to 1e-6 were made equal once tangent faces could share (00002312_012)
+    const floor = kind === 'cone' ? 1e-9 : cfg.FLOOR * mesh.diag;
     const groups = [];
     for (const it of [...items].sort((a, b) => b.w - a.w)) {
       const intentTol = kind === 'cone' ? (cfg.INTENT_DEG * Math.PI) / 180 : cfg.INTENT_REL * Math.abs(it.v);
@@ -872,15 +584,25 @@ function shareValues(mesh, surfaces, weight, accepts, pts, rms0, cfg, locks, fix
     }
     for (const k of groups) {
       if (k.items.length < 2) continue;
-      for (const it of k.items) {
-        if (it.v === k.v) continue;
-        const np = withValue(kind, it.p, k.v, pts.get(it.g));
-        // the intent floor only for a member that joined on the intent tolerance; one that agrees within
-        // precision (all of them on an exact mesh) is judged like any other move
-        if (Math.abs(it.v - k.v) > cfg.SIGMA_K * (it.tol + k.tol) + floor) intent.add(it.g);
-        if (np && accepts(it.g, kind, np)) { surfaces.set(it.g, [kind, np]); info.values_shared++; }
-        else info.values_rejected++;
-      }
+      // the intent floor only for a member that joined on the intent tolerance; one that agrees within
+      // precision (all of them on an exact mesh) is judged like any other move
+      for (const it of k.items) it.byIntent = Math.abs(it.v - k.v) > cfg.SIGMA_K * (it.tol + k.tol) + floor;
+      out.push({ kind, v: k.v, tol: k.tol, items: k.items });
+    }
+  }
+  return out;
+}
+
+/** Each group's shared value applied to its members (nothing else moved), groups touching `skip` left out. */
+function shareValues(surfaces, groups, accepts, pts, skip) {
+  const info = { values_shared: 0, values_rejected: 0 };
+  for (const k of groups) {
+    if (k.items.some((it) => skip.has(it.g))) continue;
+    for (const it of k.items) {
+      if (it.v === k.v) continue;
+      const np = withValue(k.kind, surfaces.get(it.g)[1], k.v, pts.get(it.g));
+      if (np && accepts(it.g, k.kind, np)) { surfaces.set(it.g, [k.kind, np]); info.values_shared++; }
+      else info.values_rejected++;
     }
   }
   return info;
