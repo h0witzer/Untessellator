@@ -1595,22 +1595,27 @@ async function exportStep({ checked = false } = {}) {
         (b) => finished.set(b.id, { brep: b.brep, report: b.report }));
     } catch (error) {
       if (error.name === 'AbortError') throw error;
-      // A single OCCT repair on badly fitting surfaces can run for most of an hour and cannot be
-      // interrupted, so the worker is stopped and a fresh one exports the mesh itself. A build that throws
-      // can leave the kernel's memory corrupt (its fallback then fails too: "table index is out of bounds"),
-      // so that too gets a fresh worker for the faceted solid.
-      const timedOut = error.name === 'TimeoutError';
-      // the bodies that finished stay as built; only the rest go out as facets
-      const keep = [...finished];
-      const rest = keep.length ? `the ${plural(payload.names.length - keep.length, 'body', 'bodies')} still building` : 'the mesh';
-      say(timedOut
-        ? `The surfaces took over ${Math.round(EXPORT_HARD_STOP_S / 60)} minutes to join; exporting ${rest} as a faceted solid…`
-        : `The solid build failed (${failureText(error.message)}); exporting ${rest} as a faceted solid…`, true);
-      busy.step(timedOut ? `The surfaces took too long to join: building ${rest} as flat facets…` : `The build failed: building ${rest} as flat facets…`);
-      result = await knitInWorker({ ...payload, options: { mode: 'faceted', ...(keep.length ? { keep } : {}) } }, progress, Infinity, run);
-      if (keep.length) result.report.keptBodies = keep.length;
-      if (timedOut) result.report.timedOut = true;
-      else result.report.failed = error.message;
+      if (error.name === 'TimeoutError' && error.interim) {
+        // stopped during the face-path rung: the knitter had finished, so its result is the export (no preview)
+        result = { step: error.interim.step, report: error.interim.report, preview: null };
+      } else {
+        // A single OCCT repair on badly fitting surfaces can run for most of an hour and cannot be
+        // interrupted, so the worker is stopped and a fresh one exports the mesh itself. A build that throws
+        // can leave the kernel's memory corrupt (its fallback then fails too: "table index is out of bounds"),
+        // so that too gets a fresh worker for the faceted solid.
+        const timedOut = error.name === 'TimeoutError';
+        // the bodies that finished stay as built; only the rest go out as facets
+        const keep = [...finished];
+        const rest = keep.length ? `the ${plural(payload.names.length - keep.length, 'body', 'bodies')} still building` : 'the mesh';
+        say(timedOut
+          ? `The surfaces took over ${Math.round(EXPORT_HARD_STOP_S / 60)} minutes to join; exporting ${rest} as a faceted solid…`
+          : `The solid build failed (${failureText(error.message)}); exporting ${rest} as a faceted solid…`, true);
+        busy.step(timedOut ? `The surfaces took too long to join: building ${rest} as flat facets…` : `The build failed: building ${rest} as flat facets…`);
+        result = await knitInWorker({ ...payload, options: { mode: 'faceted', ...(keep.length ? { keep } : {}) } }, progress, Infinity, run);
+        if (keep.length) result.report.keptBodies = keep.length;
+        if (timedOut) result.report.timedOut = true;
+        else result.report.failed = error.message;
+      }
     }
     const { step, report } = result;
     // after a Repair, with nothing edited since: its changes stay only if this export is not worse than the one before
@@ -2640,13 +2645,14 @@ function takeWorker() {
 function knitInWorker(payload, onStatus, limitS = Infinity, run = {}, onBody = null) {
   return new Promise((resolve, reject) => {
     const worker = takeWorker();
-    let timer = null;
+    let timer = null, interim = null;
     const finish = () => { clearTimeout(timer); worker.terminate(); warmKernel(); };   // the next build's kernel loads now
     if (Number.isFinite(limitS)) {
       timer = setTimeout(() => {
         finish();
         const error = new Error(`the solid build took longer than ${limitS} s`);
         error.name = 'TimeoutError';
+        error.interim = interim;                  // the knitter's result, when the stop came during the face-path rung
         reject(error);
       }, limitS * 1000);
     }
@@ -2660,6 +2666,7 @@ function knitInWorker(payload, onStatus, limitS = Infinity, run = {}, onBody = n
       const who = data.body != null && payload.names?.length > 1 ? `${payload.names[data.body]}: ` : '';
       if (data.type === 'status') onStatus(`${who}${data.text}`);
       else if (data.type === 'body') onBody?.(data);
+      else if (data.type === 'interim') interim = data;
       else if (data.type === 'progress') {
         if (data.freeform) onStatus(`${who}Fitting freeform surfaces… ${data.freeform} of ${data.of}`, data.freeform / data.of);
         else onStatus(`${who}Building the solid… attempt ${data.builds}`);

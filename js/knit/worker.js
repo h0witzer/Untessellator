@@ -10,7 +10,8 @@
  * only); report.info.path is 'faces' when it was taken, report.info.face_path why not when it was not. A knitted
  * solid with facets in it (or no solid) then gets the face path once more, with the groups the knitter could build
  * only as facets fitted as B-splines (knit/facePath.js faceAfterKnit); report.info.face_after_knit says why not
- * when the knitter's result stays.
+ * when the knitter's result stays. Before that rung the worker posts {type: 'interim', step, report}: the knitter's
+ * result, which the studio keeps if it stops the worker during the rung.
  *
  * Message in:  {positions: Float64Array (9 per triangle), labels: Int32Array, surfaces: [[id, [type,
  *               params]], ...], options: {budget?, fallback?, deadline?, mode?, keep?, facePath?}, repair?: true,
@@ -82,6 +83,11 @@ self.onmessage = async ({ data }) => {
     // never facets: a solid with facets in it (or none at all) gets the face path as one more rung, the facet groups
     // fitted as B-splines (knit/facePath.js faceAfterKnit); the knitter's result stays when that does not pass
     if (!keep && options.facePath !== false && (!solid || (report.facetArea ?? 0) > 0)) {
+      // the knitter's own result first, so a hard stop during the rung keeps it rather than faceting the whole mesh
+      if (solid) {
+        try { self.postMessage({ type: 'interim', step: writeStep(oc, solid, solidNames ? { names: solidNames, part } : {}), report }); }
+        catch (err) { console.warn('no interim STEP:', err?.message ?? err); }
+      }
       self.postMessage({ type: 'status', text: 'Fitting B-spline faces where the solid has facets…' });
       const left = (options.deadline ?? 150) - (performance.now() - tStart) / 1000;
       const fa = faceAfterKnit(oc, { positions, labels, surfaces: new Map(surfaces), oriented }, report,
