@@ -241,6 +241,27 @@ export function fitCurve(pts, { ts = null, closed = false, tol = 0, spans = 1, m
   return best ?? fitOn(dataKnots(ts, 1));
 }
 
+/** The closest point to x on the row of S where coordinate k (0: u, 1: v) is val: the other parameter, by Newton
+ * from t (clamped to [lo, hi], halving a step that does not get closer). */
+function isoClosest(S, x, k, val, t, lo, hi) {
+  const at = (s) => (k === 0 ? S.eval(val, s, 2) : S.eval(s, val, 2));
+  let d = at(t), r = sub(d.S, x), cur = dot(r, r);
+  for (let it = 0; it < 16; it++) {
+    const D1 = k === 0 ? d.Sv : d.Su, D2 = k === 0 ? d.Svv : d.Suu;
+    const g = dot(r, D1), h = dot(D1, D1) + dot(r, D2);
+    let step = h > 0 ? -g / h : -g / Math.max(dot(D1, D1), 1e-300), nt, nd, nr, nx;
+    for (let tries = 0; tries < 8; tries++, step /= 2) {
+      nt = Math.min(hi, Math.max(lo, t + step)); nd = at(nt); nr = sub(nd.S, x); nx = dot(nr, nr);
+      if (nx <= cur) break;
+    }
+    if (!(nx <= cur)) break;
+    const moved = Math.abs(nt - t);
+    t = nt; d = nd; r = nr; cur = nx;
+    if (moved <= 1e-14 * (hi - lo)) break;
+  }
+  return t;
+}
+
 // ── the solid ────────────────────────────────────────────────────────────────────────────────────────────────
 
 export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT.TOL, fits = null, surfaces = null } = {}) {
@@ -319,8 +340,8 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
   // are tangent breaks, not the border's curvature between vertices.)
   const sidesOf = (gi) => {
     const g = groups[gi];
-    if (g.loops.length !== 1 || g.loopChains[0].length < 4) return null;
-    const loop = g.loops[0], n = loop.length, { local, Vg, Tg } = meshes[gi];
+    if (g.loops.length !== 1 || g.loopChains[0].length < 3) return null;
+    const loop = g.loops[0], n = loop.length, { local, Vg, Tg } = meshes[gi], turns = [];
     const starts = new Set(g.loopChains[0].map((e) => { const v = chains[e.c].verts; return e.rev ? v[v.length - 1] : v[0]; }));
     const { vn } = meshNormals(Vg, Tg);
     const at = [];
@@ -331,14 +352,21 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
       let d0 = sub(vertices[v], vertices[loop[(i - 1 + n) % n]]), d1 = sub(vertices[loop[(i + 1) % n]], vertices[v]);
       if (ln > 0) { const u = nr.map((x) => x / ln); d0 = sub(d0, u.map((x) => x * dot(d0, u))); d1 = sub(d1, u.map((x) => x * dot(d1, u))); }
       const l0 = len(d0), l1 = len(d1);
-      if (l0 > 0 && l1 > 0 && Math.acos(Math.max(-1, Math.min(1, dot(d0, d1) / (l0 * l1)))) > CORNER_TURN) at.push(i);
+      const turn = l0 > 0 && l1 > 0 ? Math.acos(Math.max(-1, Math.min(1, dot(d0, d1) / (l0 * l1)))) : 0;
+      if (turn > CORNER_TURN) { at.push(i); turns.push(turn); }
     }
-    if (at.length !== 4) return null;
-    return at.map((i0, s) => {
+    if (at.length !== 4 && at.length !== 3) return null;
+    const sides = at.map((i0, s) => {
       const side = [];
-      for (let i = i0; ; i = (i + 1) % n) { side.push(local.get(loop[i])); if (i === at[(s + 1) % 4]) break; }
+      for (let i = i0; ; i = (i + 1) % n) { side.push(local.get(loop[i])); if (i === at[(s + 1) % at.length]) break; }
       return side;
     });
+    if (at.length === 4) return sides;
+    // three corners: the sharpest is the tip, where the face's width runs out (the border doubling back on itself, as
+    // a fillet's two rails meet); the rectangle's side there collapses onto it: [rail into the tip, the tip, rail out
+    // of it, the third side]
+    const t = turns.indexOf(Math.max(...turns));
+    return [sides[(t + 2) % 3], [local.get(loop[at[t]])], sides[t], sides[(t + 1) % 3]];
   };
 
   // a four-sided face's sides are its surface's boundary rows, and a side with few vertices leaves its row to
@@ -415,7 +443,7 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
     if (folded > area / Tg.length) { fail(g.label, `its surface folds under it (${((100 * folded) / area).toFixed(1)} % of its area)`); return null; }
     const seed = new Map();
     for (const [v, l] of local) { const uv = fit.vertexUV.get(l); if (uv) seed.set(v, uv); }
-    return { g, gi, S, params: fit.params, periodic, analytic, sense: vote >= 0, info: fit.info, seed, shift: 0 };
+    return { g, gi, S, params: fit.params, periodic, analytic, sense: vote >= 0, info: fit.info, seed, shift: 0, sideOf: fit.sideOf ?? null };
   });
   if (problems.length) return stop();
 
@@ -638,10 +666,51 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
 
   // pcurves: the edge curve's points projected onto each of its faces' surfaces, fitted on the edge's knots
   let edgeTol = 0;
+  // an edge along a side of a four- or three-sided face lies on the surface's boundary row there: its pcurve is that
+  // side's line in the parameters, each sample placed along the row (the other parameter held). Which line: the held
+  // coordinate its vertices share (the face's fit reports each border vertex's; a three-sided face's tip is on both
+  // rails, its own held u being the row it collapses to). A free projection there is ill-posed at a collapsed tip.
+  const isoOf = (face, ch) => {
+    const so = face.sideOf;
+    if (!so) return null;
+    const { local } = meshes[face.gi];
+    let cand = null, tipIn = false;
+    for (const v of ch.vid) {
+      if (v < 0) continue;
+      const l = local.get(v);
+      if (l === so.tip) { tipIn = true; continue; }
+      const h = so.held.get(l);
+      if (!h) return null;
+      const here = [0, 1].filter((k) => !Number.isNaN(h[k])).map((k) => [k, h[k]]);
+      cand = cand ? cand.filter(([k, x]) => here.some(([k2, x2]) => k2 === k && x2 === x)) : here;
+      if (!cand.length) return null;
+    }
+    if (tipIn && cand) { const tu = so.held.get(so.tip)?.[0]; cand = cand.filter(([k, x]) => !(k === 0 && x !== tu)); }
+    return cand?.length === 1 ? cand[0] : null;
+  };
   const pcurveOn = (face, curve, ch) => {
     const { S, periodic } = face, [u0, u1] = S.dom, P = u1 - u0;
     const spans = new Set(curve.knots).size - 1, m = Math.max(24, 8 * spans);
     const ts = Array.from({ length: m + 1 }, (_, j) => j / m), uv = [];
+    const iso = isoOf(face, ch);
+    if (iso) {
+      const [k, val] = iso, [a, b] = k === 0 ? [S.dom[2], S.dom[3]] : [S.dom[0], S.dom[1]];
+      let t = null;
+      for (const s of ts) {
+        const x = curveAt(curve, s)[0];
+        if (t === null) {                          // the first: the nearest of samples along the row, then refined
+          let best = Infinity;
+          for (let j = 0; j <= 64; j++) { const y = a + ((b - a) * j) / 64, q = k === 0 ? S.eval(val, y).S : S.eval(y, val).S, e = len(sub(q, x)); if (e < best) { best = e; t = y; } }
+        }
+        t = isoClosest(S, x, k, val, t, a, b);
+        uv.push(k === 0 ? [val, t] : [t, val]);
+      }
+      const pc = fitCurve(uv, { ts, knots: curve.knots });
+      let et = 0;
+      for (const s of ts) et = Math.max(et, len(sub(S.eval(...curveAt(pc, s)[0]).S, curveAt(curve, s)[0])));
+      edgeTol = Math.max(edgeTol, et);
+      return { pc, dir: Math.sign(uv[m][0] - uv[0][0]), tol: et };
+    }
     // the chain's points' chord-length parameters (as the curve was fitted), to find each sample's nearest vertex
     const pts = ch.ring ? [...ch.pts, ch.pts[0]] : ch.pts, vid = ch.ring ? [...ch.vid, ch.vid[0]] : ch.vid, d = [0];
     for (let i = 1; i < pts.length; i++) d.push(d[i - 1] + len(sub(pts[i], pts[i - 1])));
@@ -708,6 +777,8 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
       const areas = loops.map((entries) => {
         let a = 0;
         for (const e of entries) for (let j = 0; j < 16; j++) { const p = uvAt(e, f.gi, j / 16), q = uvAt(e, f.gi, (j + 1) / 16); a += p[0] * q[1] - p[1] * q[0]; }
+        // (and across any gap between one edge's end and the next's start: a three-sided face's collapsed side)
+        entries.forEach((e, i) => { const p = uvAt(e, f.gi, 1), q = uvAt(entries[(i + 1) % entries.length], f.gi, 0); a += p[0] * q[1] - p[1] * q[0]; });
         return Math.abs(a);
       });
       const outer = areas.indexOf(Math.max(...areas));

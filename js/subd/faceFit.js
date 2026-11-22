@@ -373,16 +373,27 @@ function lscmSolve(V, T, pin, shift, period) {
  * vertex sits at its share of its side's length; the inside is harmonic (the conformal map's system with the whole
  * border held, whose minimum is then the cotangent-weight harmonic map), folded slivers untangled with the border
  * held. A surface over the rectangle has the face's edges for its own edges: its rows run along the face and across
- * it, and none hangs outside it. {uv, W, H} or null (not a disk, the sides not its border, folds left).
+ * it, and none hangs outside it.
+ *
+ * A three-sided face comes as four sides one of which is a single vertex: its tip, where its two long sides (rails)
+ * meet, as a fillet runs out to a point. It is the rectangle with that side collapsed onto the tip, as CAD writes such
+ * a face (the surface's row there all one point): the face is mapped harmonically onto a triangle (its third side
+ * the rectangle's far side, the tip the apex), then each line across from rail to rail is stretched to the full
+ * height, so the rails lie on the rectangle's sides and the tip on the whole collapsed side (the tip itself at its
+ * middle). u runs along the rails.
+ *
+ * {uv, W, H, collapse ('lo' | 'hi': the u end collapsed, or null), tip} or null (not a disk, the sides not its
+ * border, folds left).
  */
 export function rectParam(V, T, sides) {
   const nV = V.length, cnt = edgeCounts(T);
   if (sides?.length !== 4 || nV - cnt.size + T.length !== 1 || components(T, nV) !== 1) return null;
-  let nb = 0, m = 0;
-  for (const c of cnt.values()) if (c === 1) nb++;
+  let nb = 0, m = 0, c = -1;
+  for (const x of cnt.values()) if (x === 1) nb++;
   for (let s = 0; s < 4; s++) {
     const side = sides[s];
-    if (side.length < 2 || side[side.length - 1] !== sides[(s + 1) % 4][0]) return null;
+    if (!side.length || side[side.length - 1] !== sides[(s + 1) % 4][0]) return null;
+    if (side.length === 1) { if (c >= 0) return null; c = s; continue; }
     for (let i = 0; i + 1 < side.length; i++) {
       const a = side[i], b = side[i + 1];
       if (cnt.get(a < b ? `${a}_${b}` : `${b}_${a}`) !== 1) return null;
@@ -392,16 +403,41 @@ export function rectParam(V, T, sides) {
   if (m !== nb) return null;                       // every border edge once
   const runs = sides.map((side) => { const d = [0]; for (let i = 1; i < side.length; i++) d.push(d[i - 1] + norm(sub(V[side[i]], V[side[i - 1]]))); return d; });
   const L = runs.map((d) => d[d.length - 1]);
-  if (!L.every((x) => x > 0)) return null;
-  const k0 = L[0] + L[2] >= L[1] + L[3] ? 0 : 1;   // the longer pair along u
-  const W = (L[k0] + L[k0 + 2]) / 2, H = (L[k0 + 1] + L[(k0 + 3) % 4]) / 2;
+  if (!L.every((x, s) => x > 0 || s === c)) return null;
+  // the longer pair along u (with a collapsed side: the rails, the pair without it)
+  const k0 = c >= 0 ? (c + 1) % 2 : L[0] + L[2] >= L[1] + L[3] ? 0 : 1;
+  const W = (L[k0] + L[k0 + 2]) / 2, H = c >= 0 ? L[(c + 2) % 4] : (L[k0 + 1] + L[(k0 + 3) % 4]) / 2;
+  const jc = c >= 0 ? (c - k0 + 4) % 4 : -1;       // the collapsed side's place: 1 (u = W) or 3 (u = 0)
   const corner = [[0, 0], [W, 0], [W, H], [0, H]], pin = new Map();
+  if (jc === 1) corner[1] = corner[2] = [W, H / 2];
+  if (jc === 3) corner[3] = corner[0] = [0, H / 2];
   for (let j = 0; j < 4; j++) {
+    if (j === jc) continue;
     const s = (k0 + j) % 4, a = corner[j], b = corner[(j + 1) % 4];
     sides[s].forEach((q, i) => { const w = runs[s][i] / L[s]; pin.set(q, [a[0] + w * (b[0] - a[0]), a[1] + w * (b[1] - a[1])]); });
   }
   const uv = lscmSolve(V, T, pin, null, 0);
-  return uv ? { uv, W, H } : null;
+  if (!uv) return null;
+  if (c < 0) return { uv, W, H, collapse: null, tip: -1 };
+  // the triangle stretched onto the rectangle: at each u the rails are at vA (bottom) and vB (top); v from rail to
+  // rail scaled to the full height (in the map's own sense: settle may have mirrored v). The border exact: the rails
+  // on v = 0 and H, the third side where it was pinned, the tip at the collapsed side's middle.
+  const tip = sides[c][0], mir = uv.some((q, i) => pin.has(i) && pin.get(i)[1] !== 0 && q[1] === -pin.get(i)[1]) ? -1 : 1;
+  const onSide = new Map();
+  for (let j = 0; j < 4; j++) if (j !== jc) for (const q of sides[(k0 + j) % 4]) if (!onSide.has(q)) onSide.set(q, j);
+  const out = uv.map((q, i) => {
+    const u = q[0], v = mir * q[1];
+    if (i === tip) return [u, (mir * H) / 2];
+    const t = jc === 1 ? u / W : 1 - u / W, vA = (H / 2) * t, vB = H - (H / 2) * t;
+    let v2 = vB - vA > 1e-12 * H ? (H * (v - vA)) / (vB - vA) : H / 2;
+    const j = onSide.get(i);
+    if (j === 0) v2 = 0;
+    else if (j === 2) v2 = H;
+    else if (j === (jc + 2) % 4) v2 = v;         // the third side: where it was pinned (between the rails' ends)
+    return [u, mir * Math.min(H, Math.max(0, v2))];
+  });
+  // the rails' ends at the tip: the rail vertices' u along them, exact on the rectangle's sides
+  return { uv: out, W, H, collapse: jc === 1 ? 'hi' : 'lo', tip };
 }
 
 /**
@@ -585,7 +621,7 @@ function thinPlate(M, tu, tv, nv, lam, wrap = 0) {
 
 const bandOf = (nv, wrap) => (wrap ? (P_ + 1) * wrap : P_ * nv + P_);
 
-function solveNet(tu, tv, U, Vv, X, lamAbs, wrap = 0) {
+function solveNet(tu, tv, U, Vv, X, lamAbs, wrap = 0, collapse = null) {
   const nu = tu.length - P_ - 1, nv = wrap || tv.length - P_ - 1, n = nu * nv;
   const M = new Band(n, bandOf(nv, wrap));
   const rhs = new Float64Array(n * 3);
@@ -593,8 +629,20 @@ function solveNet(tu, tv, U, Vv, X, lamAbs, wrap = 0) {
   thinPlate(M, tu, tv, nv, lamAbs, wrap);
   const ridge = (1e-12 * tr) / n;
   for (let i = 0; i < n; i++) M.add(i, i, ridge);
+  // collapse: the first ('lo') or last ('hi') row along u one point (a three-sided face's tip): its poles held
+  // together (a stiff tie between neighbours, then their mean exactly)
+  const ci = collapse === 'lo' ? 0 : collapse === 'hi' ? nu - 1 : -1;
+  if (ci >= 0) {
+    const w = (1e6 * tr) / n;
+    for (let j = 0; j + 1 < nv; j++) { const a = ci * nv + j, b = a + 1; M.add(a, a, w); M.add(b, b, w); M.add(a, b, -w); }
+  }
   const P = M.solve(rhs);
   if (!P) return null;
+  if (ci >= 0) {
+    const mean = [0, 0, 0];
+    for (let j = 0; j < nv; j++) for (let c = 0; c < 3; c++) mean[c] += P[(ci * nv + j) * 3 + c] / nv;
+    for (let j = 0; j < nv; j++) for (let c = 0; c < 3; c++) P[(ci * nv + j) * 3 + c] = mean[c];
+  }
   if (!wrap) return new Surface(P, nu, nv, tu, tv, P_, P_);
   // the unwrapped form: the first P_ columns repeated at the end, over the periodic knot vector
   const W = nv + P_, Q = new Float64Array(nu * W * 3);
@@ -627,7 +675,9 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
   // rectangle's (rectParam), unless it is a plane (exact, below, on its projection: simpler still)
   let rect;
   const rectOf = () => (rect === undefined ? (rect = sides ? rectParam(V, T, sides) : null) : rect);
-  if (!uv && rectOf()) { uv = rect.uv; info.param = 'four-sided'; }
+  const onRect = () => info.param === 'four-sided' || info.param === 'three-sided';
+  const toRect = () => { uv = rect.uv; info.param = rect.collapse ? 'three-sided' : 'four-sided'; };
+  if (!uv && rectOf()) toRect();
   if (!uv) {
     uv = lscm(V, T);
     info.param = 'lscm';
@@ -657,7 +707,7 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
       uv = uv.map((q) => [q[1], ((q[0] % period) + period) % period]);
       for (const q of uv) { lo[0] = Math.min(lo[0], q[0]); hi[0] = Math.max(hi[0], q[0]); }
       lo[1] = 0; hi[1] = period;
-    } else if (info.param === 'four-sided') {
+    } else if (onRect()) {
       // the rectangle itself: its sides are the face's edges, no margin
       for (const q of uv) for (let k = 0; k < 2; k++) { lo[k] = Math.min(lo[k], q[k]); hi[k] = Math.max(hi[k], q[k]); }
     } else {
@@ -671,7 +721,7 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
       for (const q of uv) for (let k = 0; k < 2; k++) { lo[k] = Math.min(lo[k], q[k]); hi[k] = Math.max(hi[k], q[k]); }
     }
     ext = [Math.max(hi[0] - lo[0], 1e-9 * scale), Math.max(hi[1] - lo[1], 1e-9 * scale)];
-    if (info.param !== 'four-sided') for (let k = 0; k < (period ? 1 : 2); k++) { const m = FIT.MARGIN * ext[k] + 1e-6 * scale; lo[k] -= m; hi[k] += m; }
+    if (!onRect()) for (let k = 0; k < (period ? 1 : 2); k++) { const m = FIT.MARGIN * ext[k] + 1e-6 * scale; lo[k] -= m; hi[k] += m; }
   };
   box();
   if (info.param === 'plane') {
@@ -680,7 +730,7 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
       Object.assign(info, { spans: [1, 1], rounds: 0, holdout: 0, max_err: flat.maxErr / scale, rms_err: flat.rmsErr / scale, exact: 'plane' });
       return { params: flat.params, info, vertexUV: new Map(uv.map((q, i) => [i, [q[0], q[1]]])) };
     }
-    if (rectOf()) { uv = rect.uv; info.param = 'four-sided'; box(); }
+    if (rectOf()) { toRect(); box(); }
   }
   // data: all vertices, or the boundary plus a sample of the interior
   const cnt = edgeCounts(T);
@@ -706,6 +756,8 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
     for (const { x, a, b, w, soft: sf } of extra) {
       soft.push(!!sf);
       let ua = uv[a][0], va = uv[a][1], ub = uv[b][0], vb = uv[b][1];
+      // (beside a collapsed tip the point is on the rail: the tip's v is the rail's there)
+      if (rect?.collapse && onRect()) { if (a === rect.tip) va = vb; else if (b === rect.tip) vb = va; }
       if (period) { if (vb - va > period / 2) vb -= period; else if (va - vb > period / 2) vb += period; }
       let v2 = va + w * (vb - va);
       if (period) v2 = ((v2 % period) + period) % period;
@@ -758,12 +810,13 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
   // a hair inside the domain, and the rows next to the boundary, which then barely touch any point, are left to the
   // round-off: a strip with no vertices between its rims folds its boundary row back and forth along a straight edge.
   const lockU = new Float64Array(X.length).fill(NaN), lockV = new Float64Array(X.length).fill(NaN);
-  if (info.param === 'four-sided') {
+  if (onRect()) {
     for (let k = 0; k < X.length; k++) {
       if (U[k] === lo[0] || U[k] === hi[0]) lockU[k] = U[k];
       if (Vv[k] === lo[1] || Vv[k] === hi[1]) lockV[k] = Vv[k];
     }
   }
+  const collapse = info.param === 'three-sided' ? rect.collapse : null;
   const project = (S) => {
     for (let k = 0; k < X.length; k++) {
       const lu = !Number.isNaN(lockU[k]), lv = !Number.isNaN(lockV[k]);
@@ -802,14 +855,14 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
     for (let k = 0; k < nV; k++) {
       if (!trusted[idx[k]]) continue;
       const d = S2.eval(U[k], Vv[k], 1), s1 = dot(cross(d.Su, d.Sv), vn[idx[k]]);
-      if (s1 > 0) pos += va[idx[k]]; else neg += va[idx[k]];
+      if (s1 > 0) pos += va[idx[k]]; else if (s1 < 0) neg += va[idx[k]];   // (none at a collapsed tip)
     }
     return Math.min(pos, neg) > meshArea / T.length;
   };
   for (let rnd = 0; rnd <= FIT.REFINE_ROUNDS; rnd++) {
     if (rnd > 0 && S && folds(S)) { U.set(U0); Vv.set(V0); }
     for (let it = 0; it < FIT.CORRECT_ITERS; it++) {
-      const s2 = solveNet(tu, tv, F.map((k) => U[k]), F.map((k) => Vv[k]), F.map((k) => X[k]), lamAbs, wrap);
+      const s2 = solveNet(tu, tv, F.map((k) => U[k]), F.map((k) => Vv[k]), F.map((k) => X[k]), lamAbs, wrap, collapse);
       if (!s2) break;
       S = s2;
       project(S);
@@ -853,7 +906,7 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
   ({ tu, tv, wrap } = best);
   U = best.U; Vv = best.V;
   for (let it = 0; it < FIT.CORRECT_ITERS; it++) {
-    const s2 = solveNet(tu, tv, U, Vv, X, lamAbs, wrap);
+    const s2 = solveNet(tu, tv, U, Vv, X, lamAbs, wrap, collapse);
     if (!s2) break;
     S = s2;
     project(S);
@@ -868,7 +921,14 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
   // returned surface's (u, v): the round direction first when it wraps
   const vertexUV = new Map();
   for (let k = 0; k < nV; k++) vertexUV.set(idx[k], wrap ? [Vv[k], U[k]] : [U[k], Vv[k]]);
-  return { params: wrap ? uPeriodic(S) : S.toParams(), info, vertexUV };
+  // four- / three-sided: each border vertex's held coordinates ([u | NaN, v | NaN]: on which side it lies), and the
+  // collapsed tip, so faceSolid lays the edges' pcurves along the sides
+  let sideOf = null;
+  if (onRect()) {
+    sideOf = { held: new Map(), tip: rect.collapse ? rect.tip : -1 };
+    for (let k = 0; k < nV; k++) if (!Number.isNaN(lockU[k]) || !Number.isNaN(lockV[k])) sideOf.held.set(idx[k], [lockU[k], lockV[k]]);
+  }
+  return { params: wrap ? uPeriodic(S) : S.toParams(), info, vertexUV, sideOf };
 }
 
 /**
