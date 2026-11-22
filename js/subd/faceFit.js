@@ -5,7 +5,8 @@
  * holes, folded slivers untangled, exact planes, the thin-plate weight per bending term, nets no larger than the data
  * supports, refinement restarted from the map after a folded net, points of the face's edges as data (extra), and a
  * four-sided face (sides) mapped onto a rectangle with its sides on the rectangle's (rectParam), its border points
- * held on their sides, so the surface's edges are the face's own and its net follows the face.
+ * held on their sides, so the surface's edges are the face's own and its net follows the face; a three-sided face
+ * the same with the side at its tip collapsed; and the bending term measured in 3D (the map's own stretch).
  *
  * freeformFit.js — one untrimmed bicubic B-spline surface per mesh group, for groups no analytic surface
  * fits. A port of the core of ml/freeform_fit.py (measured there on 2105 ABC freeform faces: found3
@@ -520,6 +521,47 @@ function clamped(lo, hi, spans) {
   return t;
 }
 
+/**
+ * The map's stretch, as thinPlate's metric: (u, v) -> [su, sv], the 3D length per unit u and per unit v at the
+ * vertex nearest (u, v) in the map (each vertex's: its triangles' map Jacobians' column lengths, area weighted).
+ * Floored at a hundredth of their medians (a numerical guard: the weights go as 1 / s^3).
+ */
+function mapMetric(V, T, uv) {
+  const nV = V.length, su = new Float64Array(nV), sv = new Float64Array(nV), wt = new Float64Array(nV);
+  for (const [a, b, c] of T) {
+    const e1 = sub(V[b], V[a]), e2 = sub(V[c], V[a]);
+    const a11 = uv[b][0] - uv[a][0], a21 = uv[b][1] - uv[a][1], a12 = uv[c][0] - uv[a][0], a22 = uv[c][1] - uv[a][1];
+    const det = a11 * a22 - a12 * a21, A3 = norm(cross(e1, e2)) / 2;
+    if (!(Math.abs(det) > 0) || !(A3 > 0)) continue;
+    const c0 = [0, 1, 2].map((k) => (e1[k] * a22 - e2[k] * a21) / det), c1 = [0, 1, 2].map((k) => (-e1[k] * a12 + e2[k] * a11) / det);
+    const l0 = norm(c0), l1 = norm(c1);
+    if (!(Number.isFinite(l0) && Number.isFinite(l1))) continue;
+    for (const q of [a, b, c]) { su[q] += A3 * l0; sv[q] += A3 * l1; wt[q] += A3; }
+  }
+  const ok = [];
+  for (let q = 0; q < nV; q++) if (wt[q] > 0) { su[q] /= wt[q]; sv[q] /= wt[q]; ok.push(q); }
+  if (!ok.length) return null;
+  const med = (x) => { const s = ok.map((q) => x[q]).sort((p, r) => p - r); return s[s.length >> 1]; };
+  const fu = 1e-2 * med(su), fv = 1e-2 * med(sv);
+  // nearest vertex: a grid over the map
+  let lu = Infinity, lv = Infinity, hu = -Infinity, hv = -Infinity;
+  for (const q of ok) { lu = Math.min(lu, uv[q][0]); hu = Math.max(hu, uv[q][0]); lv = Math.min(lv, uv[q][1]); hv = Math.max(hv, uv[q][1]); }
+  const G = Math.max(1, Math.ceil(Math.sqrt(ok.length))), cu = (hu - lu) / G || 1, cv = (hv - lv) / G || 1, cells = new Map();
+  const cell = (u, v) => [Math.min(G - 1, Math.max(0, Math.floor((u - lu) / cu))), Math.min(G - 1, Math.max(0, Math.floor((v - lv) / cv)))];
+  for (const q of ok) { const [i, j] = cell(uv[q][0], uv[q][1]), k = i * G + j; (cells.get(k) ?? cells.set(k, []).get(k)).push(q); }
+  return (u, v) => {
+    const [i, j] = cell(u, v);
+    let best = -1, bd = Infinity;
+    for (let r = 0; r <= G && (best < 0 || r <= 1); r++) {
+      for (let x = i - r; x <= i + r; x++) for (let y = j - r; y <= j + r; y++) {
+        if (Math.max(Math.abs(x - i), Math.abs(y - j)) !== r) continue;
+        for (const q of cells.get(x * G + y) ?? []) { const d = (uv[q][0] - u) ** 2 + (uv[q][1] - v) ** 2; if (d < bd) { bd = d; best = q; } }
+      }
+    }
+    return [Math.max(fu, su[best]), Math.max(fv, sv[best])];
+  };
+}
+
 /** Symmetric banded matrix (half-bandwidth bw), upper band stored per row. */
 class Band {
   constructor(n, bw) { this.n = n; this.bw = bw; this.a = new Float64Array(n * (bw + 1)); }
@@ -591,8 +633,10 @@ function assemble(M, rhs, tu, tv, U, Vv, X, nv, wrap = 0) {
 }
 
 /** Thin-plate energy (|S_uu|^2 + 2|S_uv|^2 + |S_vv|^2 over the domain) into M with weight lam. Returns its trace. */
-function thinPlate(M, tu, tv, nv, lam, wrap = 0) {
-  // lam: the weights of the three bending terms (S_uu, 2 S_uv, S_vv); returns their traces
+function thinPlate(M, tu, tv, nv, lam, wrap = 0, metric = null) {
+  // lam: the weights of the three bending terms (S_uu, 2 S_uv, S_vv); returns their traces. metric: (u, v) -> the
+  // map's 3D lengths per unit u and v there [su, sv], to weigh each term as bending in 3D: with x, y arc length along
+  // u and v, S_xx = S_uu / su^2, S_xy = S_uv / (su sv), S_yy = S_vv / sv^2 and dA = su sv du dv
   const ku = distinct(tu.slice(P_, tu.length - P_)), kv = distinct(tv.slice(P_, tv.length - P_));
   const tr = [0, 0, 0];
   for (let a = 0; a + 1 < ku.length; a++) for (const [gu, wu] of GAUSS) {
@@ -601,9 +645,11 @@ function thinPlate(M, tu, tv, nv, lam, wrap = 0) {
     for (let b = 0; b + 1 < kv.length; b++) for (const [gv, wv] of GAUSS) {
       const v = (kv[b] + kv[b + 1]) / 2 + ((kv[b + 1] - kv[b]) / 2) * gv, wV = ((kv[b + 1] - kv[b]) / 2) * wv;
       const bv = nzBasis(tv, P_, v, 2);
+      const g = metric ? metric(u, v) : null;
+      const gw = g ? [g[1] / g[0] ** 3, 1 / (g[0] * g[1]), g[0] / g[1] ** 3] : [1, 1, 1];
       for (const [du, dvv, c, t] of [[2, 0, 1, 0], [1, 1, 2, 1], [0, 2, 1, 2]]) {
         const cols = [], vals = [];
-        const sw = Math.sqrt(wU * wV * c);
+        const sw = Math.sqrt(wU * wV * c * gw[t]);
         for (let i = 0; i <= P_; i++) for (let j = 0; j <= P_; j++) {
           const w = bu.ders[du][i] * bv.ders[dvv][j] * sw;
           if (!w) continue;
@@ -621,12 +667,12 @@ function thinPlate(M, tu, tv, nv, lam, wrap = 0) {
 
 const bandOf = (nv, wrap) => (wrap ? (P_ + 1) * wrap : P_ * nv + P_);
 
-function solveNet(tu, tv, U, Vv, X, lamAbs, wrap = 0, collapse = null) {
+function solveNet(tu, tv, U, Vv, X, lamAbs, wrap = 0, collapse = null, metric = null) {
   const nu = tu.length - P_ - 1, nv = wrap || tv.length - P_ - 1, n = nu * nv;
   const M = new Band(n, bandOf(nv, wrap));
   const rhs = new Float64Array(n * 3);
   const tr = assemble(M, rhs, tu, tv, U, Vv, X, nv, wrap);
-  thinPlate(M, tu, tv, nv, lamAbs, wrap);
+  thinPlate(M, tu, tv, nv, lamAbs, wrap, metric);
   const ridge = (1e-12 * tr) / n;
   for (let i = 0; i < n; i++) M.add(i, i, ridge);
   // collapse: the first ('lo') or last ('hi') row along u one point (a three-sided face's tip): its poles held
@@ -784,15 +830,22 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
     tv = clamped(lo[1], hi[1], 1);
   }
   const absTol = tol * scale;
-  // the thin-plate weights, fixed once on the initial net: each bending term (along u, along v, the twist) lam x
-  // trace(A^T A) / its own trace (one weight over their sum is set by the shortest spans, and leaves bending the long
-  // way near zero: a band's net ripples between its rim vertices, a sliver's folds)
+  // the bending term measured in 3D (thinPlate's metric): the map's own stretch, so it costs the same to bend the
+  // surface wherever the map puts it (a map that stretches a face across, as a collapsed tip's does, otherwise makes
+  // bending there nearly free, and a face with no vertices inside bulges between its sides). Not round a ring (a
+  // conformal map closing round: near an isometry)
+  const metric = period ? null : mapMetric(V, T, uv);
+  // the thin-plate weights, fixed once on the initial net. Measured in 3D (metric) the three bending terms are one
+  // energy, weighed against the data as one: lam x trace(A^T A) / its trace. Measured in the map's own parameters (a
+  // ring's), each term (along u, along v, the twist) is weighed on its own, lam x trace(A^T A) / its own trace (one
+  // weight over their sum is set by the shortest spans, and leaves bending the long way near zero: a band's net
+  // ripples between its rim vertices)
   {
     const nv = wrap || tv.length - P_ - 1, n = (tu.length - P_ - 1) * nv;
     const M = new Band(n, bandOf(nv, wrap));
     const trA = assemble(M, new Float64Array(n * 3), tu, tv, U, Vv, X, nv, wrap);
-    const trR = thinPlate(M, tu, tv, nv, null, wrap);
-    info.lam_abs = trR.map((t) => (lam * trA) / Math.max(t, 1e-300));
+    const trR = thinPlate(M, tu, tv, nv, null, wrap, metric);
+    info.lam_abs = metric ? trR.map(() => (lam * trA) / Math.max(trR[0] + trR[1] + trR[2], 1e-300)) : trR.map((t) => (lam * trA) / Math.max(t, 1e-300));
   }
   const lamAbs = info.lam_abs;
   // hold-out: 10% of the interior vertices left out, to choose the refinement level
@@ -862,7 +915,7 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
   for (let rnd = 0; rnd <= FIT.REFINE_ROUNDS; rnd++) {
     if (rnd > 0 && S && folds(S)) { U.set(U0); Vv.set(V0); }
     for (let it = 0; it < FIT.CORRECT_ITERS; it++) {
-      const s2 = solveNet(tu, tv, F.map((k) => U[k]), F.map((k) => Vv[k]), F.map((k) => X[k]), lamAbs, wrap, collapse);
+      const s2 = solveNet(tu, tv, F.map((k) => U[k]), F.map((k) => Vv[k]), F.map((k) => X[k]), lamAbs, wrap, collapse, metric);
       if (!s2) break;
       S = s2;
       project(S);
@@ -906,7 +959,7 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
   ({ tu, tv, wrap } = best);
   U = best.U; Vv = best.V;
   for (let it = 0; it < FIT.CORRECT_ITERS; it++) {
-    const s2 = solveNet(tu, tv, U, Vv, X, lamAbs, wrap, collapse);
+    const s2 = solveNet(tu, tv, U, Vv, X, lamAbs, wrap, collapse, metric);
     if (!s2) break;
     S = s2;
     project(S);

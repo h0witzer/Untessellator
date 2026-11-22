@@ -8,7 +8,8 @@
  * volume check is for, a face inside out or a piece missing. And its surfaces near the mesh all over, not only at
  * score's few points: every face tessellated (the studio's preview, 1e-3 x diagonal), every point of that within
  * OFF_MESH (the knitter's 1% of the diagonal) of the mesh and 99% of them within half that (this branch's suites'
- * bar). When it is not that good, the caller builds with the knitter as before (knitSolid), so no part exports worse
+ * bar); and the mesh near the solid all over the same way (each triangle's centroid, by its area: faces that stay on
+ * the mesh can still leave part of it uncovered, a trim cutting into its face). When it is not that good, the caller builds with the knitter as before (knitSolid), so no part exports worse
  * than it did.
  *
  * hasFreeform: whether the payload has a group the knitter would fit a B-spline to (no surface, more than
@@ -89,6 +90,15 @@ function attempt(oc, { positions, labels, surfaces, oriented = false }, part, sp
   const { far, beyond } = strays(preview.positions, positions, mesh.diag);
   info.preview_far = far; info.preview_beyond = beyond;
   if (beyond > 0 || far > 0.01 * (preview.positions.length / 3)) return { rejected: `off the mesh (${beyond} points past 1%, ${far} past 0.5% of its size)`, info };
+  const nT = positions.length / 9, cen = new Float64Array(nT * 3), area = new Float64Array(nT);
+  for (let t = 0; t < nT; t++) {
+    const o = t * 9, e1 = [0, 1, 2].map((k) => positions[o + 3 + k] - positions[o + k]), e2 = [0, 1, 2].map((k) => positions[o + 6 + k] - positions[o + k]);
+    area[t] = Math.hypot(e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]) / 2;
+    for (let k = 0; k < 3; k++) cen[t * 3 + k] = (positions[o + k] + positions[o + 3 + k] + positions[o + 6 + k]) / 3;
+  }
+  const back = strays(cen, preview.positions, mesh.diag, area);
+  info.mesh_far = back.far / (back.total || 1); info.mesh_beyond = back.beyond / (back.total || 1);
+  if (back.beyond > 0 || back.far > 0.01 * back.total) return { rejected: `the mesh off the solid (${((100 * back.beyond) / back.total).toFixed(2)}% of its area past 1%, ${((100 * back.far) / back.total).toFixed(2)}% past 0.5% of its size)`, info };
   const report = { ...fx.report, closed: true, valid: true, vol_err: volErr, free_edges: sc.free_edges ?? 0,
     secs: Math.round((performance.now() - t0) / 100) / 10, info };
   return { step: fx.step, report, shape, preview };
@@ -96,9 +106,10 @@ function attempt(oc, { positions, labels, surfaces, oriented = false }, part, sp
 
 /**
  * How many of the points `pts` (flat xyz) lie farther than OFF_MESH / 2 x diag from the triangle soup P (far), and
- * farther than OFF_MESH x diag (beyond): exact point-triangle distances over a grid of the triangles.
+ * farther than OFF_MESH x diag (beyond): exact point-triangle distances over a grid of the triangles. w: a weight per
+ * point (far, beyond and total then sums of them).
  */
-function strays(pts, P, diag) {
+function strays(pts, P, diag, w = null) {
   const h = (OFF_MESH / 2) * diag, cells = new Map(), key = (x, y, z) => `${x},${y},${z}`;
   const nT = P.length / 9;
   for (let t = 0; t < nT; t++) {
@@ -132,12 +143,13 @@ function strays(pts, P, diag) {
     }
     return Math.sqrt(best);
   };
-  let far = 0, beyond = 0;
+  let far = 0, beyond = 0, total = 0;
   for (let i = 0; i < pts.length; i += 3) {
-    const p = [pts[i], pts[i + 1], pts[i + 2]];
+    const p = [pts[i], pts[i + 1], pts[i + 2]], wi = w ? w[i / 3] : 1;
+    total += wi;
     if (near(p, 1) <= h) continue;
-    far++;
-    if (near(p, 2) > 2 * h) beyond++;
+    far += wi;
+    if (near(p, 2) > 2 * h) beyond += wi;
   }
-  return { far, beyond };
+  return { far, beyond, total };
 }
