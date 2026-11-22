@@ -49,6 +49,9 @@ export function tryFacePath(oc, payload, { part = 'Part', budgetS = Infinity } =
     let added = 0;
     for (const k of r.bad ?? []) {
       if (k.analytic) { if (!free.has(k.label)) { free.add(k.label); added++; } continue; }
+      // a fitted face whose group still has a given surface (faceSolidSplit fitted it freely when that surface
+      // failed): its surface goes too, or faceSolidSplit will not cut it
+      if (payload.surfaces.has(k.label) && !free.has(k.label)) { free.add(k.label); added++; }
       const id = `${k.b}:${k.tris.join(',')}`;
       if (!seen.has(id)) { seen.add(id); split.push(k); added++; }
     }
