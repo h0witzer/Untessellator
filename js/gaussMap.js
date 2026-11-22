@@ -1270,6 +1270,12 @@ const madOf = (a) => {
  */
 function refineBest(g, pos, starts, type, refine, dedupe = true) {
   const { ext } = extentOf(pos);
+  // Starts in order of their facets' normal agreement: the loop stops at the first refinement exact on the
+  // vertices, and an extruded face's vertices lie on two rims, which a cylinder lying across the rims holds
+  // exactly too (the Concave Top's 2-segment arcs: 59 of 126 got one, a radius 0.16 cylinder across a 0.32 wall).
+  // Its facets face 90 deg off it; the true one's are off by the chord's half-angle. Ties keep their order.
+  starts = starts.map((s, i) => ({ s, i, m: s?.params ? madOf(normalMisfit(type, s.params, g)) : Infinity }))
+    .sort((a, b) => a.m - b.m || a.i - b.i).map((o) => o.s);
   const cands = [];
   const axes = [];
   for (const s of starts) {
