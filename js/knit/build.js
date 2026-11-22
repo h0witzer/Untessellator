@@ -1085,6 +1085,64 @@ export function offMeshFaces(oc, shape, mesh) {
   return faces;
 }
 
+/** Whether p is within tol (at most OFF_MESH x diagonal) of the mesh. */
+function nearMeshWithin(mesh, p, tol) {
+  const { h, cells, key } = meshGrid(mesh), { V, T } = mesh;
+  const c = p.map((x) => Math.floor(x / h));
+  for (let i = -1; i <= 1; i++) for (let j = -1; j <= 1; j++) for (let k = -1; k <= 1; k++) {
+    for (const t of cells.get(key(c[0] + i, c[1] + j, c[2] + k)) ?? []) {
+      const [a, b, d] = T[t];
+      if (triangleDistance(p, V[a], V[b], V[d]) <= tol) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * The labels in `labels` whose built face (faceOf's: a face or its pieces) strays more than tol from the mesh: nine
+ * points along each of its edges, and a 3 x 3 grid inside it. For the B-spline fallback (repair.js SPLINE), whose faces
+ * meet their neighbours at shallow angles where the edge between them is ill-placed: 00005528_003's B-splines were on
+ * the mesh in their middles (median 0.007 mm) and up to 1 mm off along their edges, inside OFF_MESH's 2.9 mm.
+ */
+export function strayFaces(oc, faceOf, labels, mesh, tol) {
+  const E = enumOf(oc);
+  const out = new Set();
+  const off = (q) => { const x = [q.X(), q.Y(), q.Z()]; q.delete(); return !nearMeshWithin(mesh, x, Math.min(tol, OFF_MESH * mesh.diag)); };
+  for (const g of labels) {
+    const got = faceOf.get(g);
+    const faces = Array.isArray(got) ? got : got ? [got] : [];
+    let stray = false;
+    for (const fc of faces) {
+      const face = oc.TopoDS.Face_1(fc);
+      for (const ec of subShapes(oc, face, E.EDGE)) {
+        const e = oc.TopoDS.Edge_1(ec);
+        if (oc.BRep_Tool.Degenerated(e)) continue;
+        const ad = new oc.BRepAdaptor_Curve_2(e);
+        const t0 = ad.FirstParameter(), t1 = ad.LastParameter();
+        for (let k = 0; k <= 8 && !stray; k++) stray = off(ad.Value(t0 + (k / 8) * (t1 - t0)));
+        ad.delete();
+        if (stray) break;
+      }
+      if (!stray) {
+        const sa = new oc.BRepAdaptor_Surface_2(face, true);
+        const u0 = sa.FirstUParameter(), u1 = sa.LastUParameter(), v0 = sa.FirstVParameter(), v1 = sa.LastVParameter();
+        const cls = new oc.BRepTopAdaptor_FClass2d(face, 1e-9);
+        for (const fu of [0.25, 0.5, 0.75]) for (const fv of [0.25, 0.5, 0.75]) {
+          if (stray) break;
+          const uv = new oc.gp_Pnt2d_3(u0 + fu * (u1 - u0), v0 + fv * (v1 - v0));
+          if (cls.Perform(uv, false) === E.IN) stray = off(sa.Value(uv.X(), uv.Y()));
+          uv.delete();
+        }
+        cls.delete();
+        sa.delete();
+      }
+      if (stray) break;
+    }
+    if (stray) out.add(g);
+  }
+  return out;
+}
+
 /**
  * The shells as solids to build: [{shell, voids}]. With oriented input (KnitMesh), a shell inside out on its own (its
  * faces toward its inside) is a void, given to the smallest other shell that holds one of its vertices; otherwise, and

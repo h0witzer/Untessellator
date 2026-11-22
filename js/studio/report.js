@@ -93,7 +93,8 @@ export function conversionNumbers({ triangles, repaired, model, settings, autoPa
     } else if (f) {
       const kinds = Object.entries(f.problems ?? {}).map(([k, v]) => `${k} ${v.length}`);
       lines.push(`export faces: kernel rejected ${kinds.length ? kinds.join(', ') : 'none'}; ` +
-        `facets ${f.demoted === 'all' ? 'all' : `${(f.demoted ?? []).length} groups`}`);
+        `facets ${f.demoted === 'all' ? 'all' : `${(f.demoted ?? []).length} groups`}` +
+        `${f.splined?.length ? `; B-splines ${f.splined.length} groups (${pct(exported.splineArea ?? 0)} of the area)` : ''}`);
     }
   }
   if (groupRepair) {

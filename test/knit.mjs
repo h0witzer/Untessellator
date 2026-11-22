@@ -4,7 +4,7 @@
  *
  * Usage:  node test/knit.mjs <mesh dir> <patch dir> <stem> [--out row.json] [--step out.step]
  *                            [--repair] [--no-fallback] [--budget 300] [--deadline s] [--faceted] [--no-split] [--no-axes]
- *                            [--no-tidy] [--no-exact-edges] [--no-contact] [--no-ssi] [--no-pinch] [--no-pcurves] [--fix-facets] [--no-facet-arcs] [--dump-kernel dir] [--facet-audit] [--max-tol] [--no-retry] [--no-progressive] [--prof]
+ *                            [--no-tidy] [--no-exact-edges] [--no-contact] [--no-ssi] [--no-pinch] [--no-pcurves] [--fix-facets] [--no-facet-arcs] [--dump-kernel dir] [--facet-audit] [--max-tol] [--no-retry] [--no-progressive] [--no-splines] [--prof]
  *                            [--axes-opts '{"TANGENT_DEG":0}']
  *
  *   <mesh dir>   <stem>.pos (float32 triangle soup)
@@ -20,8 +20,9 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { loadOcct, knitSolid, repairGroups, writeStep, BUILD } from '../js/knit/index.js';
+import { loadOcct, knitSolid, repairGroups, writeStep, compareExports, BUILD } from '../js/knit/index.js';
 import { subShapes } from '../js/knit/build.js';
+import { SPLINE } from '../js/knit/repair.js';
 
 const args = process.argv.slice(2);
 const flag = (name, dflt) => { const i = args.indexOf(name); if (i < 0) return dflt; const v = args[i + 1]; args.splice(i, 2); return v; };
@@ -35,6 +36,10 @@ const NO_AXES = bool('--no-axes');
 const NO_TIDY = bool('--no-tidy');
 const NO_RETRY = bool('--no-retry');          // no plain retry of a clean build that is not analytic
 const NO_PROGRESSIVE = bool('--no-progressive');   // the whole-part retries and facet tiers, as before 2026-11-15
+if (bool('--no-splines')) SPLINE.ON = false;       // no B-spline fallback: failing patches go straight to facets, as before 2026-11-17
+// lab overrides of the B-spline fallback's tolerances (repair.js SPLINE), for side-by-side runs of one checkout
+if (process.env.SPLINE_TOL) SPLINE.TOL = Number(process.env.SPLINE_TOL);
+if (process.env.SPLINE_EDGE_TOL) SPLINE.EDGE_TOL = Number(process.env.SPLINE_EDGE_TOL);
 const AXES_OPTS = JSON.parse(flag('--axes-opts', '{}'));
 const NO_EXACT_EDGES = bool('--no-exact-edges');
 const NO_CONTACT = bool('--no-contact');
@@ -111,8 +116,13 @@ try {
   row = { stem: STEM, ...report, load_secs: Math.round(loadSecs * 10) / 10 };
   if (REPAIR && !FACETED && report.tier !== 'analytic') {
     const r = repairGroups(oc, { positions, labels, surfaces }, { budget: BUDGET, split: !NO_SPLIT, axes: !NO_AXES, axesOptions: AXES_OPTS });
+    const before = { solid, report };
     ({ solid, report } = knitSolid(oc, { positions, labels: r.labels, surfaces: r.surfaces }, options));
-    row = { stem: STEM, ...report, load_secs: row.load_secs, first: { tier: row.tier, secs: row.secs },
+    // the studio undoes Repair's changes when the export after it is worse (compareExports): the first is kept
+    const after = { tier: report.tier, secs: report.secs, facetArea: report.facetArea, splineArea: report.splineArea ?? 0 };
+    const keptFirst = compareExports(before.report, report) < 0;
+    if (keptFirst) ({ solid, report } = before);
+    row = { stem: STEM, ...report, load_secs: row.load_secs, first: { tier: row.tier, secs: row.secs }, after, kept: keptFirst ? 'first' : 'repaired',
       repair: { ok: r.ok, moves: r.moves, problems: r.problems, builds: r.info.repair_builds, secs: r.info.secs } };
   }
   if (FACET_AUDIT && solid) row.audit = (await import('./facetAudit.mjs')).facetAudit(oc, solid, positions);
