@@ -56,7 +56,7 @@ for (let b = 0; b < found.bodies.length && !error; b++) {
   tris.forEach((t) => { const m = typeOf.get(F[t]) ?? new Map(); m.set(TY[t], (m.get(TY[t]) ?? 0) + 1); typeOf.set(F[t], m); });
   for (const f of r.faces) {
     const m = typeOf.get(f.origin ?? f.label), type = TYPES[[...m].sort((x, y) => y[1] - x[1])[0][0]];
-    faceRows.push({ type, err: f.info.max_err, param: f.info.param, spans: f.info.spans });
+    faceRows.push({ face: f.origin ?? f.label, type, err: f.info.max_err, param: f.info.param, spans: f.info.spans, cover: f.info.cover });
   }
 }
 out.ms = performance.now() - t0;

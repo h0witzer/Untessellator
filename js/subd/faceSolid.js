@@ -1,8 +1,9 @@
 /**
  * faceSolid.js — a mesh painted in groups (a part's faces) as a solid of trimmed B-spline faces, one face per
  * group, the way CAD models are built:
- * - each face one bicubic B-spline surface a little larger than the face (js/freeformFit.js fitGroup, given points
- *   inside the face's long triangles too, so a CAD face's mesh is data all over it);
+ * - each face one bicubic B-spline surface (faceFit.js fitGroup): a four-sided face's over a rectangle whose sides
+ *   are the face's (its rows run along the face and across it, its edges are the surface's own), any other face's
+ *   a little larger than the face and trimmed;
  * - each border between two faces one edge curve, fitted once to the mesh border and ending on the corner points,
  *   so neighbours share it;
  * - each face trimmed by its edges' curves projected into its surface's parameters (pcurves, on the edge curve's
@@ -22,6 +23,7 @@ const sub = (a, b) => a.map((x, i) => x - b[i]);
 const dot = (a, b) => a.reduce((s, x, i) => s + x * b[i], 0);
 const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
 const len = (a) => Math.hypot(...a);
+const CORNER_TURN = Math.PI / 9;                   // 20 degrees
 
 /** Groups, their border loops (group on the left) as chains, and the chains (corner to corner, or a ring). */
 export function faceTopology(vertices, triangles, labels) {
@@ -310,6 +312,57 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
     analyticNbrs[gF].add(groups[ua.g === gF ? ub.g : ua.g].label);
   });
 
+  // four-sided faces: a fitted face with one border loop whose corners, where the border turns by more than
+  // CORNER_TURN in the face's tangent plane at a change of neighbour (a chain's end), are four. Its sides go to the
+  // fitter (faceFit.js rectParam), so its surface's edges are the face's own and its rows follow the face. (The share
+  // of the ABC freeform set's faces with four such corners is the same at 20 and 35 degrees: a CAD face's corners
+  // are tangent breaks, not the border's curvature between vertices.)
+  const sidesOf = (gi) => {
+    const g = groups[gi];
+    if (g.loops.length !== 1 || g.loopChains[0].length < 4) return null;
+    const loop = g.loops[0], n = loop.length, { local, Vg, Tg } = meshes[gi];
+    const starts = new Set(g.loopChains[0].map((e) => { const v = chains[e.c].verts; return e.rev ? v[v.length - 1] : v[0]; }));
+    const { vn } = meshNormals(Vg, Tg);
+    const at = [];
+    for (let i = 0; i < n; i++) {
+      const v = loop[i];
+      if (!starts.has(v)) continue;
+      const nr = vn[local.get(v)], ln = len(nr);
+      let d0 = sub(vertices[v], vertices[loop[(i - 1 + n) % n]]), d1 = sub(vertices[loop[(i + 1) % n]], vertices[v]);
+      if (ln > 0) { const u = nr.map((x) => x / ln); d0 = sub(d0, u.map((x) => x * dot(d0, u))); d1 = sub(d1, u.map((x) => x * dot(d1, u))); }
+      const l0 = len(d0), l1 = len(d1);
+      if (l0 > 0 && l1 > 0 && Math.acos(Math.max(-1, Math.min(1, dot(d0, d1) / (l0 * l1)))) > CORNER_TURN) at.push(i);
+    }
+    if (at.length !== 4) return null;
+    return at.map((i0, s) => {
+      const side = [];
+      for (let i = i0; ; i = (i + 1) % n) { side.push(local.get(loop[i])); if (i === at[(s + 1) % 4]) break; }
+      return side;
+    });
+  };
+
+  // a four-sided face's sides are its surface's boundary rows, and a side with few vertices leaves its row to
+  // extrapolation from the inside (a tapered face's short end, stretched in the map, overshoots back and forth). So
+  // each side's segments get points between their vertices too (three to a segment) from the smooth curve through
+  // the side's vertices (a single segment: its chord, which a CAD mesher leaves single only where the edge is
+  // straight): data, but soft (an estimate: no refinement to reach them). Not where the segment has points already
+  // (a border on an analytic face: points of that surface).
+  const sidePoints = (Vg, sides, have) => {
+    const done = new Set(have.map((e) => (e.a < e.b ? `${e.a}_${e.b}` : `${e.b}_${e.a}`))), out = [];
+    for (const side of sides) {
+      const pts = side.map((l) => Vg[l]), d = [0];
+      for (let i = 1; i < pts.length; i++) d.push(d[i - 1] + len(sub(pts[i], pts[i - 1])));
+      if (!(d[d.length - 1] > 0)) continue;
+      const ts = d.map((x) => x / d[d.length - 1]), C = fitCurve(pts, { ts });
+      for (let i = 0; i + 1 < side.length; i++) {
+        const a = side[i], b = side[i + 1];
+        if (done.has(a < b ? `${a}_${b}` : `${b}_${a}`)) continue;
+        for (const w of [0.25, 0.5, 0.75]) out.push({ x: curveAt(C, ts[i] + w * (ts[i + 1] - ts[i]))[0], a, b, w, soft: true });
+      }
+    }
+    return out;
+  };
+
   // one surface per group
   const faces = groups.map((g, gi) => {
     const { local, Vg, Tg } = meshes[gi];
@@ -318,6 +371,21 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
     // are on the true surface; its triangles' insides are chords), with its borders on analytic faces. fits: a cache
     // across calls that differ only in other faces (faceSolidSplit's retries), by label and analytic neighbours.
     const given = surfaces?.get(g.label) ?? null, analytic = !!analyticOf[gi];
+    // which way the surface faces: its normal at each vertex's place on it against the mesh's (outward, area
+    // weighted) there, by area. Where it faces the other way under more than one triangle's worth of the face, it
+    // folds under it (a fit across a cusp or crease the face has inside it). (Not counted: vertices where the mesh
+    // itself folds over, meshNormals.)
+    const { vn, va, trusted, area } = meshNormals(Vg, Tg);
+    const facing = (S2, vertexUV) => {
+      let vote = 0, against = 0, measured = 0;
+      for (const [l, uv] of vertexUV) {
+        if (!trusted[l]) continue;
+        const s1 = Math.sign(dot(vn[l], S2.normal(uv[0], uv[1])[1]));
+        vote += s1 * va[l]; measured += va[l];
+        if (s1 < 0) against += va[l];
+      }
+      return { vote, folded: Math.min(against, measured - against) };
+    };
     let fit, S;
     if (given) {
       S = analytic ? analyticOf[gi] : Surface.fromParams(given[1]);
@@ -326,26 +394,24 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
       Vg.forEach((q, l) => { const r = S.closest(q); vertexUV.set(l, [r.u, r.v]); const e = len(sub(r.S, q)); maxErr = Math.max(maxErr, e); sq += e * e; });
       fit = { params: analytic ? null : given[1], vertexUV, info: { param: given[0], spans: [0, 0], max_err: maxErr / diag, rms_err: Math.sqrt(sq / Vg.length) / diag } };
     } else {
-      const key = `${g.label}|${[...analyticNbrs[gi]].sort((a, b) => a - b).join(',')}`;
-      fit = fits?.get(key) ?? fitGroup(Vg, Tg, { scale: diag, extra: extraOf[gi] });
-      fits?.set(key, fit);
+      // a four-sided face's own route first; where it gives no surface, or one that folds under the face, the
+      // trimmed route (the face's map's box)
+      const nbrKey = `${g.label}|${[...analyticNbrs[gi]].sort((a, b) => a - b).join(',')}`;
+      const fitWith = (sides) => {
+        const key = `${nbrKey}|${sides ? sides.map((s) => s[0]).join(',') : ''}`;
+        const f = fits?.get(key) ?? fitGroup(Vg, Tg, { scale: diag, extra: sides ? [...extraOf[gi], ...sidePoints(Vg, sides, extraOf[gi])] : extraOf[gi], sides });
+        fits?.set(key, f);
+        return f;
+      };
+      const sides = sidesOf(gi);
+      fit = fitWith(sides);
+      if (sides && (!fit.params || facing(Surface.fromParams(fit.params), fit.vertexUV).folded > area / Tg.length)) fit = fitWith(null);
       if (!fit.params) { fail(g.label, `no single surface fits it (${fit.info.fail})`); return null; }
       S = Surface.fromParams(fit.params);
     }
     const periodic = analytic ? S.periodicU : !!fit.params.u_periodic;
-    // which way the surface faces: its normal at each vertex's place on it against the mesh's (outward, area
-    // weighted) there, by area. Where it faces the other way under more than one triangle's worth of the face, it
-    // folds under it (a fit across a cusp or crease the face has inside it): no surface for this face, which
-    // faceSolidSplit then cuts in two. (Not counted: vertices where the mesh itself folds over, meshNormals.)
-    const { vn, va, trusted, area } = meshNormals(Vg, Tg);
-    let vote = 0, against = 0, measured = 0;
-    for (const [l, uv] of fit.vertexUV) {
-      if (!trusted[l]) continue;
-      const s1 = Math.sign(dot(vn[l], S.normal(uv[0], uv[1])[1]));
-      vote += s1 * va[l]; measured += va[l];
-      if (s1 < 0) against += va[l];
-    }
-    const folded = Math.min(against, measured - against);
+    // a surface that folds under its face: none for this face, which faceSolidSplit then cuts in two
+    const { vote, folded } = facing(S, fit.vertexUV);
     if (folded > area / Tg.length) { fail(g.label, `its surface folds under it (${((100 * folded) / area).toFixed(1)} % of its area)`); return null; }
     const seed = new Map();
     for (const [v, l] of local) { const uv = fit.vertexUV.get(l); if (uv) seed.set(v, uv); }
@@ -646,6 +712,11 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
       });
       const outer = areas.indexOf(Math.max(...areas));
       loops.forEach((entries, li) => out[f.gi].bounds.push({ outer: li === outer, edges: entries.map((e) => ({ e: e.c, forward: !e.rev })) }));
+      // a fitted face's share of its surface's domain (the rest of the net hangs outside the face)
+      if (!f.analytic) {
+        const [u0, u1, v0, v1] = f.S.dom;
+        f.info.cover = (areas[outer] - areas.reduce((s, a, li) => (li === outer ? s : s + a), 0)) / 2 / ((u1 - u0) * (v1 - v0));
+      }
       continue;
     }
     // its two rims, each from its seam vertex; A: the one whose u rises along it (it ends on the far side of the

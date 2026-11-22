@@ -3,7 +3,9 @@
  * developed for one trimmed face per painted group, kept apart until the knitter is gated on it. What it adds: a
  * conformal map solved directly (envelope Cholesky, one factorisation for every rim pair), faces closing round with
  * holes, folded slivers untangled, exact planes, the thin-plate weight per bending term, nets no larger than the data
- * supports, refinement restarted from the map after a folded net, points of the face's edges as data (extra).
+ * supports, refinement restarted from the map after a folded net, points of the face's edges as data (extra), and a
+ * four-sided face (sides) mapped onto a rectangle with its sides on the rectangle's (rectParam), its border points
+ * held on their sides, so the surface's edges are the face's own and its net follows the face.
  *
  * freeformFit.js — one untrimmed bicubic B-spline surface per mesh group, for groups no analytic surface
  * fits. A port of the core of ml/freeform_fit.py (measured there on 2105 ABC freeform faces: found3
@@ -365,6 +367,44 @@ function lscmSolve(V, T, pin, shift, period) {
 }
 
 /**
+ * A four-sided face onto a rectangle, its sides on the rectangle's: sides, its border's four runs from corner to
+ * corner (vertex indices in the border's order, the face on their left; each ends where the next starts). u runs
+ * along the longer pair, the rectangle as long as their mean length and as high as the other pair's; each border
+ * vertex sits at its share of its side's length; the inside is harmonic (the conformal map's system with the whole
+ * border held, whose minimum is then the cotangent-weight harmonic map), folded slivers untangled with the border
+ * held. A surface over the rectangle has the face's edges for its own edges: its rows run along the face and across
+ * it, and none hangs outside it. {uv, W, H} or null (not a disk, the sides not its border, folds left).
+ */
+export function rectParam(V, T, sides) {
+  const nV = V.length, cnt = edgeCounts(T);
+  if (sides?.length !== 4 || nV - cnt.size + T.length !== 1 || components(T, nV) !== 1) return null;
+  let nb = 0, m = 0;
+  for (const c of cnt.values()) if (c === 1) nb++;
+  for (let s = 0; s < 4; s++) {
+    const side = sides[s];
+    if (side.length < 2 || side[side.length - 1] !== sides[(s + 1) % 4][0]) return null;
+    for (let i = 0; i + 1 < side.length; i++) {
+      const a = side[i], b = side[i + 1];
+      if (cnt.get(a < b ? `${a}_${b}` : `${b}_${a}`) !== 1) return null;
+      m++;
+    }
+  }
+  if (m !== nb) return null;                       // every border edge once
+  const runs = sides.map((side) => { const d = [0]; for (let i = 1; i < side.length; i++) d.push(d[i - 1] + norm(sub(V[side[i]], V[side[i - 1]]))); return d; });
+  const L = runs.map((d) => d[d.length - 1]);
+  if (!L.every((x) => x > 0)) return null;
+  const k0 = L[0] + L[2] >= L[1] + L[3] ? 0 : 1;   // the longer pair along u
+  const W = (L[k0] + L[k0 + 2]) / 2, H = (L[k0 + 1] + L[(k0 + 3) % 4]) / 2;
+  const corner = [[0, 0], [W, 0], [W, H], [0, H]], pin = new Map();
+  for (let j = 0; j < 4; j++) {
+    const s = (k0 + j) % 4, a = corner[j], b = corner[(j + 1) % 4];
+    sides[s].forEach((q, i) => { const w = runs[s][i] / L[s]; pin.set(q, [a[0] + w * (b[0] - a[0]), a[1] + w * (b[1] - a[1])]); });
+  }
+  const uv = lscmSolve(V, T, pin, null, 0);
+  return uv ? { uv, W, H } : null;
+}
+
+/**
  * A conformal map of a mesh is conformal per triangle only on average, so a few slivers can come out folded. Their
  * vertices (and then their neighbours', the region growing a ring at a time) are moved to the weighted mean of their
  * neighbours, the rest of the map as it is: Tutte's step with Floater's mean value weights (from the mesh's own
@@ -568,10 +608,12 @@ function lcg(seed) { let s = seed >>> 0 || 1; return () => (s = (Math.imul(s, 16
 
 /**
  * Fit a bicubic B-spline to a triangle group. V: [[x, y, z]] its vertices, T: [[a, b, c]] its triangles
- * (indices into V). scale: the part diagonal, for the tolerance (default the group's own). Returns
+ * (indices into V). scale: the part diagonal, for the tolerance (default the group's own). extra: points of its
+ * edges, { x, a, b, w, soft? } (soft: data that does not call for refinement). sides: a four-sided face's four sides
+ * (rectParam), for its own route (param 'four-sided') unless it is a plane. Returns
  * {params (nurbs.Surface.toParams) | null, info: {param, spans, rounds, max_err, rms_err (x scale), fail?}}.
  */
-export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, seed = 0, extra = null } = {}) {
+export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, seed = 0, extra = null, sides = null } = {}) {
   const info = { n_vertices: V.length, n_triangles: T.length };
   if (!T.length || V.length < 3) return { params: null, info: { ...info, fail: 'empty' } };
   if (!scale) {
@@ -581,6 +623,11 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
   }
   let uv = planeParam(V, T), period = 0;
   info.param = 'plane';
+  // a four-sided face (sides: its border's four sides, faceSolid's) onto a rectangle with its edges on the
+  // rectangle's (rectParam), unless it is a plane (exact, below, on its projection: simpler still)
+  let rect;
+  const rectOf = () => (rect === undefined ? (rect = sides ? rectParam(V, T, sides) : null) : rect);
+  if (!uv && rectOf()) { uv = rect.uv; info.param = 'four-sided'; }
   if (!uv) {
     uv = lscm(V, T);
     info.param = 'lscm';
@@ -601,31 +648,39 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
       }
     }
   }
-  const lo = [Infinity, Infinity], hi = [-Infinity, -Infinity];
-  if (period) {
-    // round the ring is v here (the banded solve wraps v; the params are transposed to Python's
-    // u-periodic form at the end): its domain is the period itself, no margin
-    uv = uv.map((q) => [q[1], ((q[0] % period) + period) % period]);
-    for (const q of uv) { lo[0] = Math.min(lo[0], q[0]); hi[0] = Math.max(hi[0], q[0]); }
-    lo[1] = 0; hi[1] = period;
-  } else {
-    // tight box: principal axes of the UV points, u the long one
-    const c = uv.reduce((s, q) => [s[0] + q[0] / uv.length, s[1] + q[1] / uv.length], [0, 0]);
-    let sxx = 0, sxy = 0, syy = 0;
-    for (const q of uv) { const dx = q[0] - c[0], dy = q[1] - c[1]; sxx += dx * dx; sxy += dx * dy; syy += dy * dy; }
-    const ang = 0.5 * Math.atan2(2 * sxy, sxx - syy);          // the major axis
-    const ca = Math.cos(ang), sa = Math.sin(ang);
-    uv = uv.map((q) => [(q[0] - c[0]) * ca + (q[1] - c[1]) * sa, -(q[0] - c[0]) * sa + (q[1] - c[1]) * ca]);
-    for (const q of uv) for (let k = 0; k < 2; k++) { lo[k] = Math.min(lo[k], q[k]); hi[k] = Math.max(hi[k], q[k]); }
-  }
-  const ext = [Math.max(hi[0] - lo[0], 1e-9 * scale), Math.max(hi[1] - lo[1], 1e-9 * scale)];
-  for (let k = 0; k < (period ? 1 : 2); k++) { const m = FIT.MARGIN * ext[k] + 1e-6 * scale; lo[k] -= m; hi[k] += m; }
+  let lo, hi, ext;
+  const box = () => {
+    lo = [Infinity, Infinity]; hi = [-Infinity, -Infinity];
+    if (period) {
+      // round the ring is v here (the banded solve wraps v; the params are transposed to Python's
+      // u-periodic form at the end): its domain is the period itself, no margin
+      uv = uv.map((q) => [q[1], ((q[0] % period) + period) % period]);
+      for (const q of uv) { lo[0] = Math.min(lo[0], q[0]); hi[0] = Math.max(hi[0], q[0]); }
+      lo[1] = 0; hi[1] = period;
+    } else if (info.param === 'four-sided') {
+      // the rectangle itself: its sides are the face's edges, no margin
+      for (const q of uv) for (let k = 0; k < 2; k++) { lo[k] = Math.min(lo[k], q[k]); hi[k] = Math.max(hi[k], q[k]); }
+    } else {
+      // tight box: principal axes of the UV points, u the long one
+      const c = uv.reduce((s, q) => [s[0] + q[0] / uv.length, s[1] + q[1] / uv.length], [0, 0]);
+      let sxx = 0, sxy = 0, syy = 0;
+      for (const q of uv) { const dx = q[0] - c[0], dy = q[1] - c[1]; sxx += dx * dx; sxy += dx * dy; syy += dy * dy; }
+      const ang = 0.5 * Math.atan2(2 * sxy, sxx - syy);          // the major axis
+      const ca = Math.cos(ang), sa = Math.sin(ang);
+      uv = uv.map((q) => [(q[0] - c[0]) * ca + (q[1] - c[1]) * sa, -(q[0] - c[0]) * sa + (q[1] - c[1]) * ca]);
+      for (const q of uv) for (let k = 0; k < 2; k++) { lo[k] = Math.min(lo[k], q[k]); hi[k] = Math.max(hi[k], q[k]); }
+    }
+    ext = [Math.max(hi[0] - lo[0], 1e-9 * scale), Math.max(hi[1] - lo[1], 1e-9 * scale)];
+    if (info.param !== 'four-sided') for (let k = 0; k < (period ? 1 : 2); k++) { const m = FIT.MARGIN * ext[k] + 1e-6 * scale; lo[k] -= m; hi[k] += m; }
+  };
+  box();
   if (info.param === 'plane') {
     const flat = exactPlane(V, uv, lo, hi, tol * scale);
     if (flat) {
       Object.assign(info, { spans: [1, 1], rounds: 0, holdout: 0, max_err: flat.maxErr / scale, rms_err: flat.rmsErr / scale, exact: 'plane' });
       return { params: flat.params, info, vertexUV: new Map(uv.map((q, i) => [i, [q[0], q[1]]])) };
     }
+    if (rectOf()) { uv = rect.uv; info.param = 'four-sided'; box(); }
   }
   // data: all vertices, or the boundary plus a sample of the interior
   const cnt = edgeCounts(T);
@@ -644,9 +699,12 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
   // faceSolid gives the edges it shares with analytic faces, curves on those exact surfaces), data like the vertices,
   // their parameters interpolated in the map; the vertices alone judge the fit (hold-out, max_err)
   const nV = X.length;
+  // soft: extra points that are data but do not call for refinement (estimates, not points of the surface)
+  const soft = [];
   if (extra?.length) {
     const ex = [], eu = [], ev = [];
-    for (const { x, a, b, w } of extra) {
+    for (const { x, a, b, w, soft: sf } of extra) {
+      soft.push(!!sf);
       let ua = uv[a][0], va = uv[a][1], ub = uv[b][0], vb = uv[b][1];
       if (period) { if (vb - va > period / 2) vb -= period; else if (va - vb > period / 2) vb += period; }
       let v2 = va + w * (vb - va);
@@ -695,8 +753,38 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
   }
   const F = [...hold.keys()].filter((k) => !hold[k]);
   const err = new Float64Array(X.length);
+  // four-sided: the face's border is the surface's boundary, so a point on a side keeps that side's coordinate when
+  // its parameters are corrected (it slides along the side only; a corner stays put). Left free, border points drift
+  // a hair inside the domain, and the rows next to the boundary, which then barely touch any point, are left to the
+  // round-off: a strip with no vertices between its rims folds its boundary row back and forth along a straight edge.
+  const lockU = new Float64Array(X.length).fill(NaN), lockV = new Float64Array(X.length).fill(NaN);
+  if (info.param === 'four-sided') {
+    for (let k = 0; k < X.length; k++) {
+      if (U[k] === lo[0] || U[k] === hi[0]) lockU[k] = U[k];
+      if (Vv[k] === lo[1] || Vv[k] === hi[1]) lockV[k] = Vv[k];
+    }
+  }
   const project = (S) => {
     for (let k = 0; k < X.length; k++) {
+      const lu = !Number.isNaN(lockU[k]), lv = !Number.isNaN(lockV[k]);
+      if (lu && lv) { err[k] = norm(sub(S.eval(U[k], Vv[k]).S, X[k])); continue; }
+      if (lu || lv) {
+        // the closest point along the side (Newton on the one free parameter, clamped to the domain)
+        let t = lu ? Vv[k] : U[k];
+        const [a, b] = lu ? [lo[1], hi[1]] : [lo[0], hi[0]];
+        const at = (x) => (lu ? S.eval(lockU[k], x, 2) : S.eval(x, lockV[k], 2));
+        for (let it = 0; it < 8; it++) {
+          const d = at(t), r = sub(d.S, X[k]), D1 = lu ? d.Sv : d.Su, D2 = lu ? d.Svv : d.Suu;
+          const g = dot(r, D1), h = dot(D1, D1) + dot(r, D2);
+          const step = h > 0 ? -g / h : -g / Math.max(dot(D1, D1), 1e-300);
+          const nt = Math.min(b, Math.max(a, t + step));
+          if (norm(sub(at(nt).S, X[k])) > norm(r)) break;
+          t = nt;
+        }
+        if (lu) Vv[k] = t; else U[k] = t;
+        err[k] = norm(sub(S.eval(U[k], Vv[k]).S, X[k]));
+        continue;
+      }
       const r = S.closest(X[k], [U[k], Vv[k]], 8);
       U[k] = r.u; Vv[k] = r.v;
       err[k] = norm(sub(r.S, X[k]));
@@ -734,7 +822,7 @@ export function fitGroup(V, T, { scale = null, tol = FIT.TOL, lam = FIT.LAMBDA, 
     if (errF <= absTol || rnd === FIT.REFINE_ROUNDS || stale >= FIT.VAL_PATIENCE) break;
     // a knot mid-span in every span holding a vertex over tolerance and REFINE_MIN_POINTS in all;
     // round a ring the spans are doubled instead
-    const over = (k) => err[k] > absTol && !hold[k];
+    const over = (k) => err[k] > absTol && !hold[k] && !(k >= nV && soft[k - nV]);
     const kvD = distinct(tv), kuD = distinct(tu);
     const spanIdx = (kd, x) => { let i = 0; while (i + 1 < kd.length - 1 && x >= kd[i + 1]) i++; return i; };
     const addV = [], addU = [];
