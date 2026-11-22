@@ -98,8 +98,20 @@ function attempt(oc, { positions, labels, surfaces, oriented = false }, part, sp
   try { fx = faceExport({ positions, labels, surfaces }, { part, split }); } catch (err) { return { rejected: `threw: ${String(err?.message ?? err).slice(0, 160)}`, info: {} }; }
   const info = { ...fx.report.info, face_ms: Math.round(performance.now() - t0) };
   if (fx.error) return { rejected: fx.error, info };
-  const shape = readStep(oc, fx.step);
+  let shape = readStep(oc, fx.step);
   if (!shape) return { rejected: 'the kernel could not read it', info };
+  // the reader's shape healing can add faces with no wires, each an unbounded plane (00036039_0_solidcraft: 88 faces
+  // written, all bounded, 90 read): they are its artifacts, not the file's, and they wreck the volume integral
+  {
+    const W = oc.TopAbs_ShapeEnum, empty = subShapes(oc, shape, W.TopAbs_FACE).filter((f) => !subShapes(oc, f, W.TopAbs_WIRE).length);
+    if (empty.length) {
+      const rs = new oc.BRepTools_ReShape();
+      for (const f of empty) rs.Remove(f);
+      shape = rs.Apply(shape, W.TopAbs_SHAPE);
+      rs.delete();
+      info.empty_faces_dropped = empty.length;
+    }
+  }
   const mesh = new KnitMesh(positions, labels, { oriented });
   const sc = score(oc, shape, mesh), vm = mesh.volume();
   // the volume against the mesh's plus the bulge (score's vol_err is against the mesh's alone)
@@ -116,6 +128,17 @@ function attempt(oc, { positions, labels, surfaces, oriented = false }, part, sp
   if (!(sc.closed && sc.valid && !sc.off_mesh && volErr !== null && volErr < 0.01)) {
     let why = !sc.closed ? 'not closed' : !sc.valid ? 'not valid' : sc.off_mesh ? 'faces off the mesh' : `volume ${((volErr ?? 1) * 100).toFixed(2)}% off`;
     let bad = [];
+    if (volErr !== null && !(volErr < 1)) {
+      // a volume the kernel cannot integrate: list the faces whose parameter box is not bounded
+      const W = oc.TopAbs_ShapeEnum;
+      info.unbounded = [];
+      faces.forEach((fc, i) => {
+        const face = oc.TopoDS.Face_1(fc), sa = new oc.BRepAdaptor_Surface_2(face, true);
+        const b = [sa.FirstUParameter(), sa.LastUParameter(), sa.FirstVParameter(), sa.LastVParameter()];
+        if (!b.every((x) => Math.abs(x) < 1e6 * mesh.diag)) info.unbounded.push(`face ${i}: type ${sa.GetType()?.value ?? sa.GetType()}, ${subShapes(oc, face, W.TopAbs_WIRE).length} wires, ${subShapes(oc, face, W.TopAbs_EDGE).length} edges, key ${JSON.stringify(byPlace ? byPlace[i]?.label : fx.faceKeys[i]?.label)}`);
+        sa.delete();
+      });
+    }
     if (sc.off_mesh) {
       // the faces that strayed (score lists a face once per stray edge)
       const idx = [];
