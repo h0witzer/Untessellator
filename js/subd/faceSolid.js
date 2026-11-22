@@ -709,31 +709,47 @@ export function faceSolid(vertices, triangles, labels, { scale = null, tol = FIT
  * where its normals turn most (freeformFit's splitNormals: normal-cone clustering) and the solid built again, the
  * other faces' fits kept; up to `rounds` times. A painted face goes out as one STEP face wherever one surface can
  * carry it, and as the fewest pieces this finds where not. A face whose given surface (opts.surfaces) fails it (a
- * cone typed onto a few triangles across its apex) is fitted freely instead, before any split. Out as faceSolid's,
- * each face with `origin` (its painted label), `splits`: [{ origin, pieces }] and `retyped`: [[label, given type]].
+ * cone typed onto a few triangles across its apex) is fitted freely instead, before any split. split: faces to cut
+ * before the first build, each given by its triangles (indices into triangles: the same on every run, so a later
+ * call can name a piece an earlier one made, faceExport's kernel verdicts): those triangles become a face of their
+ * own and it is cut. Out as faceSolid's, each face with `origin` (its painted label) and `tris` (its triangles),
+ * `splits`: [{ origin, pieces }] and `retyped`: [[label, given type]].
  */
-export function faceSolidSplit(vertices, triangles, labels, { rounds = 4, ...opts } = {}) {
+export function faceSolidSplit(vertices, triangles, labels, { rounds = 4, split = null, ...opts } = {}) {
   const lab = Array.from(labels), origin = new Map(), fits = new Map(), splits = new Map(), retyped = [];
   const surfaces = new Map(opts.surfaces ?? []);
   let next = Math.max(...lab) + 1, r = null;
+  const cutFace = (label) => {
+    const tris = [];
+    lab.forEach((l, t) => { if (l === label) tris.push(t); });
+    const pieces = tris.length > 1 ? splitNormals(vertices, triangles, tris) : [tris];
+    if (pieces.length < 2) return false;
+    const root = origin.get(label) ?? label;
+    for (const piece of pieces) { for (const t of piece) lab[t] = next; origin.set(next, root); next++; }
+    splits.set(root, (splits.get(root) ?? 1) - 1 + pieces.length);
+    return true;
+  };
+  for (const tris of split ?? []) {
+    const was = labels[tris[0]];
+    if (surfaces.has(was)) continue;              // a given surface is not cut
+    const label = next++;
+    for (const t of tris) lab[t] = label;
+    origin.set(label, was);
+    cutFace(label);
+  }
   for (let round = 0; ; round++) {
     r = faceSolid(vertices, triangles, lab, { ...opts, surfaces, fits });
     if (!r.error || !r.failed?.length || round === rounds) break;
     let cut = false;
     for (const label of r.failed) {
       if (surfaces.has(label)) { retyped.push([label, surfaces.get(label)[0]]); surfaces.delete(label); cut = true; continue; }
-      const tris = [];
-      lab.forEach((l, t) => { if (l === label) tris.push(t); });
-      const pieces = tris.length > 1 ? splitNormals(vertices, triangles, tris) : [tris];
-      if (pieces.length < 2) continue;
-      const root = origin.get(label) ?? label;
-      for (const piece of pieces) { for (const t of piece) lab[t] = next; origin.set(next, root); next++; }
-      splits.set(root, (splits.get(root) ?? 1) - 1 + pieces.length);
-      cut = true;
+      if (cutFace(label)) cut = true;
     }
     if (!cut) break;
   }
   const out = { ...r, splits: [...splits].map(([o, pieces]) => ({ origin: o, pieces })), retyped };
-  for (const f of r.faces ?? []) f.origin = origin.get(f.label) ?? f.label;
+  const trisOf = new Map();
+  lab.forEach((l, t) => (trisOf.get(l) ?? trisOf.set(l, []).get(l)).push(t));
+  for (const f of r.faces ?? []) { f.origin = origin.get(f.label) ?? f.label; f.tris = trisOf.get(f.label) ?? []; }
   return out;
 }

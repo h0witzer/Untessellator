@@ -7,7 +7,8 @@
  *
  * In:  { positions (9 per triangle), labels (group per triangle, < 0 unpainted), surfaces (Map group -> [type,
  *        params]) }, { part, names? }
- * Out: { step, report } or { error, report }: report as the knitter's (js/knit/index.js knitSolid) where the studio
+ * Out: { step, report, faceKeys } or { error, report }: faceKeys, per face in the file's order, { b: its body, tris:
+ * its triangles in that body } (null for an analytic face), for split; report as the knitter's (js/knit/index.js knitSolid) where the studio
  *      reads it (tier 'analytic': every face on a surface, no facets), with info.path 'faces' and what it did.
  *
  * Unpainted triangles: each connected run a group of its own, fitted like a freeform one. A body with a void, or a
@@ -18,7 +19,7 @@ import { faceSolidSplit } from './faceSolid.js';
 import { faceStep } from './faceStep.js';
 import { ANALYTIC } from './analytic.js';
 
-export function faceExport({ positions, labels, surfaces }, { part = 'Part' } = {}) {
+export function faceExport({ positions, labels, surfaces }, { part = 'Part', split = null } = {}) {
   const t0 = performance.now();
   const nT = labels.length;
   // weld on exact coordinates (the payload is a triangle soup)
@@ -66,7 +67,7 @@ export function faceExport({ positions, labels, surfaces }, { part = 'Part' } = 
       }
     }
   }
-  const solids = [], final = [], rows = [], loose = [];
+  const solids = [], final = [], rows = [], loose = [], faceKeys = [];
   let bulge = 0;
   let edgeTol = 0;
   for (let b = 0; b < found.bodies.length; b++) {
@@ -82,11 +83,14 @@ export function faceExport({ positions, labels, surfaces }, { part = 'Part' } = 
       Lb.push(lab[t]);
     }
     let r;
-    try { r = faceSolidSplit(Vb, Tb, Lb, { scale: diag, surfaces: given }); } catch (e) { r = { error: `threw: ${String(e?.message ?? e).slice(0, 200)}` }; }
+    // split: faces to cut first, [{ b, tris }] (the kernel's verdicts on an earlier try, knit/facePath.js)
+    const cut = (split ?? []).filter((x) => x.b === b).map((x) => x.tris);
+    try { r = faceSolidSplit(Vb, Tb, Lb, { scale: diag, surfaces: given, split: cut }); } catch (e) { r = { error: `threw: ${String(e?.message ?? e).slice(0, 200)}` }; }
     if (r.error) return { error: r.error, report: report({}) };
     for (const sp of r.splits ?? []) info.splits.push(sp);
     for (const [g, was] of r.retyped ?? []) retyped.push([g, was, 'bspline']);
     for (const f of r.faces) {
+      faceKeys.push(f.params?.analytic ? null : { b, tris: f.tris });
       if (f.params?.analytic) info.analytic_faces++; else info.fitted_faces++;
       final.push([f.origin ?? f.label, f.params?.analytic ? f.params.analytic.type : 'bspline']);
     }
@@ -104,7 +108,7 @@ export function faceExport({ positions, labels, surfaces }, { part = 'Part' } = 
   info.step_faces = solids.reduce((s, x) => s + x.faces.length, 0);
   final.sort((x, y) => x[0] - y[0]);
   return {
-    step, solids,
+    step, solids, faceKeys,
     report: report({ tier: 'analytic', bestTier: 'analytic', closed: true, valid: true, free_edges: 0, nonmanifold_edges: 0, shells: solids.length, bodies: rows,
       faces: { problems: {}, moves: [], absorbed: [], retyped, final, demoted: [], pieces: [] } }),
   };

@@ -29,10 +29,27 @@ export function hasFreeform(labels, surfaces) {
   return false;
 }
 
-export function tryFacePath(oc, { positions, labels, surfaces, oriented = false }, { part = 'Part' } = {}) {
+export function tryFacePath(oc, payload, { part = 'Part', budgetS = Infinity } = {}) {
+  // the kernel's verdict names faces (invalid, or not tessellated): fitted ones are cut and the solid built again,
+  // twice at most and within budgetS (the knitter's time after it is what is left)
+  const t0 = performance.now(), split = [], seen = new Set();
+  let last = null;
+  for (let round = 0; round < 3; round++) {
+    const r = attempt(oc, payload, part, split);
+    (r.info ?? r.report.info).kernel_rounds = round;
+    if (r.step) return r;
+    last = r;
+    const add = (r.bad ?? []).filter((k) => k && !seen.has(`${k.b}:${k.tris.join(',')}`));
+    if (!add.length || (performance.now() - t0) / 1000 > budgetS) break;
+    for (const k of add) { seen.add(`${k.b}:${k.tris.join(',')}`); split.push(k); }
+  }
+  return { rejected: last.rejected, info: last.info };
+}
+
+function attempt(oc, { positions, labels, surfaces, oriented = false }, part, split) {
   const t0 = performance.now();
   let fx;
-  try { fx = faceExport({ positions, labels, surfaces }, { part }); } catch (err) { return { rejected: `threw: ${String(err?.message ?? err).slice(0, 160)}`, info: {} }; }
+  try { fx = faceExport({ positions, labels, surfaces }, { part, split }); } catch (err) { return { rejected: `threw: ${String(err?.message ?? err).slice(0, 160)}`, info: {} }; }
   const info = { ...fx.report.info, face_ms: Math.round(performance.now() - t0) };
   if (fx.error) return { rejected: fx.error, info };
   const shape = readStep(oc, fx.step);
@@ -44,15 +61,31 @@ export function tryFacePath(oc, { positions, labels, surfaces, oriented = false 
   info.check_ms = Math.round(performance.now() - t0) - info.face_ms;
   info.vol_err_mesh = sc.vol_err;
   info.vol_err_surfaces = volErr;
+  const faces = subShapes(oc, shape, oc.TopAbs_ShapeEnum.TopAbs_FACE);
+  // the faces the kernel calls invalid, as faceExport's keys (the file's order is the read shape's)
+  const keyed = (idx) => (faces.length === fx.faceKeys.length ? idx.map((i) => fx.faceKeys[i]).filter(Boolean) : []);
   if (!(sc.closed && sc.valid && !sc.off_mesh && volErr !== null && volErr < 0.01)) {
     const why = !sc.closed ? 'not closed' : !sc.valid ? 'not valid' : sc.off_mesh ? `${sc.off_mesh} faces off the mesh` : `volume ${((volErr ?? 1) * 100).toFixed(2)}% off`;
-    return { rejected: why, info };
+    let bad = [];
+    if (sc.closed && !sc.valid) {
+      const ana = new oc.BRepCheck_Analyzer(shape, true, false), W = oc.TopAbs_ShapeEnum, idx = [];
+      faces.forEach((fc, i) => {
+        if (!ana.IsValid_1(fc) || subShapes(oc, fc, W.TopAbs_WIRE).some((w) => !ana.IsValid_1(w)) || subShapes(oc, fc, W.TopAbs_EDGE).some((e) => !ana.IsValid_1(e))) idx.push(i);
+      });
+      ana.delete();
+      bad = keyed(idx);
+    }
+    return { rejected: why, info, bad };
   }
   let preview;
   try { preview = previewMesh(oc, shape, 1e-3 * mesh.diag); } catch { return { rejected: 'the kernel could not tessellate it', info }; }
-  // (the preview leaves out a face it cannot tessellate, and counts only those it drew)
-  const total = subShapes(oc, shape, oc.TopAbs_ShapeEnum.TopAbs_FACE).length;
-  if (preview.faces < total) return { rejected: `${total - preview.faces} faces the kernel could not tessellate`, info };
+  // (the preview leaves out a face it cannot tessellate, and counts only those it drew: a face left with no
+  // triangulation after it is one)
+  if (preview.faces < faces.length) {
+    const idx = [];
+    faces.forEach((fc, i) => { const loc = new oc.TopLoc_Location_1(); if (oc.BRep_Tool.Triangulation(oc.TopoDS.Face_1(fc), loc, 0).IsNull()) idx.push(i); loc.delete(); });
+    return { rejected: `${faces.length - preview.faces} faces the kernel could not tessellate`, info, bad: keyed(idx) };
+  }
   const { far, beyond } = strays(preview.positions, positions, mesh.diag);
   info.preview_far = far; info.preview_beyond = beyond;
   if (beyond > 0 || far > 0.01 * (preview.positions.length / 3)) return { rejected: `off the mesh (${beyond} points past 1%, ${far} past 0.5% of its size)`, info };

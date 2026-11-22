@@ -52,7 +52,7 @@ self.onmessage = async ({ data }) => {
     if (options.facePath !== false && !keep && hasFreeform(labels, new Map(surfaces))) {
       const tf = performance.now();
       self.postMessage({ type: 'status', text: 'Building one face per painted group…' });
-      const fp = tryFacePath(oc, { positions, labels, surfaces: new Map(surfaces), oriented }, { part });
+      const fp = tryFacePath(oc, { positions, labels, surfaces: new Map(surfaces), oriented }, { part, budgetS: (options.deadline ?? 150) / 3 });
       if (fp.step) {
         const { preview } = fp;
         const buffers = preview ? [preview.positions.buffer, preview.normals.buffer, preview.face.buffer, preview.edges.buffer] : [];
