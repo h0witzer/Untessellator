@@ -9,7 +9,8 @@
  * In:  { positions (9 per triangle), labels (group per triangle, < 0 unpainted), surfaces (Map group -> [type,
  *        params]) }, { part, names? }
  * Out: { step, report, faceKeys } or { error, report }: faceKeys, per face in the file's order, { b: its body, tris:
- * its triangles in that body } for split, and for an analytic face also { label: its painted group, analytic: true }
+ * its triangles in that body, g: the same as the payload's triangle indices, label: its painted group } for split, and
+ * for an analytic face also { analytic: true }
  * (knit/facePath.js fits that group freely instead); report as the knitter's (js/knit/index.js knitSolid) where the studio
  *      reads it (tier 'analytic': every face on a surface, no facets), with info.path 'faces' and what it did.
  *
@@ -87,13 +88,14 @@ export function faceExport({ positions, labels, surfaces }, { part = 'Part', spl
     const body = found.bodies[b];
     if (!body.closed) return { error: 'the mesh has holes (open edges)', report: report({}) };
     if (body.shells.length > 1) return { error: 'a body with a void', report: report({}) };
-    const local = new Map(), Vb = [], Tb = [], Lb = [];
+    const local = new Map(), Vb = [], Tb = [], Lb = [], Gb = [];
     const at = (v) => { let i = local.get(v); if (i === undefined) { i = Vb.length; local.set(v, i); Vb.push(V[v]); } return i; };
     for (let t = 0; t < nT; t++) {
       if (found.bodyOf[t] !== b) continue;
       const [a, c, d] = [idx[t * 3], idx[t * 3 + 1], idx[t * 3 + 2]];
       Tb.push(found.flip[t] ? [at(a), at(d), at(c)] : [at(a), at(c), at(d)]);
       Lb.push(lab[t]);
+      Gb.push(t);
     }
     let r;
     // split: faces to cut first, [{ b, tris }] (the kernel's verdicts on an earlier try, knit/facePath.js)
@@ -103,7 +105,8 @@ export function faceExport({ positions, labels, surfaces }, { part = 'Part', spl
     for (const sp of r.splits ?? []) info.splits.push(sp);
     for (const [g, was] of r.retyped ?? []) retyped.push([g, was, 'bspline']);
     for (const f of r.faces) {
-      faceKeys.push(f.params?.analytic ? { b, tris: f.tris, label: f.origin ?? f.label, analytic: true } : { b, tris: f.tris, label: f.origin ?? f.label });
+      const g = f.tris.map((i) => Gb[i]);
+      faceKeys.push(f.params?.analytic ? { b, tris: f.tris, g, label: f.origin ?? f.label, analytic: true } : { b, tris: f.tris, g, label: f.origin ?? f.label });
       if (f.params?.analytic) info.analytic_faces++; else info.fitted_faces++;
       final.push([f.origin ?? f.label, f.params?.analytic ? f.params.analytic.type : 'bspline']);
     }

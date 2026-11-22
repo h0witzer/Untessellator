@@ -109,7 +109,10 @@ function attempt(oc, { positions, labels, surfaces, oriented = false }, part, sp
   info.vol_err_surfaces = volErr;
   const faces = subShapes(oc, shape, oc.TopAbs_ShapeEnum.TopAbs_FACE);
   // the faces the kernel names, as faceExport's keys (the file's order is the read shape's)
-  const keyed = (idx) => (faces.length === fx.faceKeys.length ? idx.map((i) => fx.faceKeys[i]).filter(Boolean) : []);
+  // (the reader's shape healing can split a face, so the counts differ: each read face then takes its key by place)
+  const byPlace = faces.length === fx.faceKeys.length ? null : keysByPlace(oc, faces, fx.faceKeys, positions);
+  const keyed = (idx) => idx.map((i) => (byPlace ? byPlace[i] : fx.faceKeys[i])).filter(Boolean);
+  info.keyed_by_place = byPlace ? `${faces.length} read, ${fx.faceKeys.length} written` : null;
   if (!(sc.closed && sc.valid && !sc.off_mesh && volErr !== null && volErr < 0.01)) {
     let why = !sc.closed ? 'not closed' : !sc.valid ? 'not valid' : sc.off_mesh ? 'faces off the mesh' : `volume ${((volErr ?? 1) * 100).toFixed(2)}% off`;
     let bad = [];
@@ -156,6 +159,71 @@ function attempt(oc, { positions, labels, surfaces, oriented = false }, part, sp
   const report = { ...fx.report, closed: true, valid: true, vol_err: volErr, free_edges: sc.free_edges ?? 0,
     secs: Math.round((performance.now() - t0) / 100) / 10, info };
   return { step: fx.step, report, shape, preview };
+}
+
+/**
+ * Each read face's key (faceExport's faceKeys, by their g: payload triangle indices) by place: the key of the mesh
+ * triangle nearest most of a 5 x 5 grid of points inside the face (its parameter box, kept where the face is). For
+ * when the kernel's reader split faces, so the file's order no longer matches. A face no point of which lands
+ * gets null.
+ */
+function keysByPlace(oc, faces, keys, P) {
+  const nT = P.length / 9, owner = new Int32Array(nT).fill(-1);
+  keys.forEach((k, i) => { for (const t of k?.g ?? []) owner[t] = i; });
+  // a grid of triangle centroids, cells about four median triangles wide
+  const C = new Float64Array(nT * 3), sizes = [];
+  for (let t = 0; t < nT; t++) {
+    const o = t * 9;
+    for (let k = 0; k < 3; k++) C[t * 3 + k] = (P[o + k] + P[o + 3 + k] + P[o + 6 + k]) / 3;
+    if (t % Math.max(1, Math.floor(nT / 2000)) === 0) sizes.push(Math.hypot(P[o + 3] - P[o], P[o + 4] - P[o + 1], P[o + 5] - P[o + 2]));
+  }
+  sizes.sort((a, b) => a - b);
+  const h = Math.max(4 * (sizes[sizes.length >> 1] || 1), 1e-9), cells = new Map(), key = (x, y, z) => `${x},${y},${z}`;
+  for (let t = 0; t < nT; t++) {
+    const c = key(Math.floor(C[t * 3] / h), Math.floor(C[t * 3 + 1] / h), Math.floor(C[t * 3 + 2] / h));
+    (cells.get(c) ?? cells.set(c, []).get(c)).push(t);
+  }
+  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < C.length; i++) { const k = i % 3; lo[k] = Math.min(lo[k], C[i]); hi[k] = Math.max(hi[k], C[i]); }
+  const nearest = (p) => {
+    // only points about the part (a ring search far outside it finds nothing, and huge cell indices stop counting)
+    if (p.some((x, k) => !Number.isFinite(x) || x < lo[k] - 8 * h || x > hi[k] + 8 * h)) return -1;
+    const c = p.map((x) => Math.floor(x / h));
+    for (let r = 0; r <= 8; r++) {
+      let best = -1, bd = Infinity;
+      for (let x = c[0] - r; x <= c[0] + r; x++) for (let y = c[1] - r; y <= c[1] + r; y++) for (let z = c[2] - r; z <= c[2] + r; z++) {
+        for (const t of cells.get(key(x, y, z)) ?? []) {
+          const d = (C[t * 3] - p[0]) ** 2 + (C[t * 3 + 1] - p[1]) ** 2 + (C[t * 3 + 2] - p[2]) ** 2;
+          if (d < bd) { bd = d; best = t; }
+        }
+      }
+      if (best >= 0) return best;
+    }
+    return -1;
+  };
+  const IN = oc.TopAbs_State.TopAbs_IN;
+  // (a face whose parameter box is not bounded, as a plane read back with no curves on it can be, is not sampled: its
+  // grid points would lie astronomically far away)
+  const bound = 1e6 * Math.max(Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]), 1e-9);
+  return faces.map((fc) => {
+    const face = oc.TopoDS.Face_1(fc), sa = new oc.BRepAdaptor_Surface_2(face, true);
+    const u0 = sa.FirstUParameter(), u1 = sa.LastUParameter(), v0 = sa.FirstVParameter(), v1 = sa.LastVParameter(), votes = new Map();
+    if (![u0, u1, v0, v1].every((x) => Number.isFinite(x) && Math.abs(x) < bound)) { sa.delete(); return null; }
+    const cls = new oc.BRepTopAdaptor_FClass2d(face, 1e-9);
+    for (const fu of [0.1, 0.3, 0.5, 0.7, 0.9]) for (const fv of [0.1, 0.3, 0.5, 0.7, 0.9]) {
+      const uv = new oc.gp_Pnt2d_3(u0 + fu * (u1 - u0), v0 + fv * (v1 - v0));
+      if (cls.Perform(uv, false) === IN) {
+        const q = sa.Value(uv.X(), uv.Y()), t = nearest([q.X(), q.Y(), q.Z()]);
+        q.delete();
+        if (t >= 0 && owner[t] >= 0) votes.set(owner[t], (votes.get(owner[t]) ?? 0) + 1);
+      }
+      uv.delete();
+    }
+    cls.delete(); sa.delete();
+    let best = -1, n = 0;
+    for (const [k, c] of votes) if (c > n) { n = c; best = k; }
+    return best >= 0 ? keys[best] : null;
+  });
 }
 
 /**
