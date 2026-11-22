@@ -9,7 +9,8 @@
  * In:  { positions (9 per triangle), labels (group per triangle, < 0 unpainted), surfaces (Map group -> [type,
  *        params]) }, { part, names? }
  * Out: { step, report, faceKeys } or { error, report }: faceKeys, per face in the file's order, { b: its body, tris:
- * its triangles in that body } (null for an analytic face), for split; report as the knitter's (js/knit/index.js knitSolid) where the studio
+ * its triangles in that body } for split, and for an analytic face also { label: its painted group, analytic: true }
+ * (knit/facePath.js fits that group freely instead); report as the knitter's (js/knit/index.js knitSolid) where the studio
  *      reads it (tier 'analytic': every face on a surface, no facets), with info.path 'faces' and what it did.
  *
  * Unpainted triangles: each connected run a group of its own, fitted like a freeform one. A body with a void, or a
@@ -102,7 +103,7 @@ export function faceExport({ positions, labels, surfaces }, { part = 'Part', spl
     for (const sp of r.splits ?? []) info.splits.push(sp);
     for (const [g, was] of r.retyped ?? []) retyped.push([g, was, 'bspline']);
     for (const f of r.faces) {
-      faceKeys.push(f.params?.analytic ? null : { b, tris: f.tris });
+      faceKeys.push(f.params?.analytic ? { b, tris: f.tris, label: f.origin ?? f.label, analytic: true } : { b, tris: f.tris, label: f.origin ?? f.label });
       if (f.params?.analytic) info.analytic_faces++; else info.fitted_faces++;
       final.push([f.origin ?? f.label, f.params?.analytic ? f.params.analytic.type : 'bspline']);
     }

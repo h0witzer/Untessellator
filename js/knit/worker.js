@@ -7,7 +7,10 @@
  * A part with freeform groups (painted groups with no surface) goes the face path first (knit/facePath.js: one
  * trimmed face per group, the STEP written without the kernel, which only reads it back to judge and tessellate it),
  * and to the knitter when that is not closed, valid and of the mesh's volume (options.facePath false: the knitter
- * only); report.info.path is 'faces' when it was taken, report.info.face_path why not when it was not.
+ * only); report.info.path is 'faces' when it was taken, report.info.face_path why not when it was not. A knitted
+ * solid with facets in it (or no solid) then gets the face path once more, with the groups the knitter could build
+ * only as facets fitted as B-splines (knit/facePath.js faceAfterKnit); report.info.face_after_knit says why not
+ * when the knitter's result stays.
  *
  * Message in:  {positions: Float64Array (9 per triangle), labels: Int32Array, surfaces: [[id, [type,
  *               params]], ...], options: {budget?, fallback?, deadline?, mode?, keep?, facePath?}, repair?: true,
@@ -24,7 +27,7 @@
 
 import { loadOcct, knitSolid, repairGroups, writeStep, brepText } from './index.js';
 import { previewMesh } from './preview.js';
-import { hasFreeform, tryFacePath } from './facePath.js';
+import { hasFreeform, tryFacePath, faceAfterKnit } from './facePath.js';
 
 // warm: loading now, before any build is asked for
 let ready = false;
@@ -46,6 +49,7 @@ self.onmessage = async ({ data }) => {
       return;
     }
     const keep = options.keep ? new Map(options.keep) : null;
+    const tStart = performance.now();
     // a part with freeform groups: one face per painted group first (knit/facePath.js), taken when it is as good as
     // the knitter's own bar; else the knitter, as before
     let faceTried = null, faceSecs = 0;
@@ -75,6 +79,21 @@ self.onmessage = async ({ data }) => {
     const { solid, report, names: solidNames } = knitSolid(oc, { positions, labels, surfaces: new Map(surfaces), bodies, names, oriented },
       { ...knitOptions, keep, onProgress, onBody });
     if (faceTried) report.info = { ...report.info, face_path: faceTried.rejected, face_path_info: faceTried.info };
+    // never facets: a solid with facets in it (or none at all) gets the face path as one more rung, the facet groups
+    // fitted as B-splines (knit/facePath.js faceAfterKnit); the knitter's result stays when that does not pass
+    if (!keep && options.facePath !== false && (!solid || (report.facetArea ?? 0) > 0)) {
+      self.postMessage({ type: 'status', text: 'Fitting B-spline faces where the solid has facets…' });
+      const left = (options.deadline ?? 150) - (performance.now() - tStart) / 1000;
+      const fa = faceAfterKnit(oc, { positions, labels, surfaces: new Map(surfaces), oriented }, report,
+        { part, budgetS: Math.max(30, left), triedAsPainted: !!faceTried });
+      if (fa.step) {
+        const { preview } = fa;
+        const buffers = preview ? [preview.positions.buffer, preview.normals.buffer, preview.face.buffer, preview.edges.buffer] : [];
+        self.postMessage({ type: 'done', step: fa.step, report: fa.report, preview }, buffers);
+        return;
+      }
+      report.info = { ...report.info, face_after_knit: fa.rejected };
+    }
     self.postMessage({ type: 'status', text: 'Writing STEP…' });
     const step = solid ? writeStep(oc, solid, solidNames ? { names: solidNames, part } : {}) : null;
     // the preview: tessellated to a thousandth of the part's diagonal; without one the studio saves at once

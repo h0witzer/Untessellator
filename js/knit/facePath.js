@@ -31,20 +31,62 @@ export function hasFreeform(labels, surfaces) {
 }
 
 export function tryFacePath(oc, payload, { part = 'Part', budgetS = Infinity } = {}) {
-  // the kernel's verdict names faces (invalid, or not tessellated): fitted ones are cut and the solid built again,
-  // twice at most and within budgetS (the knitter's time after it is what is left)
-  const t0 = performance.now(), split = [], seen = new Set();
+  // the kernel's verdict names faces (invalid, not tessellated, or off the mesh) and the solid is built again, three
+  // times at most and within budgetS (the knitter's time after it is what is left): an analytic face named is fitted
+  // freely as one B-spline face of its group, a fitted one is cut where its normals turn most (faceSolidSplit)
+  const t0 = performance.now(), split = [], seen = new Set(), free = new Set(), rounds = [];
   let last = null;
-  for (let round = 0; round < 3; round++) {
-    const r = attempt(oc, payload, part, split);
-    (r.info ?? r.report.info).kernel_rounds = round;
+  for (let round = 0; round < 4; round++) {
+    const surfaces = free.size ? new Map([...payload.surfaces].filter(([g]) => !free.has(g))) : payload.surfaces;
+    const r = attempt(oc, { ...payload, surfaces }, part, split);
+    const info = r.info ?? r.report.info;
+    rounds.push(`${r.step ? 'taken' : r.rejected} [freed ${free.size}, cut ${split.length}, splits ${info.splits?.length ?? 0}]`);
+    info.kernel_rounds = round;
+    info.freed = free.size;
+    info.rounds = rounds;
     if (r.step) return r;
     last = r;
-    const add = (r.bad ?? []).filter((k) => k && !seen.has(`${k.b}:${k.tris.join(',')}`));
-    if (!add.length || (performance.now() - t0) / 1000 > budgetS) break;
-    for (const k of add) { seen.add(`${k.b}:${k.tris.join(',')}`); split.push(k); }
+    let added = 0;
+    for (const k of r.bad ?? []) {
+      if (k.analytic) { if (!free.has(k.label)) { free.add(k.label); added++; } continue; }
+      const id = `${k.b}:${k.tris.join(',')}`;
+      if (!seen.has(id)) { seen.add(id); split.push(k); added++; }
+    }
+    if (!added || (performance.now() - t0) / 1000 > budgetS) break;
   }
   return { rejected: last.rejected, info: last.info };
+}
+
+/**
+ * The face path as the last rung before facets. A knit whose solid has facets in it (or no solid) is tried once more
+ * as one face per painted group: first the groups as painted, unless the face path already tried that, then with the
+ * groups the knitter could build only as facets (knitReport.faces.demoted) fitted as B-splines instead of kept on the
+ * surfaces they failed on. Returns tryFacePath's result for the first that passes, else the last rejection;
+ * info.after_knit records what the knitter made and info.after_knit_how which try was taken.
+ */
+export function faceAfterKnit(oc, payload, knitReport, { part = 'Part', budgetS = Infinity, triedAsPainted = false } = {}) {
+  const demoted = knitReport?.faces?.demoted;
+  const was = { tier: knitReport?.tier ?? 'none', facetArea: knitReport?.facetArea ?? null };
+  const tries = [];
+  if (!triedAsPainted) tries.push(['as painted', payload.surfaces]);
+  if (Array.isArray(demoted) && demoted.length) {
+    const s = new Map(payload.surfaces);
+    for (const g of demoted) s.delete(g);
+    tries.push(['facet groups as B-splines', s]);
+  }
+  const t0 = performance.now(), why = [];
+  let last = { info: {} };
+  for (const [how, surfaces] of tries) {
+    const left = budgetS - (performance.now() - t0) / 1000;
+    if (left <= 0) { why.push(`${how}: out of time`); break; }
+    const r = tryFacePath(oc, { ...payload, surfaces }, { part, budgetS: left });
+    const info = r.info ?? r.report?.info;
+    if (info) { info.after_knit = was; info.after_knit_how = how; }
+    if (r.step) return r;
+    why.push(`${how}: ${r.rejected}`);
+    last = r;
+  }
+  return { ...last, rejected: why.join('; ') || 'nothing to try' };
 }
 
 function attempt(oc, { positions, labels, surfaces, oriented = false }, part, split) {
@@ -63,11 +105,20 @@ function attempt(oc, { positions, labels, surfaces, oriented = false }, part, sp
   info.vol_err_mesh = sc.vol_err;
   info.vol_err_surfaces = volErr;
   const faces = subShapes(oc, shape, oc.TopAbs_ShapeEnum.TopAbs_FACE);
-  // the faces the kernel calls invalid, as faceExport's keys (the file's order is the read shape's)
+  // the faces the kernel names, as faceExport's keys (the file's order is the read shape's)
   const keyed = (idx) => (faces.length === fx.faceKeys.length ? idx.map((i) => fx.faceKeys[i]).filter(Boolean) : []);
   if (!(sc.closed && sc.valid && !sc.off_mesh && volErr !== null && volErr < 0.01)) {
-    const why = !sc.closed ? 'not closed' : !sc.valid ? 'not valid' : sc.off_mesh ? `${sc.off_mesh} faces off the mesh` : `volume ${((volErr ?? 1) * 100).toFixed(2)}% off`;
+    let why = !sc.closed ? 'not closed' : !sc.valid ? 'not valid' : sc.off_mesh ? 'faces off the mesh' : `volume ${((volErr ?? 1) * 100).toFixed(2)}% off`;
     let bad = [];
+    if (sc.off_mesh) {
+      // the faces that strayed (score lists a face once per stray edge)
+      const idx = [];
+      faces.forEach((fc, i) => { if (sc.offFaces.some((o) => o.IsSame(fc))) idx.push(i); });
+      bad = keyed(idx);
+      info.off_analytic = bad.filter((k) => k.analytic).length; info.off_fitted = bad.length - info.off_analytic;
+      info.off_faces = bad.map((k) => `${k.analytic ? 'analytic' : 'fitted'} ${k.label}: ${k.tris.length} tris`);
+      why = `${idx.length} faces off the mesh (${info.off_analytic} analytic, ${info.off_fitted} fitted)`;
+    }
     if (sc.closed && !sc.valid) {
       const ana = new oc.BRepCheck_Analyzer(shape, true, false), W = oc.TopAbs_ShapeEnum, idx = [];
       faces.forEach((fc, i) => {
