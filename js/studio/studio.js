@@ -35,6 +35,7 @@ import { loadModelFile } from '../stlLoader.js';
 import { fitRegionAs } from '../gaussMap.js';
 import { repairMesh } from '../meshRepair.js';
 import { preflight, PREFLIGHT } from '../knit/preflight.js';
+import { compareExports } from '../knit/tiers.js';
 import { distNormal } from '../knit/geometry.js';
 import { capOwners, fitTriangles, projectCapVertices } from './caps.js';
 import { creaseTableFor, creaseFor } from '../regionGrow.js';
@@ -1568,6 +1569,7 @@ async function exportStep({ checked = false } = {}) {
   const { store, name } = current;
   if (!store.list().length) { say('Paint at least one face group first', true); return; }
   toolbar.setDisabled('export', 'Exporting…');
+  const editsAtStart = current.edits;
   current.lastExport = null;                      // this attempt's result replaces any earlier one
   // Stop (or Esc) ends the worker at once: a running kernel call cannot be interrupted any other way
   const run = { abort: null };
@@ -1593,24 +1595,40 @@ async function exportStep({ checked = false } = {}) {
         (b) => finished.set(b.id, { brep: b.brep, report: b.report }));
     } catch (error) {
       if (error.name === 'AbortError') throw error;
-      // A single OCCT repair on badly fitting surfaces can run for most of an hour and cannot be
-      // interrupted, so the worker is stopped and a fresh one exports the mesh itself. A build that throws
-      // can leave the kernel's memory corrupt (its fallback then fails too: "table index is out of bounds"),
-      // so that too gets a fresh worker for the faceted solid.
-      const timedOut = error.name === 'TimeoutError';
-      // the bodies that finished stay as built; only the rest go out as facets
-      const keep = [...finished];
-      const rest = keep.length ? `the ${plural(payload.names.length - keep.length, 'body', 'bodies')} still building` : 'the mesh';
-      say(timedOut
-        ? `The surfaces took over ${Math.round(EXPORT_HARD_STOP_S / 60)} minutes to join; exporting ${rest} as a faceted solid…`
-        : `The solid build failed (${failureText(error.message)}); exporting ${rest} as a faceted solid…`, true);
-      busy.step(timedOut ? `The surfaces took too long to join: building ${rest} as flat facets…` : `The build failed: building ${rest} as flat facets…`);
-      result = await knitInWorker({ ...payload, options: { mode: 'faceted', ...(keep.length ? { keep } : {}) } }, progress, Infinity, run);
-      if (keep.length) result.report.keptBodies = keep.length;
-      if (timedOut) result.report.timedOut = true;
-      else result.report.failed = error.message;
+      if (error.name === 'TimeoutError' && error.interim) {
+        // stopped during the face-path rung: the knitter had finished, so its result is the export (no preview)
+        result = { step: error.interim.step, report: error.interim.report, preview: null };
+      } else {
+        // A single OCCT repair on badly fitting surfaces can run for most of an hour and cannot be
+        // interrupted, so the worker is stopped and a fresh one exports the mesh itself. A build that throws
+        // can leave the kernel's memory corrupt (its fallback then fails too: "table index is out of bounds"),
+        // so that too gets a fresh worker for the faceted solid.
+        const timedOut = error.name === 'TimeoutError';
+        // the bodies that finished stay as built; only the rest go out as facets
+        const keep = [...finished];
+        const rest = keep.length ? `the ${plural(payload.names.length - keep.length, 'body', 'bodies')} still building` : 'the mesh';
+        say(timedOut
+          ? `The surfaces took over ${Math.round(EXPORT_HARD_STOP_S / 60)} minutes to join; exporting ${rest} as a faceted solid…`
+          : `The solid build failed (${failureText(error.message)}); exporting ${rest} as a faceted solid…`, true);
+        busy.step(timedOut ? `The surfaces took too long to join: building ${rest} as flat facets…` : `The build failed: building ${rest} as flat facets…`);
+        result = await knitInWorker({ ...payload, options: { mode: 'faceted', ...(keep.length ? { keep } : {}) } }, progress, Infinity, run);
+        if (keep.length) result.report.keptBodies = keep.length;
+        if (timedOut) result.report.timedOut = true;
+        else result.report.failed = error.message;
+      }
     }
     const { step, report } = result;
+    // after a Repair, with nothing edited since: its changes stay only if this export is not worse than the one before
+    // it (compareExports); else they are undone and the export before it is the one on show
+    const repaired = current.repairRun;
+    current.repairRun = null;
+    if (repaired?.base && repaired.edits === editsAtStart && !report.timedOut && !report.failed
+      && compareExports(repaired.base.report, report) < 0 && undoRepair(current, repaired)) {
+      busy.end();
+      repairWorse(current, repaired.base, report);
+      return;
+    }
+    current.exportResult = { step, report, preview: result.preview ?? null, edits: current.edits };
     current.lastExport = report;                  // for the conversion report (report.js)
     current.lastExportEdits = current.edits;
     current.bodyResults = Array.isArray(report.bodies) ? report.bodies : null;   // each body's result, for the Bodies list
@@ -1680,13 +1698,21 @@ function offerSave(current, step, report) {
   const file = `${current.name}.stp`;
   const counts = new Map();
   for (const t of previewing?.types ?? []) counts.set(t, (counts.get(t) ?? 0) + 1);
-  const kinds = SURFACE_KINDS.filter((t) => counts.has(t)).map((t) => `${counts.get(t)} ${typeLabel(t).toLowerCase()}${counts.get(t) === 1 || t === 'freeform' ? '' : 's'}`);
-  say(`Ready to save: ${file}, a closed solid with every face on its fitted surface`);
+  const kinds = SURFACE_KINDS.filter((t) => counts.has(t)).map((t) => `${counts.get(t)} ${counts.get(t) === 1 || t === 'freeform' ? typeLabel(t).toLowerCase() : t === 'torus' ? 'tori' : `${typeLabel(t).toLowerCase()}s`}`);
+  const faces = previewing ? `: ${previewing.types.length} faces (${kinds.join(', ')})` : '';
+  // groups whose own type would not join went out as B-splines fitted to them: named, with Repair to try their types
+  const splined = splinedRows(current, report);
+  const n = splined.length;
+  say(n ? `Ready to save: ${file}, a closed solid with no flat facets; ${plural(n, 'group')} built as B-splines`
+    : `Ready to save: ${file}, a closed solid with every face on its fitted surface`);
   showResult({
     title: `Ready: ${file}`,
-    lead: `A closed solid, every face on its fitted surface${previewing ? `: ${previewing.types.length} faces (${kinds.join(', ')})` : ''}. Turn it to check it, then save.`,
+    lead: n ? `A closed solid with no flat facets${faces}. ${plural(n, 'group')} would not join as ${n === 1 ? 'its' : 'their'} own type, so ${n === 1 ? 'it is a B-spline' : 'they are B-splines'} fitted to the mesh. Click one to zoom to it.`
+      : `A closed solid, every face on its fitted surface${faces}. Turn it to check it, then save.`,
+    groups: splined,
     steps: [
       { label: 'Save STEP', primary: true, detail: `Downloads ${file}.`, onSelect: () => saveStep(current, step, report, file) },
+      ...(n ? [{ label: 'Repair automatically', detail: `Tries other types and merges on ${n === 1 ? 'that group' : 'those groups'}, keeping only what makes the export better. Then export again.`, onSelect: () => repairInView() }] : []),
       { label: 'Back to editing', detail: 'Returns to the painted groups; nothing is saved.', onSelect: () => {} },
     ],
     // the ask is for a part of the user's own; the guide's sample did nothing for them yet
@@ -1699,7 +1725,8 @@ function savedClean(current, step, report) {
   const file = `${current.name}.stp`;
   saveStep(current, step, report, file);
   if (current.fromGuide || supportHidden()) return;
-  showResult({ title: `Saved: ${file}`, lead: 'A closed solid, every face on its fitted surface.', support: true });
+  const n = splinedRows(current, report).length;
+  showResult({ title: `Saved: ${file}`, lead: n ? `A closed solid with no flat facets. ${plural(n, 'group')} went out as B-splines.` : 'A closed solid, every face on its fitted surface.', support: true });
 }
 
 /**
@@ -2618,13 +2645,14 @@ function takeWorker() {
 function knitInWorker(payload, onStatus, limitS = Infinity, run = {}, onBody = null) {
   return new Promise((resolve, reject) => {
     const worker = takeWorker();
-    let timer = null;
+    let timer = null, interim = null;
     const finish = () => { clearTimeout(timer); worker.terminate(); warmKernel(); };   // the next build's kernel loads now
     if (Number.isFinite(limitS)) {
       timer = setTimeout(() => {
         finish();
         const error = new Error(`the solid build took longer than ${limitS} s`);
         error.name = 'TimeoutError';
+        error.interim = interim;                  // the knitter's result, when the stop came during the face-path rung
         reject(error);
       }, limitS * 1000);
     }
@@ -2638,6 +2666,7 @@ function knitInWorker(payload, onStatus, limitS = Infinity, run = {}, onBody = n
       const who = data.body != null && payload.names?.length > 1 ? `${payload.names[data.body]}: ` : '';
       if (data.type === 'status') onStatus(`${who}${data.text}`);
       else if (data.type === 'body') onBody?.(data);
+      else if (data.type === 'interim') interim = data;
       else if (data.type === 'progress') {
         if (data.freeform) onStatus(`${who}Fitting freeform surfaces… ${data.freeform} of ${data.of}`, data.freeform / data.of);
         else onStatus(`${who}Building the solid… attempt ${data.builds}`);
@@ -2655,7 +2684,7 @@ function knitInWorker(payload, onStatus, limitS = Infinity, run = {}, onBody = n
 
 /** What the export holds, said plainly: every face analytic, or how much went out as facets, or why not a solid. */
 function exportSummary(file, report, unpainted) {
-  const pct = (x) => `${(100 * x).toFixed(x < 0.01 ? 1 : 0)}%`;
+  const pct = areaPct;
   const parts = [];
   const n = Array.isArray(report.bodies) ? report.bodies.length : 1;
   const solids = n > 1 ? `${n} closed solids` : 'a closed solid';
@@ -2674,6 +2703,8 @@ function exportSummary(file, report, unpainted) {
       (report.free_edges ? `: ${report.free_edges.toLocaleString()} open edges` : '') +
       (report.bestTier === 'faceted' ? ' - the mesh itself is open, so no surfaces can close it' : ''));
   }
+  const splined = report.faces?.splined?.length ?? 0;
+  if (splined && report.tier !== 'faceted' && report.tier !== 'none') parts.push(`${plural(splined, 'face')} built as B-splines where their own type would not join`);
   if (unpainted > 0) parts.push(`${unpainted.toLocaleString()} unpainted triangles went out as facets`);
   parts.push(`${report.secs} s`);
   return parts.join(' · ');
@@ -2690,7 +2721,17 @@ const KERNEL_PROBLEMS = {
   open: 'it leaves a gap in the solid',
   // not the knitter's: offerRepair's, for a group the facet tier built as facets (report.faces.demoted)
   facets: 'it went out as flat facets',
+  // the B-spline fallback's (report.faces.splined): its own type would not join, so a B-spline fitted to it did
+  splined: 'its own type would not join, so it is a B-spline',
 };
+
+/** The groups an export built as B-splines where their own type would not join, as [id, why] rows for a card. */
+function splinedRows(current, report) {
+  const faces = report.faces ?? {};
+  const pieces = new Map(faces.pieces ?? []);
+  const ids = new Set((faces.splined ?? []).map((label) => pieces.get(label) ?? label));
+  return [...ids].filter((id) => current.store.groups.has(id)).map((id) => [id, KERNEL_PROBLEMS.splined]);
+}
 
 /** Map group -> reasons from the knitter's problems ({kind: [label]}), each label first through `idOf` (null: skip). */
 function kernelFlags(problems, idOf, store) {
@@ -2707,11 +2748,8 @@ function kernelFlags(problems, idOf, store) {
   return out;
 }
 
-/**
- * An export with faces off their surfaces: each group the kernel rejected, or the facet tier built as facets,
- * gets a ⚠ with why, and the user picks Repair (in view) or this export as it is. The STEP waits for that.
- */
-function offerRepair(current, step, report) {
+/** Each group an export's kernel rejected, or its facet tier built as facets: Map id -> reasons, for the ⚠ marks. */
+function exportFlags(current, report) {
   const faces = report.faces ?? {};
   const pieces = new Map(faces.pieces ?? []);           // a freeform group's pieces are that group
   const idOf = (label) => pieces.get(label) ?? label;
@@ -2722,13 +2760,89 @@ function offerRepair(current, step, report) {
       (flags.get(id) ?? flags.set(id, []).get(id)).push(KERNEL_PROBLEMS.facets);
     }
   }
+  return flags;
+}
+
+/** ⚠ marks as a card's [id, why] rows. */
+const flagRows = (flags) => [...flags].map(([id, why]) => [id, why.join('; ')]);
+
+/** A share of the area in words: a sliver under 0.1% (the report rounds it, to 0 at times) is said so, not as 0.0%. */
+const areaPct = (x) => (x < 0.001 ? 'under 0.1%' : `${(100 * x).toFixed(x < 0.01 ? 1 : 0)}%`);
+
+/** An export's result in a few words, to set one beside another. */
+function exportWords(report) {
+  const pct = areaPct;
+  if (report.tier === 'analytic') return report.splineArea ? `no flat facets, with ${pct(report.splineArea)} of the area as B-splines` : 'every face on its surface';
+  if (report.tier === 'hybrid' || report.tier === 'planar') return `${pct(report.facetArea)} of the area as flat facets`;
+  if (report.tier === 'faceted') return 'the mesh as flat facets';
+  return 'no closed solid';
+}
+
+/**
+ * Undo a Repair's changes: the undo steps above run.mark (the step on top when it started), each "Repair: …".
+ * False, with nothing undone, when anything else is among them or the stack was trimmed past the mark.
+ */
+function undoRepair(current, run) {
+  if (mesh !== current) return false;
+  const { store } = current;
+  if (run.mark && !store.undoStack.includes(run.mark)) return false;
+  let n = 0;
+  for (let i = store.undoStack.length - 1; i >= 0 && store.undoStack[i] !== run.mark; i--) {
+    if (!String(store.undoStack[i].label ?? '').startsWith('Repair:')) return false;
+    n++;
+  }
+  if (!n) return false;
+  leavePreview();
+  for (let i = 0; i < n; i++) store.undo();
+  afterHistory();
+  return true;
+}
+
+/**
+ * A Repair whose export came out worse than the export before it: its changes are undone (undoRepair) and the export
+ * before it is on show again, with its own verdicts, to save or fix by hand. Redo puts the changes back.
+ */
+function repairWorse(current, base, after) {
+  const { step, report } = base;
+  current.exportResult = { ...base, edits: current.edits };
+  current.lastExport = report;                    // for the conversion report: the export on show
+  current.lastExportEdits = current.edits;
+  current.bodyResults = Array.isArray(report.bodies) ? report.bodies : null;
+  const file = `${current.name}.stp`;
+  if (base.preview) enterPreview(current, { preview: base.preview });
+  const flags = report.tier === 'analytic' ? new Map() : exportFlags(current, report);
+  current.flags = flags;
+  current.showFlags = false;
+  refreshPanel();
+  const clean = report.tier === 'analytic';
+  say(`Repair undone: the export after it had ${exportWords(after)}, the one before it ${exportWords(report)}`, !clean);
+  showResult({
+    title: 'Repair undone: it made the export worse',
+    bad: !clean,
+    lead: `After Repair, the export had ${exportWords(after)}. Before it, it had ${exportWords(report)}. Its changes are undone, and this is the export from before Repair.`,
+    groups: [...flagRows(flags), ...splinedRows(current, report).filter(([id]) => !flags.has(id))],
+    steps: [
+      { label: clean ? 'Save STEP' : 'Save as it is', primary: true, detail: `Downloads ${file}.`, onSelect: () => saveStep(current, step, report, file) },
+      ...(flags.size ? [{ label: 'Fix by hand', detail: 'Outlines the groups that failed. Repaint, retype or merge them, then export again.', onSelect: () => showDoubts() }] : []),
+      { label: 'Back to editing', detail: "Returns to the painted groups. Redo puts Repair's changes back.", onSelect: () => {} },
+    ],
+  });
+}
+
+/**
+ * An export with faces off their surfaces: each group the kernel rejected, or the facet tier built as facets,
+ * gets a ⚠ with why, and the user picks Repair (in view) or this export as it is. The STEP waits for that.
+ */
+function offerRepair(current, step, report) {
+  const flags = exportFlags(current, report);
   current.flags = flags;
   current.showFlags = false;
   refreshPanel();
   const n = flags.size;
+  const splined = splinedRows(current, report).filter(([id]) => !flags.has(id));
   const groups = `${n} group${n === 1 ? '' : 's'}`;
   const file = `${current.name}.stp`;
-  const pct = (x) => `${(100 * x).toFixed(x < 0.01 ? 1 : 0)}%`;
+  const pct = areaPct;
   const what = report.tier === 'none' ? 'it is not a closed solid'
     : report.tier === 'faceted' ? 'it is the mesh as flat facets'
       : `${pct(report.facetArea)} of the area is flat facets`;
@@ -2737,11 +2851,12 @@ function offerRepair(current, step, report) {
     ? `The faces would not close into a solid${report.free_edges ? ` (${report.free_edges.toLocaleString()} open edges)` : ''}.`
     : report.tier === 'faceted' ? 'The fitted surfaces would not join, so the file would hold the mesh as flat facets throughout.'
       : `The solid closes, but ${pct(report.facetArea)} of its area would go out as flat facets where faces would not join.`;
+  const others = splined.length ? ` ${plural(splined.length, 'other group')} went out as B-splines where their own type would not join.` : '';
   showResult({
     title: n ? `Not saved yet: ${groups} would not build` : `Not saved yet: ${what}`,
     bad: true,
-    lead: `${lead}${n ? ' The kernel rejected these groups; click one to zoom to it.' : ''}`,
-    groups: [...flags].map(([id, why]) => [id, why.join('; ')]),
+    lead: `${lead}${n ? ' The kernel rejected these groups; click one to zoom to it.' : ''}${others}`,
+    groups: [...flagRows(flags), ...splined],
     steps: [
       { label: 'Repair automatically', primary: true, detail: 'Tries other surface types and merges on the failing groups, keeping only what makes the solid better; each change is an undo step. Then export again.', onSelect: () => repairInView() },
       ...(n ? [{ label: 'Fix by hand', detail: 'Outlines them: repaint a group that spans two faces, change its type under Fit as, or merge it into a neighbor. Then export again.', onSelect: () => showDoubts() }] : []),
@@ -2770,6 +2885,10 @@ async function repairInView() {
     return;
   }
   if (mesh !== current || stroke || autoRun) return;
+  // the export Repair starts from (when it is of the groups as they stand), and the undo step on top before its changes,
+  // so the export after it can be held against that one and its changes undone if it is worse (exportStep)
+  const base = current.exportResult?.edits === current.edits ? current.exportResult : null;
+  const mark = current.store.undoStack.at(-1) ?? null;
   const known = new Set(payload.labels);         // the groups as sent; any other label is a freeform piece
   const made = new Map();                        // freeform pieces the repair made groups of: label -> id
   const idOf = (label) => (known.has(label) ? label : made.get(label) ?? null);
@@ -2785,6 +2904,7 @@ async function repairInView() {
     autoRun = null;
     current.lastRepair = { ok: !!result?.ok, kept, stopped: !result, secs: Math.round((performance.now() - started) / 100) / 10,
                            moves: result?.moves ?? null, edits: current.edits };        // for the conversion report
+    current.repairRun = kept ? { base, mark, edits: current.edits } : null;
     if (result) { current.flags = kernelFlags(result.problems, idOf, current.store); current.showFlags = false; }
     busy.end();
     setActive(null);
@@ -2853,7 +2973,7 @@ function offerAfterRepair(current, ok) {
     groups: left,
     steps: [
       ...(n ? [{ label: 'Fix by hand', primary: true, detail: 'Outlines them: repaint a group that spans two faces, change its type under Fit as, or merge it into a neighbor.', onSelect: () => showDoubts() }] : []),
-      { label: 'Export anyway', detail: 'Builds the solid as it is; where faces still fail, you can save with them as flat facets.', onSelect: () => exportStep({ checked: true }) },
+      { label: 'Export anyway', detail: 'Builds the solid as it is. Where faces still fail, they go out as B-splines or flat facets.', onSelect: () => exportStep({ checked: true }) },
     ],
   });
 }

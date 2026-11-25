@@ -33,6 +33,15 @@ if (!step && !FACE_ONLY) {
   const { solid, report: r } = knitSolid(oc, { positions, labels, surfaces }, { deadline: DEADLINE });
   report = r;
   if (solid) step = writeStep(oc, solid);
+  const d = r?.faces?.demoted;
+  row.knit = { tier: r?.tier, facetArea: r?.facetArea, demoted: Array.isArray(d) ? d.length : d ?? null };
+  // never facets, as the worker does it: facets (or no solid) get the face path once more (facePath.js faceAfterKnit)
+  if (!KNIT_ONLY && (!solid || (r?.facetArea ?? 0) > 0)) {
+    const { faceAfterKnit } = await import('../js/knit/facePath.js');
+    const left = DEADLINE - (performance.now() - t0) / 1000;
+    const fa = faceAfterKnit(oc, { positions, labels, surfaces }, r, { part: stem, budgetS: Math.max(30, left), triedAsPainted: row.freeform });
+    if (fa.step) { step = fa.step; report = fa.report; row.after_knit = fa.report.info.after_knit_how; } else row.face_after_knit = fa.rejected;
+  }
 }
 row.path = report?.info?.path ?? 'knit';
 Object.assign(row, { tier: report?.tier, facetArea: report?.facetArea, vol_err: report?.vol_err, closed: report?.closed, valid: report?.valid,

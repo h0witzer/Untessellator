@@ -8,7 +8,8 @@
  *
  * --repair: the studio's flow when that export is not every face analytic: press Repair (knit/index.js
  * repairGroups with the worker's defaults, every move it keeps applied) and Export STEP again. The STEP is the
- * second export; the row keeps the first one's tier as `first` and the kept moves as `repair`.
+ * second export unless it is worse than the first (compareExports), when the studio undoes Repair's changes and
+ * the first is kept; the row has both (`first`, `after`), which was kept (`kept`) and the kept moves (`repair`).
  *
  * Per file: <name>.step and <name>.json (the knitter's report, groups by type, timings). The mesh is
  * centred as js/stlLoader.js does and moved back for the export, as the studio does. --synthetic: where
@@ -32,7 +33,7 @@ import { coherentScores, seedOrder, autoPaint } from '../js/autoPaint.js';
 import { annotateEdges, edgeWall } from '../js/edgeWall.js';
 import { fitRegionAs } from '../js/gaussMap.js';
 import { freeformMerge } from '../js/freeformMerge.js';
-import { loadOcct, knitSolid, repairGroups, writeStep } from '../js/knit/index.js';
+import { loadOcct, knitSolid, repairGroups, writeStep, compareExports } from '../js/knit/index.js';
 import { distNormal } from '../js/knit/geometry.js';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
@@ -193,16 +194,24 @@ for (const file of FILES) {
   let { solid, report } = knitSolid(oc, { positions, labels: owner, surfaces }, { deadline: DEADLINE, axes: !NO_AXES });
   const knitSecs = (performance.now() - t1) / 1000;
   let repaired = {};
+  let step = solid ? writeStep(oc, solid) : null;
   if (REPAIR && report.tier !== 'analytic') {
     const t2 = performance.now();
     const r = repairGroups(oc, { positions, labels: owner, surfaces }, { axes: !NO_AXES });
     const repairSecs = (performance.now() - t2) / 1000;
-    const first = { tier: report.tier, secs: report.secs };
+    const before = { solid, report, step };
+    const first = { tier: report.tier, secs: report.secs, facetArea: report.facetArea, splineArea: report.splineArea ?? 0 };
     ({ solid, report } = knitSolid(oc, { positions, labels: r.labels, surfaces: r.surfaces }, { deadline: DEADLINE, axes: !NO_AXES }));
-    repaired = { first, repair: { ok: r.ok, secs: Math.round(repairSecs * 10) / 10, builds: r.info.repair_builds,
+    const after = { tier: report.tier, secs: report.secs, facetArea: report.facetArea, splineArea: report.splineArea ?? 0 };
+    // the studio's Repair keeps its changes only when the export after it is not worse (compareExports): else they
+    // are undone and the export before it is the one to save
+    const keptFirst = compareExports(before.report, report) < 0;
+    if (keptFirst) ({ solid, report, step } = before);
+    else step = solid ? writeStep(oc, solid) : null;
+    repaired = { first, after, kept: keptFirst ? 'first' : 'repaired', repair: { ok: r.ok, secs: Math.round(repairSecs * 10) / 10, builds: r.info.repair_builds,
       kept: r.moves.filter((m) => m.kept).map(({ move, group, groups, from, to }) => ({ move, group, groups, from, to })) } };
   }
-  if (solid) writeFileSync(join(OUT, `${name}.step`), writeStep(oc, solid));
+  if (step) writeFileSync(join(OUT, `${name}.step`), step);
   const row = { file, name, triangles: facets.count, segments, groups: byGroup.size, inexactShare: Math.round(inexactShare * 100) / 100, unpainted: result.free, retyped, typeCount,
     paint_secs: Math.round(paintSecs * 10) / 10, knit_secs: Math.round(knitSecs * 10) / 10, ...report, ...repaired };
   writeFileSync(join(OUT, `${name}.json`), JSON.stringify(row, null, 1));

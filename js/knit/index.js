@@ -21,9 +21,11 @@ import { attachCurvature } from '../curvature.js';
 import { fitRegionAs } from '../gaussMap.js';
 import { fitPieces } from '../freeformFit.js';
 import { shareAxes } from './axes.js';
+import { TIERS } from './tiers.js';
 
 export { loadOcct, writeStep, brepText, readBrep, readStep } from './occt.js';
 export { BUILD } from './build.js';
+export { TIERS, compareExports } from './tiers.js';
 
 const TYPES = ['plane', 'cylinder', 'cone', 'sphere', 'torus'];
 
@@ -50,6 +52,33 @@ export function fitCandidatesFor(positions) {
     }
     return out;
   };
+}
+
+/**
+ * A group on more than one connected piece of the mesh, split: its part on each piece after the first gets a NEW
+ * label (written into mesh.F) with the same surface. The knitter's topology takes a patch to lie on one piece
+ * (meshTopology's corners are keyed by vertex and the patch's piece), and a face cannot span two pieces anyway: a
+ * group across pieces left corners with no faces, and the build threw (00008039_000, a mesh in 16,031 pieces).
+ * Returns the number of labels made.
+ */
+export function splitAcrossPieces(mesh, surfaces, firstLabel = 0) {
+  let next = firstLabel, low = -1;
+  for (const g of mesh.F) { next = Math.max(next, g + 1); low = Math.min(low, g); }
+  for (const g of surfaces.keys()) next = Math.max(next, g + 1);
+  const firstPiece = new Map(), made = new Map();           // group -> its first piece; `${group}|${piece}` -> label
+  for (let t = 0; t < mesh.T.length; t++) {
+    const g = mesh.F[t], b = mesh.body[t];
+    if (!firstPiece.has(g)) firstPiece.set(g, b);
+    if (firstPiece.get(g) === b) continue;
+    const key = `${g}|${b}`;
+    if (!made.has(key)) {
+      // unpainted triangles (labels below 0) stay unpainted on every piece: no freeform fit, facets as before
+      made.set(key, g < 0 ? --low : next++);
+      if (surfaces.has(g)) surfaces.set(made.get(key), surfaces.get(g));
+    }
+    mesh.F[t] = made.get(key);
+  }
+  return made.size;
 }
 
 /** Groups of more than this many triangles with no surface get a fitted B-spline (solid_rebuild.py --freeform). */
@@ -101,7 +130,8 @@ export function addFreeform(mesh, surfaces, onProgress = null, { split = true, f
  * report.facetArea of the area), faceted (the mesh itself), or none (no closed, valid solid of the
  * mesh's volume; the best attempt is still returned, and report says how it fails). freeform: groups with
  * no surface get a fitted B-spline first (addFreeform). A build that is not fully analytic is mended where it
- * fails (repair.js progressiveRecovery: other edge methods there, then facets, each place rebuilt alone while it
+ * fails (repair.js progressiveRecovery: other edge methods there, then B-splines fitted to the failing patches
+ * (report.splineArea, report.faces.splined), then facets, each place rebuilt alone while it
  * is tried), then the planar and faceted tiers; progressive false: the whole part rebuilt plain and from the
  * mesh's points, then the facet tiers, as before 2026-11-15. No group changes type or gives facets to another:
  * that is repairGroups, which the studio runs in view. `deadline` (s): past it no retry, trial or facet tier
@@ -128,7 +158,8 @@ function knitOne(oc, { positions, labels, surfaces, oriented = false }, { fallba
   const end = now() + deadline;                  // past it: no plain retry or facet tiers
   progressive &&= fallback;                      // with no facets, the whole-part retries as before (test/reportReplay.mjs)
   const mesh = new KnitMesh(positions, labels, { oriented });
-  let surfs = surfaces instanceof Map ? surfaces : new Map(Object.entries(surfaces).map(([k, v]) => [Number(k), v]));
+  // a copy: the split and the freeform fits below add labels of their own
+  let surfs = surfaces instanceof Map ? new Map(surfaces) : new Map(Object.entries(surfaces).map(([k, v]) => [Number(k), v]));
   const info = {};
   let shape = null, state = null, out, pieces = null;
   if (mode === 'faceted') {
@@ -139,6 +170,8 @@ function knitOne(oc, { positions, labels, surfaces, oriented = false }, { fallba
     return finish(out);
   }
   const unsplit = Int32Array.from(mesh.F);
+  const across = splitAcrossPieces(mesh, surfs, firstLabel);
+  if (across) info.groups_split_across_pieces = across;
   if (freeform) Object.assign(info, addFreeform(mesh, surfs, onProgress, { split, firstLabel }));
   pieces = piecesOf(unsplit, mesh.F);
   const plainSurfs = new Map(surfs);              // the fits as they came, for the plain retry
@@ -214,10 +247,10 @@ function knitOne(oc, { positions, labels, surfaces, oriented = false }, { fallba
     const t = performance.now();
     // its trials stop where the whole-part retries did, a quarter of the deadline early, to leave its whole build time
     const recover = (maxFacetArea) => progressiveRecovery(oc, mesh, state0, shape, state0.surfaces, plainSurfs, info,
-      end - (deadline === Infinity ? 0 : deadline / 4), onProgress, { methodsMs: 4 * (info.ms_clean ?? Infinity), maxFacetArea });
+      end - (deadline === Infinity ? 0 : deadline / 4), onProgress, { methodsMs: 4 * (info.ms_clean ?? Infinity), maxFacetArea, lastChance: end });
     let p = recover(planarShare);
     info.ms_progressive = Math.round(performance.now() - t);
-    if (p.tier) { out = { shape: p.shape, sc: p.sc, tier: p.tier, facetTris: p.facetTris, facetArea: p.facetArea, demoted: p.demoted }; state = p.state; }
+    if (p.tier) { out = { shape: p.shape, sc: p.sc, tier: p.tier, facetTris: p.facetTris, facetArea: p.facetArea, demoted: p.demoted, splined: p.splined, splineArea: p.splineArea }; state = p.state; }
     // a hybrid with more of its area as facets than the planar tier would have is the worse export: planar is tried
     // too, and kept if it is recreated (00002311_011: 0.5% facets planar, 83% hybrid)
     if (p.tier === 'hybrid' && p.facetArea > planarShare + 1e-4) {
@@ -233,7 +266,7 @@ function knitOne(oc, { positions, labels, surfaces, oriented = false }, { fallba
       else {
         info.progressive_rerun = 1;
         p = recover(Infinity);
-        if (p.tier) { out = { shape: p.shape, sc: p.sc, tier: p.tier, facetTris: p.facetTris, facetArea: p.facetArea, demoted: p.demoted }; state = p.state; }
+        if (p.tier) { out = { shape: p.shape, sc: p.sc, tier: p.tier, facetTris: p.facetTris, facetArea: p.facetArea, demoted: p.demoted, splined: p.splined, splineArea: p.splineArea }; state = p.state; }
       }
     }
     // nothing recovered: the hybrid tier as before (every flagged patch a facet at once, grown by whole builds;
@@ -262,6 +295,7 @@ function knitOne(oc, { positions, labels, surfaces, oriented = false }, { fallba
   }
   const report = {
     tier: out.tier, bestTier: out.bestTier ?? out.tier, facetTris: out.facetTris, facetArea: out.facetArea,
+    splineArea: out.splined?.length ? out.splineArea : 0,
     closed: !!sc.closed, valid: !!sc.valid, vol_err: sc.vol_err ?? null, free_edges: sc.free_edges ?? null,
     nonmanifold_edges: sc.nonmanifold_edges ?? null, shells: sc.shells ?? null,
     groups: new Set(mesh.F).size, meshPieces: mesh.nBodies, triangles: mesh.T.length,
@@ -272,19 +306,10 @@ function knitOne(oc, { positions, labels, surfaces, oriented = false }, { fallba
   }
 }
 
-/**
- * What became of each painted group, for the studio's conversion report (js/studio/report.js): the kernel's
- * complaints about each patch in the best analytic build, by kind (missing, invalid, orient, area, open);
- * the repair loop's moves; the groups it absorbed into neighbours or that ended on another surface type
- * (repair or shared axes); each group's final surface type; and the groups the facet tier built as facets
- * ('all' when the result is the mesh itself). Group ids are the labels the knitter was given; a freeform
- * group split into pieces adds labels above them (knitSolid's report.faces.pieces: [piece, group]).
- */
-const TIERS = ['analytic', 'hybrid', 'planar', 'faceted', 'none'];
 
 /** A body's line in report.bodies. */
 function bodyRow(r) {
-  return { tier: r.tier, bestTier: r.bestTier, facetTris: r.facetTris, facetArea: r.facetArea, closed: r.closed, valid: r.valid,
+  return { tier: r.tier, bestTier: r.bestTier, facetTris: r.facetTris, facetArea: r.facetArea, splineArea: r.splineArea ?? 0, closed: r.closed, valid: r.valid,
     vol_err: r.vol_err, triangles: r.triangles, groups: r.groups, secs: r.secs };
 }
 
@@ -369,18 +394,19 @@ function mergeReports(reports, rows, areas, trisOf, ids, labels) {
     if (typeof v === 'number') info[k] = (info[k] ?? 0) + v;
     else if (!(k in info)) info[k] = v;
   }
-  const faces = { problems: {}, moves: [], absorbed: [], retyped: [], final: [], demoted: [], pieces: [] };
+  const faces = { problems: {}, moves: [], absorbed: [], retyped: [], final: [], demoted: [], splined: [], pieces: [] };
   const allFaceted = reports.every((r) => r.faces?.demoted === 'all');
   reports.forEach((r, i) => {
     const f = r.faces ?? {};
     for (const [k, v] of Object.entries(f.problems ?? {})) faces.problems[k] = [...(faces.problems[k] ?? []), ...v];
-    for (const k of ['moves', 'absorbed', 'retyped', 'final', 'pieces']) faces[k].push(...(f[k] ?? []));
+    for (const k of ['moves', 'absorbed', 'retyped', 'final', 'splined', 'pieces']) faces[k].push(...(f[k] ?? []));
     if (!allFaceted) faces.demoted.push(...(f.demoted === 'all' ? [...new Set(trisOf.get(ids[i]).map((t) => labels[t]))] : f.demoted ?? []));
   });
   if (allFaceted) faces.demoted = 'all';
   return {
     tier: worst('tier'), bestTier: worst('bestTier'), facetTris: sum('facetTris'),
     facetArea: Math.round((reports.reduce((s, r, i) => s + (r.facetArea ?? 0) * areas[i], 0) / Math.max(total, 1e-300)) * 1e4) / 1e4,
+    splineArea: Math.round((reports.reduce((s, r, i) => s + (r.splineArea ?? 0) * areas[i], 0) / Math.max(total, 1e-300)) * 1e4) / 1e4,
     closed: reports.every((r) => r.closed), valid: reports.every((r) => r.valid),
     vol_err: Math.max(...reports.map((r) => r.vol_err ?? 0)), free_edges: sum('free_edges'), nonmanifold_edges: sum('nonmanifold_edges'),
     shells: sum('shells'), groups: new Set(labels).size, meshPieces: sum('meshPieces'), triangles: sum('triangles'),
@@ -388,11 +414,21 @@ function mergeReports(reports, rows, areas, trisOf, ids, labels) {
   };
 }
 
+/**
+ * What became of each painted group, for the studio's conversion report (js/studio/report.js): the kernel's
+ * complaints about each patch in the best analytic build, by kind (missing, invalid, orient, area, open);
+ * the repair loop's moves; the groups it absorbed into neighbours or that ended on another surface type
+ * (repair or shared axes); each group's final surface type; the groups the facet tier built as facets
+ * ('all' when the result is the mesh itself); and the groups built as B-splines where their own type would
+ * not join (repair.js SPLINE). Group ids are the labels the knitter was given; a freeform
+ * group split into pieces adds labels above them (knitSolid's report.faces.pieces: [piece, group]).
+ */
 function faceOutcomes(labels, surfaces, state, out) {
   const ids = (s) => [...s].sort((a, b) => a - b);
   const faces = {
     problems: {}, moves: state?.moves ?? [], absorbed: [], retyped: [], final: [],
     demoted: (out.bestTier ?? out.tier) === 'faceted' ? 'all' : ids(out.demoted ?? []),
+    splined: (out.bestTier ?? out.tier) === 'faceted' ? [] : ids(out.splined ?? []),
   };
   if (!state) return faces;
   for (const [k, v] of Object.entries(state.problems ?? {})) if (v.size) faces.problems[k] = ids(v);
@@ -536,6 +572,8 @@ function repairOne(oc, { positions, labels, surfaces, oriented = false }, { budg
   const out = { labels: Int32Array.from(labels), surfaces: new Map(surfs) };
   const info = {};
   const unsplit = Int32Array.from(mesh.F);
+  const across = splitAcrossPieces(mesh, surfs, firstLabel);
+  if (across) info.groups_split_across_pieces = across;
   Object.assign(info, addFreeform(mesh, surfs, onProgress, { split, firstLabel }));
   const pieces = piecesOf(unsplit, mesh.F);
   // Every build gets its shared axes from the groups and fits as they stand, as the export will make them:

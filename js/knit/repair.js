@@ -10,16 +10,18 @@
  * the user sees and can undo, so the export builds only what the view shows.
  *
  * The export's own recovery, when its build is not recreated: progressiveRecovery (below) mends each place that
- * fails on its own, other edge methods there and then facets, and only then the facet tiers:
+ * fails on its own, other edge methods there, then B-splines fitted to the failing patches (SPLINE), then facets,
+ * and only then the facet tiers:
  *   hybrid   the patches still failing (and surfaceless ones) as facets, the rest analytic (knitSolid's
  *            progressive false only: progressiveRecovery makes its hybrids place by place)
  *   planar   only plane patches analytic
  *   faceted  the mesh as a polyhedral solid
  */
 
-import { buildTopo, buildPolyhedral, patchProblems, regionProblems, grade, better, score, VARIANTS } from './build.js';
+import { buildTopo, buildPolyhedral, patchProblems, regionProblems, grade, better, score, strayFaces, VARIANTS } from './build.js';
 import { distNormal, unit, sub, cross } from './geometry.js';
 import { meshTopology } from './mesh.js';
+import { fitGroup } from '../freeformFit.js';
 
 export const LOOP = {
   SMALL_GROUP: 3,            // facets; a failing group this small is absorbed, never refit
@@ -35,6 +37,7 @@ const SIMPLER = { plane: 0, sphere: 1, cylinder: 2, cone: 3, torus: 4 };
 const KINDS = ['missing', 'invalid', 'orient', 'area', 'open'];
 
 const bump = (info, k, n = 1) => { info[k] = (info[k] ?? 0) + n; };
+const mid = (a, b) => [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2];
 const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now()) / 1000;
 
 /** Least-squares plane through a group's vertices: the fallback surface without the fitters. */
@@ -341,13 +344,24 @@ export function facetFallback(oc, mesh, shape, state, info = {}, deadline = Infi
 // while they are tried (buildTopo's only, judged by regionProblems). Each pass:
 //   1. edge methods: each other method (VARIANTS) on each place's groups, then on them and their neighbours; each
 //      place keeps the one that leaves the least area to facets, and a whole build judges them (undone if no better);
-//   2. facets for what that build still flags, grown round by round by the neighbours they break; a whole build
+//   2. B-splines (SPLINE): the patches step 3 would make facets, each as one B-spline fitted to its own triangles,
+//      grown round by round as the facets are; a whole build judges them (undone if no better);
+//   3. facets for what that build still flags, grown round by round by the neighbours they break; a whole build
 //      judges again, and what it still flags starts the next pass (PASSES).
 // A place is problem groups that touch (share a mesh vertex); its region is them and every group touching them, so
 // every edge and corner that can change is inside it. Every place is tried in the same trial: they do not touch.
 
 export const PROGRESSIVE = { ROUNDS: 8, PASSES: 3 };
 const WHOLE_VARIANTS = ['plain', 'mesh_plain'];
+// The B-spline fallback: a patch that would go to facets is first tried as one B-spline fitted to its own triangles
+// (js/freeformFit.js), taken when its triangles (vertices, edge midpoints and centres: a CAD mesh's long triangles
+// have vertices only on a face's rims, and a fit held only there sagged 0.8 mm between them on a 294 mm part,
+// 00005528_003) lie within TOL x diagonal of it, and kept when the whole build leaves less to facets for it.
+// MIN_TRIS as addFreeform's (more than FREEFORM_MIN_FACETS); at most SAMPLES points checked per group.
+// EDGE_TOL (0: off): a B-spline face built kept only with its edges and inside within EDGE_TOL x diagonal of the mesh
+// (build.js strayFaces). Off: at 1e-3 it sent faces 0.003 mm off the mesh to facets (00007996_019), and what it was
+// added for was OCCT's tessellation missing its deflection on B-spline faces, not the faces.
+export const SPLINE = { ON: true, MIN_TRIS: 5, TOL: 5e-4, SAMPLES: 6000, EDGE_TOL: 0 };
 
 /** Groups sharing a mesh vertex with each group. */
 function touching(mesh, labels) {
@@ -420,7 +434,8 @@ function facetize(labels, surfaces, demote) {
  * Mend the part `state` (buildRepaired's, not fully analytic) as progressive recovery does (above). surfaces are
  * the build's; plainSurfaces the fits as they came (no shared axes), which a group mended by a plain method gets.
  * Returns {shape, sc, state, tier (analytic, hybrid, or null when no whole build was a valid solid of the mesh's
- * volume), facetTris, facetArea, demoted, variants, overPlanar (stopped at maxFacetArea)} with the best whole build,
+ * volume), facetTris, facetArea, demoted, variants, splined (groups built as B-splines), splineArea, overPlanar
+ * (stopped at maxFacetArea)} with the best whole build (state.surfaces with the B-splines in),
  * and counts in info. onProgress gets
  * {builds} (the trials and whole builds so far, after the first) as buildRepaired's does. methodsMs: the time the
  * edge-method trials of a pass may take before the rest are skipped (knitSolid: four of its first build, about what the
@@ -428,7 +443,7 @@ function facetize(labels, surfaces, demote) {
  * the share of the area past which facets are not worth it (knitSolid: the planar tier's), where recovery stops.
  */
 export function progressiveRecovery(oc, mesh, state, shape, surfaces, plainSurfaces, info = {}, deadline = Infinity, onProgress = null,
-  { methodsMs = Infinity, maxFacetArea = Infinity } = {}) {
+  { methodsMs = Infinity, maxFacetArea = Infinity, lastChance = deadline } = {}) {
   const t0 = now();
   let builds = 1;                              // the build that failed, then every trial and whole build here
   const labels = state.labels;
@@ -446,11 +461,50 @@ export function progressiveRecovery(oc, mesh, state, shape, surfaces, plainSurfa
   const less = (x, y) => x[0] < y[0] - 1e-12 * totalArea || (Math.abs(x[0] - y[0]) <= 1e-12 * totalArea && x[1] < y[1]);
   const variantOf = new Map();                 // group -> its edge method, where not BUILD's own
   const demote = new Set();                    // groups built as facets
+  const splined = new Map();                   // group -> ['bspline', params]: the B-spline fallback (SPLINE)
   const plainish = (v) => v === 'plain' || v === 'mesh_plain';
-  const surfacesFor = (vOf, dem) => {
+  const surfacesFor = (vOf, dem, spl = splined) => {
     const sf = new Map(surfaces);
     for (const [g, v] of vOf) if (plainish(v) && plainSurfaces.has(g) && !dem.has(g)) sf.set(g, plainSurfaces.get(g));
+    for (const [g, s] of spl) if (!dem.has(g)) sf.set(g, s);
     return sf;
+  };
+  // a group's B-spline, fitted once to its own triangles; null when it has too few, is one already, or no single map
+  // of it holds its vertices within SPLINE.TOL
+  const splineCache = new Map();
+  // the farthest of a group's triangles' edge midpoints and centres from its B-spline (its vertices are the fit's own)
+  const splineOff = (params, V, T) => {
+    const step = Math.max(1, Math.ceil((4 * T.length) / SPLINE.SAMPLES));
+    let far = 0;
+    for (let i = 0; i < T.length; i += step) {
+      const [a, b, c] = T[i].map((v) => V[v]);
+      for (const x of [mid(a, b), mid(b, c), mid(c, a), [(a[0] + b[0] + c[0]) / 3, (a[1] + b[1] + c[1]) / 3, (a[2] + b[2] + c[2]) / 3]]) {
+        far = Math.max(far, Math.abs(distNormal('bspline', params, x)[0]));
+        if (far > SPLINE.TOL * mesh.diag) return far;
+      }
+    }
+    return far;
+  };
+  const splineFor = (g) => {
+    if (splineCache.has(g)) return splineCache.get(g);
+    let out = null;
+    const tris = [];
+    for (let t = 0; t < labels.length; t++) if (labels[t] === g) tris.push(t);
+    if (tris.length >= SPLINE.MIN_TRIS && surfaces.has(g) && surfaces.get(g)[0] !== 'bspline') {
+      const local = new Map(), V = [], T = [];
+      for (const t of tris) T.push(mesh.T[t].map((v) => { if (!local.has(v)) { local.set(v, V.length); V.push(mesh.V[v]); } return local.get(v); }));
+      try {
+        const r = fitGroup(V, T, { scale: mesh.diag });
+        debug?.(`  fit ${g}${typeOf(g)[0]}: ${T.length} tris, vertices ${(r.info.max_err ?? NaN).toExponential(2)}, between ${r.params ? (splineOff(r.params, V, T) / mesh.diag).toExponential(2) : '-'} x diag`);
+        if (!r.params) bump(info, 'spline_unfit');
+        else if (r.info.max_err > SPLINE.TOL || splineOff(r.params, V, T) > SPLINE.TOL * mesh.diag) bump(info, 'spline_too_far');
+        else out = ['bspline', r.params];
+      } catch {
+        bump(info, 'spline_exception');
+      }
+    }
+    splineCache.set(g, out);
+    return out;
   };
   // the mesh's topology for each set of facets, and ssi's curves for each pair, shared by every build here
   const topos = new Map(), ssiCache = new Map();
@@ -464,12 +518,14 @@ export function progressiveRecovery(oc, mesh, state, shape, surfaces, plainSurfa
   };
   // a trial of one region: its analytic faces built alone with the choices so far plus the trial's. Facets stay
   // out (a plane through its own corners needs no check): the edges to them are the chords they make.
-  const trial = (region, vOf, dem) => {
-    const { lab, sf, facetLabels, base } = facetize(labels, surfacesFor(vOf, dem), dem);
+  let trialSecs = 0, wholeSecs = 0;          // the last trial's and whole build's time: what the next ones will cost
+  const trial = (region, vOf, dem, spl = splined) => {
+    const { lab, sf, facetLabels, base } = facetize(labels, surfacesFor(vOf, dem, spl), dem);
     const only = new Set([...region].filter((g) => !dem.has(g)));
     if (!only.size) return { probs: {}, n: 0, base };
     bump(info, 'progressive_trials');
     onProgress?.({ builds: ++builds, ok: false });
+    const t1 = now();
     try {
       const work = mesh.withLabels(lab);
       const r = buildTopo(oc, work, sf, { facetLabels, only, variantOf: vOf.size ? vOf : null, topo: topoFor(work, facetLabels, dem), ssiCache });
@@ -478,10 +534,16 @@ export function progressiveRecovery(oc, mesh, state, shape, surfaces, plainSurfa
     } catch {
       bump(info, 'progressive_trial_exception');
       return null;
+    } finally {
+      trialSecs = now() - t1;
     }
   };
   // the whole part with every choice so far, judged as every build is
   const whole = () => {
+    const t1 = now();
+    try { return wholeBuild(); } finally { wholeSecs = now() - t1; }
+  };
+  const wholeBuild = () => {
     const { lab, sf, facetLabels, base } = facetize(labels, surfacesFor(variantOf, demote), demote);
     const work = mesh.withLabels(lab);
     bump(info, 'progressive_builds');
@@ -489,6 +551,11 @@ export function progressiveRecovery(oc, mesh, state, shape, surfaces, plainSurfa
     const r = buildTopo(oc, work, sf, { facetLabels, variantOf: variantOf.size ? variantOf : null, topo: topoFor(work, facetLabels, demote), ssiCache });
     const checked = score(oc, r.shape, work);
     const probs = patchProblems(oc, r.shape, r.faceOf, lab, r.ratios, checked.analyzers, { offFaces: checked.offFaces });
+    // B-spline faces off the mesh along their edges (SPLINE.EDGE_TOL) are failing faces, as any face off OFF_MESH is
+    const live = SPLINE.EDGE_TOL > 0 ? [...splined.keys()].filter((g) => !demote.has(g)) : [];
+    const stray = live.length ? strayFaces(oc, r.faceOf, live, work, SPLINE.EDGE_TOL * mesh.diag) : new Set();
+    for (const g of stray) probs.invalid.add(g);
+    if (stray.size) { checked.off_mesh = (checked.off_mesh ?? 0) + stray.size; bump(info, 'spline_stray_faces', stray.size); }
     const { g, sc } = grade(oc, r.shape, work, probs, checked);
     // the problems in the input's groups too (a facet's is its group's), for the conversion report
     const groupOf = new Map();
@@ -502,7 +569,7 @@ export function progressiveRecovery(oc, mesh, state, shape, surfaces, plainSurfa
   const typeOf = (g) => surfaces.get(g)?.[0] ?? 'none';
   const show = (probs) => Object.entries(probs).filter(([, v]) => v.size).map(([k, v]) => `${k}:${[...v].map((g) => `${g}${typeOf(g)[0]}`).join(',')}`).join(' ');
 
-  let best = { g: state.g, sc: state.sc, shape, demoted: new Set(), variants: new Map(), probs: state.problems, asGroups: state.problems };
+  let best = { g: state.g, sc: state.sc, shape, demoted: new Set(), variants: new Map(), splined: new Map(), probs: state.problems, asGroups: state.problems };
   let probs = state.problems, base = Infinity;
   const names = (set) => [...set].map((g) => `${g}${typeOf(g)[0]}`).join(',');
   // the groups to mend: flagged groups that are not facets yet, and groups with no surface (always facets)
@@ -511,17 +578,19 @@ export function progressiveRecovery(oc, mesh, state, shape, surfaces, plainSurfa
     for (const g of new Set(labels)) if (!surfaces.has(g) && !demote.has(g)) out.add(g);
     return out;
   };
-  const chosen = () => `${[...demote].sort((x, y) => x - y)}|${[...variantOf].sort((x, y) => x[0] - y[0]).join(';')}`;
+  const chosen = () => `${[...demote].sort((x, y) => x - y)}|${[...variantOf].sort((x, y) => x[0] - y[0]).join(';')}|${[...splined.keys()].sort((x, y) => x - y)}`;
   // the part as a whole with everything chosen so far: true when it is recreated
   let lastJudged = chosen();
+  let lastAsGroups = state.problems;            // the last whole build's problems in the input's groups (a facet's is its group's)
   const judge = (stage) => {
     lastJudged = chosen();
     let w;
     try { w = whole(); } catch { bump(info, 'progressive_exception'); return null; }
     debug?.(`whole build (${stage}): g ${JSON.stringify(w.g)} ${show(w.asGroups)}`);
-    if (better(w.g, best.g)) best = { ...w, demoted: new Set(demote), variants: new Map(variantOf) };
+    if (better(w.g, best.g)) best = { ...w, demoted: new Set(demote), variants: new Map(variantOf), splined: new Map(splined) };
     probs = w.probs;
     base = w.base;
+    lastAsGroups = w.asGroups;
     return !!w.g[0];
   };
   const within = (p, set) => {
@@ -530,6 +599,8 @@ export function progressiveRecovery(oc, mesh, state, shape, surfaces, plainSurfa
     return q;
   };
   const triedMethods = new Set();               // groups whose edge methods were tried
+  const splineTried = new Set();                // groups tried as B-splines
+  const backTried = new Set();                  // facet groups tried back on a surface (step 4)
   let overPlanar = false;
   debug?.(`start: g ${JSON.stringify(state.g)} ${show(state.problems)}`);
   for (let pass = 0; pass < PROGRESSIVE.PASSES && !best.g[0] && !timeUp(); pass++) {
@@ -608,6 +679,7 @@ export function progressiveRecovery(oc, mesh, state, shape, surfaces, plainSurfa
       for (const [g, v] of prevVariants) variantOf.set(g, v);
       probs = was.probs;
       base = was.base ?? Infinity;
+      lastAsGroups = was.asGroups ?? lastAsGroups;
       lastJudged = chosen();
     };
     let done = false;
@@ -634,18 +706,76 @@ export function progressiveRecovery(oc, mesh, state, shape, surfaces, plainSurfa
     // Kept only when recreated.
     for (const v of pass === 0 && !done ? WHOLE_VARIANTS : []) {
       if (timeUp()) break;
-      const keep = new Map(variantOf), was = { probs, base };
+      const keep = new Map(variantOf), was = { probs, base, lastAsGroups };
       for (const g of surfaces.keys()) if (!demote.has(g)) variantOf.set(g, v);
       if (chosen() === lastJudged) continue;
       if (judge(`whole part ${v}`)) { done = true; bump(info, `progressive_whole_${v}`); break; }
       variantOf.clear();
       for (const [g, x] of keep) variantOf.set(g, x);
-      ({ probs, base } = was);
+      ({ probs, base, lastAsGroups } = was);
       lastJudged = chosen();
     }
     if (done) break;
     if (timeUp()) break;
-    // 2. facets for what the whole build still flags (patches that fail themselves first), grown round by round by
+    // 2. B-splines (SPLINE): the patches the facets would take, each as a B-spline fitted to its own triangles, grown
+    // round by round by the neighbours they break as the facets are, judged in each round's region; then the whole
+    // build judges, and they stay only if it is better for them. What it still flags goes on to facets.
+    // only with time left for the facets after them: B-splines that run the clock out leave the part to the mesh as
+    // facets where the facets alone made a hybrid (00000765_001: 29% facets on main, all facets with them)
+    const splineTime = now() + 2 * wholeSecs + 4 * trialSecs < deadline;
+    if (SPLINE.ON && !splineTime) bump(info, 'progressive_splines_skipped_for_time');
+    if (SPLINE.ON && splineTime) {
+      const flaggedS = flaggedNow();
+      const spl = new Map(splined), added = new Set();
+      const take = (g) => {
+        if (spl.has(g) || splineTried.has(g)) return false;
+        splineTried.add(g);
+        const s = splineFor(g);
+        if (!s) return false;
+        spl.set(g, s);
+        added.add(g);
+        return true;
+      };
+      for (const g of culprits(probs, (x) => flaggedS.has(x) && surfaces.has(x))) take(g);
+      for (let round = 0; added.size && round < PROGRESSIVE.ROUNDS && !timeUp(); round++) {
+        const r = trial(grown(added, adj), variantOf, demote, spl);
+        bump(info, 'progressive_spline_rounds');
+        debug?.(`  B-splines ${names(added)}: ${r?.n} ${r ? show(r.probs) : 'threw'}`);
+        if (!r || r.n === 0) break;
+        let more = false;
+        for (const g of culprits(r.probs, (x) => x < r.base && !demote.has(x) && surfaces.has(x))) if (take(g)) more = true;
+        if (!more) break;
+      }
+      if (added.size && !timeUp()) {
+        // kept when they leave less of the area to facets than the build before them: fewer problems is not enough,
+        // as B-splines can break planes beside them (00007502_007: 45 problems to 32, but 1.0% facets to 1.7%)
+        const keepVariants = new Map(variantOf), keepWas = { probs, base, lastAsGroups };
+        // the area the facet step would start from (step 3's fix: surfaceless flagged groups and the culprits)
+        const toFacets = () => {
+          const fl = flaggedNow(), f = new Set([...fl].filter((g) => !surfaces.has(g)));
+          for (const g of culprits(probs, (x) => fl.has(x))) f.add(g);
+          let x = 0;
+          for (const g of f) x += areaOf.get(g) ?? 0;
+          return x;
+        };
+        const before = toFacets();
+        for (const g of added) { splined.set(g, spl.get(g)); variantOf.delete(g); }
+        if (judge('B-splines')) { bump(info, 'progressive_splines_kept', added.size); break; }
+        const after = toFacets();
+        if (!(after < before - 1e-9 * totalArea)) {
+          // no less for facets: undone, and their patches go on to facets as before
+          bump(info, 'progressive_splines_undone');
+          debug?.(`  B-splines undone (area to facets ${(after / totalArea).toFixed(4)} vs ${(before / totalArea).toFixed(4)})`);
+          for (const g of added) splined.delete(g);
+          variantOf.clear();
+          for (const [g, v] of keepVariants) variantOf.set(g, v);
+          ({ probs, base, lastAsGroups } = keepWas);
+          lastJudged = chosen();
+        } else { bump(info, 'progressive_splines_kept', added.size); debug?.(`  B-splines kept (area to facets ${(after / totalArea).toFixed(4)} vs ${(before / totalArea).toFixed(4)})`); }
+      }
+      if (timeUp()) break;
+    }
+    // 3. facets for what the whole build still flags (patches that fail themselves first), grown round by round by
     // the neighbours they break, judged in each round's region: every place at once too
     const flagged = flaggedNow();
     if (!flagged.size) break;
@@ -667,18 +797,69 @@ export function progressiveRecovery(oc, mesh, state, shape, surfaces, plainSurfa
       if (!more) break;
     }
     if (over || facetShare() > maxFacetArea) { overPlanar = true; bump(info, 'progressive_over_planar'); debug?.('  facets past the planar tier'); break; }
-    for (const g of fix) { demote.add(g); variantOf.delete(g); }
+    for (const g of fix) { demote.add(g); variantOf.delete(g); splined.delete(g); }
     // nothing new chosen: the whole build would be the last one again
     if (chosen() === lastJudged) { bump(info, 'progressive_stalled'); break; }
     if (judge('facets')) break;
+    // 4. facets that fail themselves (a thin facet turned over where its corners went onto curved neighbours:
+    // 00007996_019's plane 2, 00003304_000's cylinder 56) leave no flagged patch for the next pass, and the export
+    // went to the mesh as facets: each such group back on a surface (its B-spline, else its own), kept if the whole
+    // build is better for it
+    const back = [...problemGroups(lastAsGroups)].filter((g) => demote.has(g) && !backTried.has(g) && surfaces.has(g));
+    if (back.length && !timeUp()) {
+      const was = best, keepWas = { probs, base, lastAsGroups };
+      for (const g of back) {
+        backTried.add(g);
+        demote.delete(g);
+        const sp = SPLINE.ON ? splineFor(g) : null;
+        if (sp) splined.set(g, sp);
+      }
+      debug?.(`  facets back on surfaces: ${names(back)}`);
+      if (judge('facets back on surfaces')) { bump(info, 'progressive_facets_back', back.length); break; }
+      if (best === was) {
+        for (const g of back) { demote.add(g); splined.delete(g); }
+        ({ probs, base, lastAsGroups } = keepWas);
+        lastJudged = chosen();
+        // ...and else the groups around them as facets too: a facet turns over where a neighbour's surface pulls its
+        // corner (00003502_006's torus 119: back on its surface it broke five faces; main recreated it as a hybrid)
+        const ring = [...grown(new Set(back), adj)].filter((g) => !demote.has(g) && surfaces.has(g));
+        if (ring.length && !timeUp()) {
+          for (const g of ring) { demote.add(g); variantOf.delete(g); splined.delete(g); }
+          debug?.(`  facets around them: ${names(ring)}`);
+          if (judge('facets around failing facets')) { bump(info, 'progressive_facets_ring', ring.length); break; }
+        }
+      } else bump(info, 'progressive_facets_back', back.length);
+    }
+  }
+  // no whole build recreated with B-splines in play: out of time, every group the last whole build flagged to facets at
+  // once, in one more whole build before lastChance (the time the facet tiers keep). Their trials take the time the
+  // facets alone would have used (00000130_005 recreated at 112.7 s of a 112.5 s budget, so under load it was not).
+  // ...and with B-splines in a solid that is off in volume (00191936_0: closed, valid, no problem, 1.08% off where the
+  // facets alone made 1.0% or less), the B-splines themselves to facets in one more whole build
+  const facetShareOf = () => { let x = 0; for (const g of demote) x += areaOf.get(g) ?? 0; return x / Math.max(totalArea, 1e-300); };
+  const lastChanceFor = (groups, stage) => {
+    if (!groups.length || best.g[0] || now() + wholeSecs >= lastChance) return;
+    for (const g of groups) { demote.add(g); variantOf.delete(g); splined.delete(g); }
+    if (facetShareOf() <= maxFacetArea && judge(stage)) bump(info, 'progressive_last_chance');
+  };
+  if (!best.g[0] && splined.size && !overPlanar) {
+    if (timeUp()) lastChanceFor([...problemGroups(lastAsGroups)].filter((g) => !demote.has(g)), 'last chance, flagged to facets');
+    lastChanceFor([...splined.keys()], 'last chance, B-splines to facets');
   }
   let n = 0, a = 0;
   for (let t = 0; t < labels.length; t++) if (best.demoted.has(labels[t])) { n++; a += mesh.area[t]; }
   info.progressive_secs = Math.round((now() - t0) * 10) / 10;
   if (best.arcs) info.progressive_facet_arcs = best.arcs;
   if (best.variants.size) info.progressive_variant_groups = best.variants.size;
+  // the B-spline fallback's groups in the best build, with their share of the area
+  let sa = 0;
+  for (let t = 0; t < labels.length; t++) if (best.splined.has(labels[t])) sa += mesh.area[t];
+  if (best.splined.size) info.progressive_spline_groups = best.splined.size;
+  const finalSurfaces = new Map(state.surfaces);
+  for (const [g, s] of best.splined) finalSurfaces.set(g, s);
   // every triangle a facet (a part of one group) is the faceted tier, as the old fallback called it
   return { shape: best.shape, sc: best.sc, tier: best.g[0] ? (n === labels.length ? 'faceted' : n ? 'hybrid' : 'analytic') : null, overPlanar,
     facetTris: n, facetArea: Math.round((a / Math.max(totalArea, 1e-300)) * 1e4) / 1e4, demoted: [...best.demoted], variants: best.variants,
-    state: { ...state, problems: best.asGroups, ok: !!best.g[0] && !n, g: best.g, sc: best.sc } };
+    splined: [...best.splined.keys()], splineArea: Math.round((sa / Math.max(totalArea, 1e-300)) * 1e4) / 1e4,
+    state: { ...state, surfaces: finalSurfaces, problems: best.asGroups, ok: !!best.g[0] && !n, g: best.g, sc: best.sc } };
 }
