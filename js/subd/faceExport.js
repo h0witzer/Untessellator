@@ -7,7 +7,7 @@
  * by its two faces by construction; nothing is sewn or healed.
  *
  * In:  { positions (9 per triangle), labels (group per triangle, < 0 unpainted), surfaces (Map group -> [type,
- *        params]) }, { part, names? }
+ *        params]), bodies? (the studio's body id per triangle) }, { part, names? (by body id), split? }
  * Out: { step, report, faceKeys } or { error, report }: faceKeys, per face in the file's order, { b: its body, tris:
  * its triangles in that body, g: the same as the payload's triangle indices, label: its painted group } for split, and
  * for an analytic face also { analytic: true }
@@ -24,7 +24,7 @@ import { ANALYTIC } from './analytic.js';
 import { KnitMesh } from '../knit/mesh.js';
 import { shareAxes } from '../knit/axes.js';
 
-export function faceExport({ positions, labels, surfaces }, { part = 'Part', split = null } = {}) {
+export function faceExport({ positions, labels, surfaces, bodies = null }, { part = 'Part', split = null, names = null } = {}) {
   const t0 = performance.now();
   const nT = labels.length;
   // weld on exact coordinates (the payload is a triangle soup)
@@ -81,10 +81,22 @@ export function faceExport({ positions, labels, surfaces }, { part = 'Part', spl
       }
     }
   }
+  // The solids as the knitter writes them (js/knit/index.js knitSolid): each mesh body under the studio's body it
+  // belongs to (most of its triangles), in body order, with that body's name (a body in several pieces numbered "Name
+  // 1", "Name 2"); with no names, Body 1..n. The file then names its bodies the same whichever path built it.
+  const appOf = found.bodies.map((_, b) => (bodies ? new Map() : b));
+  if (bodies) for (let t = 0; t < nT; t++) { const m = appOf[found.bodyOf[t]]; m.set(bodies[t], (m.get(bodies[t]) ?? 0) + 1); }
+  const app = appOf.map((m) => (m instanceof Map ? [...m].sort((x, y) => y[1] - x[1] || x[0] - y[0])[0][0] : m));
+  const ids = [...new Set(app)].sort((x, y) => x - y);
+  const order = found.bodies.map((_, b) => b).sort((x, y) => app[x] - app[y] || x - y);
+  const baseName = (id) => names?.[id] ?? `Body ${ids.indexOf(id) + 1}`;
+  const pieces = new Map(), piece = new Map();
+  for (const b of order) { pieces.set(app[b], (pieces.get(app[b]) ?? 0) + 1); piece.set(b, pieces.get(app[b])); }
+  const nameOf = (b) => (pieces.get(app[b]) > 1 ? `${baseName(app[b])} ${piece.get(b)}` : baseName(app[b]));
   const solids = [], final = [], rows = [], loose = [], faceKeys = [], gaps = {}, exactN = {};
   let bulge = 0;
   let edgeTol = 0;
-  for (let b = 0; b < found.bodies.length; b++) {
+  for (const b of order) {
     const body = found.bodies[b];
     if (!body.closed) return { error: 'the mesh has holes (open edges)', report: report({}) };
     if (body.shells.length > 1) return { error: 'a body with a void', report: report({}) };
@@ -114,8 +126,10 @@ export function faceExport({ positions, labels, surfaces }, { part = 'Part', spl
     loose.push(...r.report.looseEdges);
     for (const [k, g] of Object.entries(r.report.edgeGaps ?? {})) { for (const x of g.gaps) (gaps[k] ??= []).push(x); exactN[k] = (exactN[k] ?? 0) + (g.exact ?? 0); }
     bulge += r.report.bulgeVolume;
-    solids.push({ faces: r.faces, edges: r.edges, points: r.points, name: `Body ${b + 1}`, tolerance: r.tolerance });
-    rows.push({ id: b, name: `Body ${b + 1}`, tier: 'analytic', bestTier: 'analytic', facetTris: 0, facetArea: 0, triangles: Tb.length });
+    solids.push({ faces: r.faces, edges: r.edges, points: r.points, name: nameOf(b), tolerance: r.tolerance });
+    const row = rows.find((x) => x.id === app[b]);
+    if (row) row.triangles += Tb.length;
+    else rows.push({ id: app[b], name: baseName(app[b]), tier: 'analytic', bestTier: 'analytic', facetTris: 0, facetArea: 0, triangles: Tb.length });
   }
   info.edge_tol = edgeTol;
   // the edges by what meets there (faceSolid's edgeGaps): count, median and worst gap, x the diagonal

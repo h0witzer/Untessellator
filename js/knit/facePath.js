@@ -95,10 +95,10 @@ export function faceAfterKnit(oc, payload, knitReport, { part = 'Part', budgetS 
   return { ...last, rejected: why.join('; ') || 'nothing to try' };
 }
 
-function attempt(oc, { positions, labels, surfaces, oriented = false }, part, split, close = false) {
+function attempt(oc, { positions, labels, surfaces, bodies = null, names = null, oriented = false }, part, split, close = false) {
   const t0 = performance.now();
   let fx;
-  try { fx = faceExport({ positions, labels, surfaces }, { part, split }); } catch (err) { return { rejected: `threw: ${String(err?.message ?? err).slice(0, 160)}`, info: {} }; }
+  try { fx = faceExport({ positions, labels, surfaces, bodies }, { part, split, names }); } catch (err) { return { rejected: `threw: ${String(err?.message ?? err).slice(0, 160)}`, info: {} }; }
   const info = { ...fx.report.info, face_ms: Math.round(performance.now() - t0) };
   if (fx.error) return { rejected: fx.error, info };
   let shape = readStep(oc, fx.step);
