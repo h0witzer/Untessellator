@@ -186,9 +186,19 @@ function attempt(oc, { positions, labels, surfaces, oriented = false }, part, sp
     area[t] = Math.hypot(e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]) / 2;
     for (let k = 0; k < 3; k++) cen[t * 3 + k] = (positions[o + k] + positions[o + 3 + k] + positions[o + 6 + k]) / 3;
   }
-  const back = strays(cen, preview.positions, mesh.diag, area, close);
+  const back = strays(cen, preview.positions, mesh.diag, area, close, area, true);
   info.mesh_far = back.far / (back.total || 1); info.mesh_beyond = back.beyond / (back.total || 1); info.mesh_close = back.near / (back.total || 1);
-  if (back.beyond > 0 || back.far > 0.01 * back.total) return { rejected: `the mesh off the solid (${((100 * back.beyond) / back.total).toFixed(2)}% of its area past 1%, ${((100 * back.far) / back.total).toFixed(2)}% past 0.5% of its size)`, info };
+  if (back.beyond > 0 || back.far > 0.01 * back.total) {
+    // the faces whose triangles the solid leaves uncovered (those past 1%, else those past half that) are named, as
+    // the kernel's verdicts name faces, so the next round rebuilds them (a trim cutting into its own face)
+    const owner = new Int32Array(nT).fill(-1);
+    fx.faceKeys.forEach((k, i) => { for (const t of k?.g ?? []) owner[t] = i; });
+    const named = new Set();
+    for (const t of back.beyondAt.length ? back.beyondAt : back.farAt) if (owner[t] >= 0) named.add(owner[t]);
+    const bad = [...named].map((i) => fx.faceKeys[i]);
+    info.uncovered_faces = bad.map((k) => `${k.analytic ? 'analytic' : 'fitted'} ${k.label}`);
+    return { rejected: `the mesh off the solid (${((100 * back.beyond) / back.total).toFixed(2)}% of its area past 1%, ${((100 * back.far) / back.total).toFixed(2)}% past 0.5% of its size)`, info, bad };
+  }
   // after a knit (close): the solid replaces one whose facets lie on the mesh, so it must also be as near the mesh as
   // a surface counts as found (CLOSE x diag, the surface scorer's tolerance) both ways, over 99% of points and area
   if (close && info.mesh_close > 0.01 && info.preview_close <= 0.01) {
@@ -288,9 +298,10 @@ function keysByPlace(oc, faces, keys, P) {
  * OFF_MESH / 2 x diag (far), and farther than OFF_MESH x diag (beyond): exact point-triangle distances over a grid of
  * the triangles. w: a weight per point (near, far, beyond and total then sums of them; wNear for near and totalNear
  * alone, w unless given). flag: also list the points past
- * CLOSE with the triangle each is nearest ([point, triangle]; one past the 1-ring of cells is not listed).
+ * CLOSE with the triangle each is nearest ([point, triangle]; one past the 1-ring of cells is not listed). mark: also
+ * list the points past half OFF_MESH (farAt) and past OFF_MESH (beyondAt).
  */
-function strays(pts, P, diag, w = null, flag = false, wNear = w) {
+function strays(pts, P, diag, w = null, flag = false, wNear = w, mark = false) {
   const h = (OFF_MESH / 2) * diag, cells = new Map(), key = (x, y, z) => `${x},${y},${z}`;
   const nT = P.length / 9;
   for (let t = 0; t < nT; t++) {
@@ -327,14 +338,15 @@ function strays(pts, P, diag, w = null, flag = false, wNear = w) {
     return Math.sqrt(best);
   };
   let close = 0, totalNear = 0, far = 0, beyond = 0, total = 0;
-  const flagged = [];
+  const flagged = [], farAt = [], beyondAt = [];
   for (let i = 0; i < pts.length; i += 3) {
     const p = [pts[i], pts[i + 1], pts[i + 2]], wi = w ? w[i / 3] : 1, wn = wNear ? wNear[i / 3] : 1, d = near(p, 1);
     total += wi; totalNear += wn;
     if (d > CLOSE * diag) { close += wn; if (flag && bestT >= 0) flagged.push([i / 3, bestT]); }
     if (d <= h) continue;
     far += wi;
-    if (near(p, 2) > 2 * h) beyond += wi;
+    if (mark) farAt.push(i / 3);
+    if (near(p, 2) > 2 * h) { beyond += wi; if (mark) beyondAt.push(i / 3); }
   }
-  return { near: close, totalNear, far, beyond, total, flagged };
+  return { near: close, totalNear, far, beyond, total, flagged, farAt, beyondAt };
 }
