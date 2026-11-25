@@ -80,12 +80,13 @@ self.onmessage = async ({ data }) => {
     const { solid, report, names: solidNames } = knitSolid(oc, { positions, labels, surfaces: new Map(surfaces), bodies, names, oriented },
       { ...knitOptions, keep, onProgress, onBody });
     if (faceTried) report.info = { ...report.info, face_path: faceTried.rejected, face_path_info: faceTried.info };
+    let interimStep = null;
     // never facets: a solid with facets in it (or none at all) gets the face path as one more rung, the facet groups
     // fitted as B-splines (knit/facePath.js faceAfterKnit); the knitter's result stays when that does not pass
     if (!keep && options.facePath !== false && (!solid || (report.facetArea ?? 0) > 0)) {
       // the knitter's own result first, so a hard stop during the rung keeps it rather than faceting the whole mesh
       if (solid) {
-        try { self.postMessage({ type: 'interim', step: writeStep(oc, solid, solidNames ? { names: solidNames, part } : {}), report }); }
+        try { interimStep = writeStep(oc, solid, solidNames ? { names: solidNames, part } : {}); self.postMessage({ type: 'interim', step: interimStep, report }); }
         catch (err) { console.warn('no interim STEP:', err?.message ?? err); }
       }
       self.postMessage({ type: 'status', text: 'Fitting B-spline faces where the solid has facets…' });
@@ -101,7 +102,8 @@ self.onmessage = async ({ data }) => {
       report.info = { ...report.info, face_after_knit: fa.rejected };
     }
     self.postMessage({ type: 'status', text: 'Writing STEP…' });
-    const step = solid ? writeStep(oc, solid, solidNames ? { names: solidNames, part } : {}) : null;
+    // (the interim STEP is this one: the rung leaves the knitter's solid as it was)
+    const step = solid ? interimStep ?? writeStep(oc, solid, solidNames ? { names: solidNames, part } : {}) : null;
     // the preview: tessellated to a thousandth of the part's diagonal; without one the studio saves at once
     let preview = null;
     if (step) {
