@@ -1715,6 +1715,13 @@ function saveStep(current, step, report, file) {
   say(exportSummary(file, report, current.model.count - current.store.painted), report.tier !== 'analytic');
 }
 
+/** "A closed solid", or "2 closed solids" for a file of several bodies (each its own solid); capitalised with `cap`. */
+const solidsText = (report, cap = false) => {
+  const n = Array.isArray(report?.bodies) ? report.bodies.length : 1;
+  const s = n > 1 ? `${n} closed solids` : 'a closed solid';
+  return cap ? s[0].toUpperCase() + s.slice(1) : s;
+};
+
 /** A fully analytic build, on show: save it, or go back to the groups. */
 function offerSave(current, step, report) {
   const file = `${current.name}.stp`;
@@ -1725,12 +1732,12 @@ function offerSave(current, step, report) {
   // groups whose own type would not join went out as B-splines fitted to them: named, with Repair to try their types
   const splined = splinedRows(current, report);
   const n = splined.length;
-  say(n ? `Ready to save: ${file}, a closed solid with no flat facets; ${plural(n, 'group')} built as B-splines`
-    : `Ready to save: ${file}, a closed solid with every face on its fitted surface`);
+  say(n ? `Ready to save: ${file}, ${solidsText(report)} with no flat facets; ${plural(n, 'group')} built as B-splines`
+    : `Ready to save: ${file}, ${solidsText(report)} with every face on its fitted surface`);
   showResult({
     title: `Ready: ${file}`,
-    lead: n ? `A closed solid with no flat facets${faces}. ${plural(n, 'group')} would not join as ${n === 1 ? 'its' : 'their'} own type, so ${n === 1 ? 'it is a B-spline' : 'they are B-splines'} fitted to the mesh. Click one to zoom to it.`
-      : `A closed solid, every face on its fitted surface${faces}. Turn it to check it, then save.`,
+    lead: n ? `${solidsText(report, true)} with no flat facets${faces}. ${plural(n, 'group')} would not join as ${n === 1 ? 'its' : 'their'} own type, so ${n === 1 ? 'it is a B-spline' : 'they are B-splines'} fitted to the mesh. Click one to zoom to it.`
+      : `${solidsText(report, true)}, every face on its fitted surface${faces}. Turn it to check it, then save.`,
     groups: splined,
     steps: [
       { label: 'Save STEP', primary: true, detail: `Downloads ${file}.`, onSelect: () => saveStep(current, step, report, file) },
@@ -1748,7 +1755,7 @@ function savedClean(current, step, report) {
   saveStep(current, step, report, file);
   if (current.fromGuide || supportHidden()) return;
   const n = splinedRows(current, report).length;
-  showResult({ title: `Saved: ${file}`, lead: n ? `A closed solid with no flat facets. ${plural(n, 'group')} went out as B-splines.` : 'A closed solid, every face on its fitted surface.', support: true });
+  showResult({ title: `Saved: ${file}`, lead: n ? `${solidsText(report, true)} with no flat facets. ${plural(n, 'group')} went out as B-splines.` : `${solidsText(report, true)}, every face on its fitted surface.`, support: true });
 }
 
 /**
@@ -2798,8 +2805,7 @@ function knitInWorker(payload, onStatus, limitS = Infinity, run = {}, onBody = n
 function exportSummary(file, report, unpainted) {
   const pct = areaPct;
   const parts = [];
-  const n = Array.isArray(report.bodies) ? report.bodies.length : 1;
-  const solids = n > 1 ? `${n} closed solids` : 'a closed solid';
+  const solids = solidsText(report);
   if (report.tier === 'analytic') parts.push(`Exported ${file}: ${solids}, every face on its fitted surface`);
   else if (report.tier === 'hybrid' || report.tier === 'planar') {
     parts.push(`Exported ${file}: ${solids}; ${report.facetTris.toLocaleString()} triangles (${pct(report.facetArea)} of the area) ` +
