@@ -86,6 +86,9 @@ export function vertexDeviation(tris, facets, type, params) {
   return { d, n: seen.size };
 }
 
+/** The curved primitives: none can be fitted on fewer than three facets. */
+const CURVED = new Set(['cylinder', 'cone', 'sphere', 'torus']);
+
 /** Degrees of freedom of each primitive: an exact fit is evidence only on several times as many vertices. */
 const DOF = { plane: 3, cylinder: 5, cone: 6, sphere: 4, torus: 7 };
 
@@ -105,7 +108,7 @@ const DOF = { plane: 3, cylinder: 5, cone: 6, sphere: 4, torus: 7 };
  * meshes 89 right cylinders of 7-10 vertices became tori, spheres and cones. Otherwise the painted type
  * stays. An untyped group (the fill
  * found no analytic surface) takes the classifier's type, or a plane through 1-2 facets within
- * `looseTol` x the diagonal.
+ * `looseTol` x the diagonal; so does a group of 1-2 facets painted a curved type it cannot be fitted as.
  *
  * @returns {{type: string|null, changed: boolean, exact: boolean}}
  */
@@ -114,7 +117,9 @@ export function typeFinalGroup(tris, facets, painted, { bar = EXACT_TYPE_BAR, lo
   const diag = partDiagonal(facets);
   const keep = { type: painted ?? null, changed: false, exact: false };
   if (set.size < 3) {
-    if (painted || !set.size) return keep;
+    // a curved painted type cannot be fitted on fewer than three triangles (gaussMap.fitRegionAs): kept, it left the
+    // group with no surface and its neighbors open (the Base's one-triangle slivers), so it counts as none here
+    if ((painted && !CURVED.has(painted)) || !set.size) return keep;
     const plane = fitRegionAs('plane', set, facets);
     return plane.params && vertexDeviation(set, facets, 'plane', plane.params).d <= looseTol * diag
       ? { type: 'plane', changed: true, exact: false } : keep;
