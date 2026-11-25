@@ -27,7 +27,10 @@ SolidCraft's rule 2 forbids reading GPL, LGPL or AGPL code. This repo contains o
 | OpenCASCADE, through opencascade.js 2.0 | `node_modules/opencascade.js`; the browser loads it from unpkg | LGPL-2.1-only |
 | OpenCASCADE, through OCP (`cadquery-ocp`) | the Python environment for `ml/` | LGPL-2.1 |
 
-Everything else is our own MIT code. Some of it is written against OpenCASCADE's API:
+Everything else is our own MIT code, apart from `js/vendor/quadriflow/`: QuadriFlow compiled to
+WebAssembly, with LEMON, pcg32, Boost and Eigen built in. None of those are GPL or LGPL; their
+licenses (BSD-3-Clause, Boost, Apache-2.0, MPL-2.0) are in its NOTICE file. Some of our own code is
+written against OpenCASCADE's API:
 
 - `js/knit/build.js` and `js/knit/occt.js` call OCCT directly.
 - `js/knit/repair.js` drives them.

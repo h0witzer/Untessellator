@@ -205,12 +205,19 @@ Then open an issue saying what you're picking up.
 | [onnxruntime-web](https://onnxruntime.ai/) | 1.22.0 | MIT | Running the optional models |
 | [opencascade.js](https://github.com/donalffons/opencascade.js) | 2.0.0-beta | LGPL-2.1 | The geometry kernel behind the STEP export |
 | Form Studio UI kit (`vendor/form-studio-ui/`) | vendored | LGPL-2.1-or-later | Untessellator's camera, view cube, menus, tooltips and rendering pieces |
+| [QuadriFlow](https://github.com/hjwdzh/QuadriFlow) (`js/vendor/quadriflow/`) | commit 810b7a0, built to WebAssembly | BSD-3-Clause, with an enhancements clause | Quad remeshing for the SubD-to-NURBS converter (`js/subd/`); the page doesn't load it |
+| [LEMON](https://lemon.cs.elte.hu/), built into QuadriFlow | 1.3.1 | Boost Software License 1.0 | QuadriFlow's min-cost flow |
+| [pcg32](https://github.com/wjakob/pcg32), built into QuadriFlow | bundled | Apache-2.0 | QuadriFlow's random numbers |
+| [Boost](https://www.boost.org/) headers, built into QuadriFlow | 1.83.0 | Boost Software License 1.0 | QuadriFlow's max-flow |
+| [Eigen](https://eigen.tuxfamily.org/), built into QuadriFlow | 3.3.9 | MPL-2.0 (built with `EIGEN_MPL2_ONLY`) | QuadriFlow's linear algebra |
 
 The browser loads the libraries from jsDelivr and unpkg. The Node harnesses use `onnxruntime-node`
-and `opencascade.js` from `npm install`.
+and `opencascade.js` from `npm install`. `tools/quadriflow/build.sh` builds `js/vendor/quadriflow/`
+from the upstream sources; its NOTICE file carries every license text and says what is compiled in.
 
 ## License
 
 MIT; see [LICENSE](LICENSE). The file loader (`js/stlLoader.js`) still carries code from
 stlTexturizer, so its copyright notice stays in LICENSE alongside ours. The two LGPL components
-above keep their own licenses.
+above keep their own licenses, as do QuadriFlow and the libraries built into it
+([js/vendor/quadriflow/NOTICE](js/vendor/quadriflow/NOTICE)).
