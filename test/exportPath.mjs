@@ -41,6 +41,8 @@ if (!step && !FACE_ONLY) {
     const left = DEADLINE - (performance.now() - t0) / 1000;
     const fa = faceAfterKnit(oc, { positions, labels, surfaces }, r, { part: stem, budgetS: Math.max(30, left), triedAsPainted: row.freeform });
     if (fa.step) { step = fa.step; report = fa.report; row.after_knit = fa.report.info.after_knit_how; } else row.face_after_knit = fa.rejected;
+    const ai = fa.info ?? fa.report?.info;
+    if (ai) row.after_knit_close = { points: ai.preview_close, area: ai.mesh_close, area_preview: ai.mesh_close_preview };
   }
 }
 row.path = report?.info?.path ?? 'knit';

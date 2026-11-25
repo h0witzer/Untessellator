@@ -23,6 +23,9 @@ import { score, subShapes, OFF_MESH } from './build.js';
 import { previewMesh } from './preview.js';
 import { FREEFORM_MIN_FACETS } from './index.js';
 
+// how near the mesh a surface counts as found (ml surfaceScore's tolerance), as a part of the diagonal
+const CLOSE = 1e-3;
+
 export function hasFreeform(labels, surfaces) {
   const count = new Map();
   for (const g of labels) if (g >= 0 && !surfaces.has(g)) count.set(g, (count.get(g) ?? 0) + 1);
@@ -30,7 +33,7 @@ export function hasFreeform(labels, surfaces) {
   return false;
 }
 
-export function tryFacePath(oc, payload, { part = 'Part', budgetS = Infinity } = {}) {
+export function tryFacePath(oc, payload, { part = 'Part', budgetS = Infinity, close = false } = {}) {
   // the kernel's verdict names faces (invalid, not tessellated, or off the mesh) and the solid is built again, three
   // times at most and within budgetS (the knitter's time after it is what is left): an analytic face named is fitted
   // freely as one B-spline face of its group, a fitted one is cut where its normals turn most (faceSolidSplit)
@@ -38,7 +41,7 @@ export function tryFacePath(oc, payload, { part = 'Part', budgetS = Infinity } =
   let last = null;
   for (let round = 0; round < 4; round++) {
     const surfaces = free.size ? new Map([...payload.surfaces].filter(([g]) => !free.has(g))) : payload.surfaces;
-    const r = attempt(oc, { ...payload, surfaces }, part, split);
+    const r = attempt(oc, { ...payload, surfaces }, part, split, close);
     const info = r.info ?? r.report.info;
     rounds.push(`${r.step ? 'taken' : r.rejected} [freed ${free.size}, cut ${split.length}, splits ${info.splits?.length ?? 0}]`);
     info.kernel_rounds = round;
@@ -82,7 +85,7 @@ export function faceAfterKnit(oc, payload, knitReport, { part = 'Part', budgetS 
   for (const [how, surfaces] of tries) {
     const left = budgetS - (performance.now() - t0) / 1000;
     if (left <= 0) { why.push(`${how}: out of time`); break; }
-    const r = tryFacePath(oc, { ...payload, surfaces }, { part, budgetS: left });
+    const r = tryFacePath(oc, { ...payload, surfaces }, { part, budgetS: left, close: true });
     const info = r.info ?? r.report?.info;
     if (info) { info.after_knit = was; info.after_knit_how = how; }
     if (r.step) return r;
@@ -92,7 +95,7 @@ export function faceAfterKnit(oc, payload, knitReport, { part = 'Part', budgetS 
   return { ...last, rejected: why.join('; ') || 'nothing to try' };
 }
 
-function attempt(oc, { positions, labels, surfaces, oriented = false }, part, split) {
+function attempt(oc, { positions, labels, surfaces, oriented = false }, part, split, close = false) {
   const t0 = performance.now();
   let fx;
   try { fx = faceExport({ positions, labels, surfaces }, { part, split }); } catch (err) { return { rejected: `threw: ${String(err?.message ?? err).slice(0, 160)}`, info: {} }; }
@@ -167,8 +170,15 @@ function attempt(oc, { positions, labels, surfaces, oriented = false }, part, sp
     faces.forEach((fc, i) => { const loc = new oc.TopLoc_Location_1(); if (oc.BRep_Tool.Triangulation(oc.TopoDS.Face_1(fc), loc, 0).IsNull()) idx.push(i); loc.delete(); });
     return { rejected: `${faces.length - preview.faces} faces the kernel could not tessellate`, info, bad: keyed(idx) };
   }
-  const { far, beyond } = strays(preview.positions, positions, mesh.diag);
-  info.preview_far = far; info.preview_beyond = beyond;
+  // (each preview point also weighed by a third of its triangle's area for the closeness: the preview is denser where
+  // its faces curve, where a coarse mesh's chords are farthest from them)
+  const pp = preview.positions, wArea = new Float64Array(pp.length / 3);
+  for (let o = 0; o < pp.length; o += 9) {
+    const e1 = [pp[o + 3] - pp[o], pp[o + 4] - pp[o + 1], pp[o + 5] - pp[o + 2]], e2 = [pp[o + 6] - pp[o], pp[o + 7] - pp[o + 1], pp[o + 8] - pp[o + 2]];
+    wArea[o / 3] = wArea[o / 3 + 1] = wArea[o / 3 + 2] = Math.hypot(e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]) / 6;
+  }
+  const { far, beyond, near: nearFar, totalNear } = strays(pp, positions, mesh.diag, null, false, wArea);
+  info.preview_far = far; info.preview_beyond = beyond; info.preview_close = nearFar / (totalNear || 1);
   if (beyond > 0 || far > 0.01 * (preview.positions.length / 3)) return { rejected: `off the mesh (${beyond} points past 1%, ${far} past 0.5% of its size)`, info };
   const nT = positions.length / 9, cen = new Float64Array(nT * 3), area = new Float64Array(nT);
   for (let t = 0; t < nT; t++) {
@@ -176,9 +186,33 @@ function attempt(oc, { positions, labels, surfaces, oriented = false }, part, sp
     area[t] = Math.hypot(e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]) / 2;
     for (let k = 0; k < 3; k++) cen[t * 3 + k] = (positions[o + k] + positions[o + 3 + k] + positions[o + 6 + k]) / 3;
   }
-  const back = strays(cen, preview.positions, mesh.diag, area);
-  info.mesh_far = back.far / (back.total || 1); info.mesh_beyond = back.beyond / (back.total || 1);
+  const back = strays(cen, preview.positions, mesh.diag, area, close);
+  info.mesh_far = back.far / (back.total || 1); info.mesh_beyond = back.beyond / (back.total || 1); info.mesh_close = back.near / (back.total || 1);
   if (back.beyond > 0 || back.far > 0.01 * back.total) return { rejected: `the mesh off the solid (${((100 * back.beyond) / back.total).toFixed(2)}% of its area past 1%, ${((100 * back.far) / back.total).toFixed(2)}% past 0.5% of its size)`, info };
+  // after a knit (close): the solid replaces one whose facets lie on the mesh, so it must also be as near the mesh as
+  // a surface counts as found (CLOSE x diag, the surface scorer's tolerance) both ways, over 99% of points and area
+  if (close && info.mesh_close > 0.01 && info.preview_close <= 0.01) {
+    // the preview's triangles are chords, up to its deflection (CLOSE x diag itself, more on B-splines) off the faces:
+    // a mesh point past CLOSE from them is measured again to the surface of the face it is nearest
+    const sas = new Map(), tol = CLOSE * mesh.diag, limit = 0.01 * back.total;
+    // (a point with no preview triangle within reach is past it whatever the surface)
+    let past = back.near;
+    for (const [i] of back.flagged) past -= area[i];
+    for (const [i, t] of back.flagged) {
+      const f = preview.face[t];
+      let sa = sas.get(f);
+      if (!sa) { sa = new oc.ShapeAnalysis_Surface(oc.BRep_Tool.Surface_2(oc.TopoDS.Face_1(faces[f]))); sas.set(f, sa); }
+      const gp = new oc.gp_Pnt_3(cen[i * 3], cen[i * 3 + 1], cen[i * 3 + 2]);
+      sa.ValueOfUV(gp, 1e-9 * mesh.diag).delete();
+      gp.delete();
+      if (!(sa.Gap() <= tol)) past += area[i];
+      if (past > limit) break;
+    }
+    for (const sa of sas.values()) sa.delete();
+    info.mesh_close_preview = info.mesh_close;
+    info.mesh_close = past / (back.total || 1);
+  }
+  if (close && (info.preview_close > 0.01 || info.mesh_close > 0.01)) return { rejected: `not close enough to replace facets (${(100 * info.preview_close).toFixed(1)}% of its points and ${(100 * info.mesh_close).toFixed(1)}% of the mesh's area past ${CLOSE * 100}% of its size)`, info };
   const report = { ...fx.report, closed: true, valid: true, vol_err: volErr, free_edges: sc.free_edges ?? 0,
     secs: Math.round((performance.now() - t0) / 100) / 10, info };
   return { step: fx.step, report, shape, preview };
@@ -250,11 +284,13 @@ function keysByPlace(oc, faces, keys, P) {
 }
 
 /**
- * How many of the points `pts` (flat xyz) lie farther than OFF_MESH / 2 x diag from the triangle soup P (far), and
- * farther than OFF_MESH x diag (beyond): exact point-triangle distances over a grid of the triangles. w: a weight per
- * point (far, beyond and total then sums of them).
+ * How many of the points `pts` (flat xyz) lie farther than CLOSE x diag from the triangle soup P (near), farther than
+ * OFF_MESH / 2 x diag (far), and farther than OFF_MESH x diag (beyond): exact point-triangle distances over a grid of
+ * the triangles. w: a weight per point (near, far, beyond and total then sums of them; wNear for near and totalNear
+ * alone, w unless given). flag: also list the points past
+ * CLOSE with the triangle each is nearest ([point, triangle]; one past the 1-ring of cells is not listed).
  */
-function strays(pts, P, diag, w = null) {
+function strays(pts, P, diag, w = null, flag = false, wNear = w) {
   const h = (OFF_MESH / 2) * diag, cells = new Map(), key = (x, y, z) => `${x},${y},${z}`;
   const nT = P.length / 9;
   for (let t = 0; t < nT; t++) {
@@ -280,21 +316,25 @@ function strays(pts, P, diag, w = null) {
     return (p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 + (p[2] - q[2]) ** 2;
   };
   // nearest within the cells r rings round p (2 rings reach 2h = OFF_MESH x diag)
+  let bestT = -1;
   const near = (p, rings) => {
     const c = p.map((x) => Math.floor(x / h));
     let best = Infinity;
+    bestT = -1;
     for (let x = c[0] - rings; x <= c[0] + rings; x++) for (let y = c[1] - rings; y <= c[1] + rings; y++) for (let z = c[2] - rings; z <= c[2] + rings; z++) {
-      for (const t of cells.get(key(x, y, z)) ?? []) best = Math.min(best, dist2(p, t));
+      for (const t of cells.get(key(x, y, z)) ?? []) { const d = dist2(p, t); if (d < best) { best = d; bestT = t; } }
     }
     return Math.sqrt(best);
   };
-  let far = 0, beyond = 0, total = 0;
+  let close = 0, totalNear = 0, far = 0, beyond = 0, total = 0;
+  const flagged = [];
   for (let i = 0; i < pts.length; i += 3) {
-    const p = [pts[i], pts[i + 1], pts[i + 2]], wi = w ? w[i / 3] : 1;
-    total += wi;
-    if (near(p, 1) <= h) continue;
+    const p = [pts[i], pts[i + 1], pts[i + 2]], wi = w ? w[i / 3] : 1, wn = wNear ? wNear[i / 3] : 1, d = near(p, 1);
+    total += wi; totalNear += wn;
+    if (d > CLOSE * diag) { close += wn; if (flag && bestT >= 0) flagged.push([i / 3, bestT]); }
+    if (d <= h) continue;
     far += wi;
     if (near(p, 2) > 2 * h) beyond += wi;
   }
-  return { far, beyond, total };
+  return { near: close, totalNear, far, beyond, total, flagged };
 }
