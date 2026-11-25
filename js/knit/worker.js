@@ -26,7 +26,7 @@
  *               bodies?}}: with several bodies each is repaired alone (knit/index.js repairGroups), bodies a line each.
  */
 
-import { loadOcct, knitSolid, repairGroups, writeStep, brepText } from './index.js';
+import { loadOcct, knitSolid, repairGroups, writeStep, brepText, kernelError } from './index.js';
 import { previewMesh } from './preview.js';
 import { hasFreeform, tryFacePath, faceAfterKnit } from './facePath.js';
 
@@ -117,7 +117,9 @@ self.onmessage = async ({ data }) => {
     const buffers = preview ? [preview.positions.buffer, preview.normals.buffer, preview.face.buffer, preview.edges.buffer] : [];
     self.postMessage({ type: 'done', step, report, preview }, buffers);
   } catch (err) {
-    self.postMessage({ type: 'error', message: String(err?.message ?? err) });
+    // the kernel's exceptions arrive as bare numbers: decoded, the studio can say what went wrong
+    const oc = ready ? await kernel.catch(() => null) : null;
+    self.postMessage({ type: 'error', message: kernelError(oc, err) });
   }
 };
 

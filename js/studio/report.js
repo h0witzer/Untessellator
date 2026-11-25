@@ -1,16 +1,18 @@
 /**
- * report.js — a conversion report: this run's numbers as a prefilled GitHub issue, and a report file.
+ * report.js — a conversion report: this run's numbers and a report file, sent to Untessellator's private inbox.
  *
- * The models ship in models/ and run in the browser, and the studio promises that nothing is uploaded,
- * so the only way to learn how they do on real parts is for people to tell us. The Report button downloads
- * a report file (a .zip) and opens the repository's "Conversion report" issue form with a summary already
- * filled in; the user drags the file in, adds what went wrong, and submits. Nothing leaves the browser
- * until they do. The mesh's file name is left out: they can add it if they want to.
+ * The models ship in models/ and run in the browser, and the page promises that nothing is uploaded, so the
+ * only way to learn how they do on real parts is for people to tell us. The Report button builds a report
+ * file (a .zip) and, when the user presses Send, uploads it to the inbox (a Cloudflare Worker and an R2 bucket,
+ * kept outside this repo), which opens an issue for it in a private repo that only the developer can read.
+ * The user can add a note, a reply address and permission to keep the file as a test, or save the file
+ * instead. The mesh's file name is left out.
  *
  * The summary separates the failure modes at a glance: which model and fill settings ran, how many groups
  * auto-paint made and of what type (hundreds of one-triangle cylinders is over-segmentation), and the
  * export's tier with what the kernel said about the faces. The file says it per face:
- *   report.json      every group: where it is (centroid, box, area), how it came to be (auto-paint seed,
+ *   report.json      first in the zip (the inbox checks for it): the summary, the user's note, and every
+ *                    group: where it is (centroid, box, area), how it came to be (auto-paint seed,
  *                    the model's prediction and confidence, how its final type was decided, or a stroke),
  *                    its fit residual, what the export check flagged, and the export's verdict per face
  *                    (knit/index.js faceOutcomes: kernel problems, repair moves, retypes, facets)
@@ -21,9 +23,20 @@
  *                    with it, test/reportReplay.mjs rebuilds the reported export exactly
  */
 
-export const REPORT_REPO = 'https://github.com/h0witzer/Untessellator';
-/** The issue form in .github/ISSUE_TEMPLATE; the query keys are its field ids. */
-const TEMPLATE = 'conversion-report.yml';
+/** The inbox: a Cloudflare Worker, kept outside this public repo. */
+const INBOX = 'https://reports.untessellator.com';
+/** The inbox's size limit (its MAX_MB). */
+export const INBOX_MAX_BYTES = 95 * 1024 * 1024;
+
+/**
+ * Where Send uploads. A copy of the page served from this machine may name a local inbox with
+ * ?inbox=http://127.0.0.1:8787 (wrangler dev); the live site always uses its own, so a link can't redirect reports.
+ */
+export function inboxUrl() {
+  const local = /^(localhost|127\.0\.0\.1)$/.test(location.hostname);
+  const override = local ? new URLSearchParams(location.search).get('inbox') : null;
+  return (override ?? INBOX).replace(/\/$/, '');
+}
 
 const n = (x) => Number(x).toLocaleString('en-US');
 const pct = (x) => `${(100 * x).toFixed(x < 0.01 ? 1 : 0)}%`;
@@ -162,9 +175,10 @@ export async function fingerprint(floats) {
  * The report file's report.json, as an object. `groups` are the studio's ({ id, type, fit }), `placed` is
  * placeGroups' map, `origins` the studio's per-group origins (a group the Repair changed lists its retypes
  * under `repaired`), `check` the export check's last flags ({ groups: [[id, reasons]], mesh }), `groupRepair`
- * the last Repair of the groups.
+ * the last Repair of the groups, `summary` conversionNumbers' lines. When the user sends it, `message` holds
+ * their note, reply address and whether the file may be kept to test future versions ({ note, contact, keep }).
  */
-export function reportJson({ page, settings, model, triangles, repair, fingerprint: print, includesMesh, autoPaint,
+export function reportJson({ summary = '', page, settings, model, triangles, repair, fingerprint: print, includesMesh, autoPaint,
   groups, placed, origins, check, exported, groupRepair = null, since = {} }) {
   const flags = new Map(check?.groups ?? []);
   return {
@@ -172,6 +186,8 @@ export function reportJson({ page, settings, model, triangles, repair, fingerpri
     created: new Date().toISOString(),
     page,
     browser: browserName(),
+    summary,
+    message: null,
     settings: { ...settings, model },
     mesh: { triangles, fingerprint: print, included: includesMesh, repair: repair ?? null },
     autoPaint: autoPaint ?? null,
@@ -191,10 +207,26 @@ export function reportJson({ page, settings, model, triangles, repair, fingerpri
   };
 }
 
-/** The prefilled issue form: the title says the outcome, the numbers go in the form's `numbers` field. */
-export function reportUrl(numbers, { tier, groups, editedSince = false } = {}) {
-  const outcome = tier ? `tier ${tier}${editedSince ? ' before later edits' : ''}` : 'not exported';
-  const title = `Conversion report: ${outcome}${groups ? `, ${groups} groups` : ''}`;
-  const q = new URLSearchParams({ template: TEMPLATE, title, numbers });
-  return `${REPORT_REPO}/issues/new?${q}`;
+/**
+ * Upload a report file to the inbox. `onProgress(share)` follows the upload (0..1); `signal` aborts it.
+ * Resolves the report's reference ("20261121-K7Q2MX"); rejects with the inbox's reason, or a network error.
+ * Everything the inbox needs is in the file's report.json. XMLHttpRequest, not fetch, for the upload's progress.
+ */
+export function sendToInbox(bytes, { onProgress, signal } = {}) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `${inboxUrl()}/reports`);
+    xhr.setRequestHeader('Content-Type', 'application/zip');
+    xhr.upload.onprogress = (event) => { if (event.lengthComputable) onProgress?.(event.loaded / event.total); };
+    xhr.onload = () => {
+      let body = null;
+      try { body = JSON.parse(xhr.responseText); } catch { /* not JSON: a proxy's page */ }
+      if (xhr.status === 201 && body?.id) resolve(body.id);
+      else reject(new Error(body?.error ?? `the inbox answered ${xhr.status}`));
+    };
+    xhr.onerror = () => reject(new Error('no connection to the inbox'));
+    xhr.onabort = () => reject(Object.assign(new Error('stopped'), { name: 'AbortError' }));
+    signal?.addEventListener('abort', () => xhr.abort(), { once: true });
+    xhr.send(bytes);
+  });
 }

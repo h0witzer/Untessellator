@@ -14,8 +14,8 @@
 
 import { KnitMesh } from './mesh.js';
 import { buildRepaired, facetFallback, progressiveRecovery, LOOP, now } from './repair.js';
-import { buildPolyhedral, grade, tidy, better, BUILD } from './build.js';
-import { readBrep } from './occt.js';
+import { buildPolyhedral, grade, tidy, better, BUILD, FACETED_MAX_TRIANGLES, tooManyFacets } from './build.js';
+import { readBrep, kernelError } from './occt.js';
 import { buildFacets } from '../meshCore.js';
 import { attachCurvature } from '../curvature.js';
 import { fitRegionAs } from '../gaussMap.js';
@@ -23,7 +23,7 @@ import { fitPieces } from '../freeformFit.js';
 import { shareAxes } from './axes.js';
 import { TIERS } from './tiers.js';
 
-export { loadOcct, writeStep, brepText, readBrep, readStep } from './occt.js';
+export { loadOcct, writeStep, brepText, readBrep, readStep, kernelError } from './occt.js';
 export { BUILD } from './build.js';
 export { TIERS, compareExports } from './tiers.js';
 
@@ -136,10 +136,17 @@ export function addFreeform(mesh, surfaces, onProgress = null, { split = true, f
  * mesh's points, then the facet tiers, as before 2026-11-15. No group changes type or gives facets to another:
  * that is repairGroups, which the studio runs in view. `deadline` (s): past it no retry, trial or facet tier
  * starts (a running OCCT call cannot be stopped, so callers that must bound the time also need a hard stop,
- * as the studio's worker timeout). mode 'faceted': the mesh as a polyhedral solid only.
+ * as the studio's worker timeout). mode 'faceted': the mesh as a polyhedral solid only; it throws tooManyFacets when the
+ * triangles to build (every body's but those in options.keep) pass FACETED_MAX_TRIANGLES, which the kernel cannot hold.
  */
 export function knitSolid(oc, { positions, labels, surfaces, bodies = null, names = null, oriented = false }, options = {}) {
   const ids = bodies ? [...new Set(bodies)].sort((a, b) => a - b) : [];
+  if (options.mode === 'faceted') {
+    const kept = options.keep ? new Set(options.keep.keys()) : new Set();
+    let n = 0;
+    for (let t = 0; t < labels.length; t++) if (!bodies || !kept.has(bodies[t])) n++;
+    if (n > FACETED_MAX_TRIANGLES) throw tooManyFacets(n);
+  }
   if (ids.length <= 1) {
     const r = knitOne(oc, { positions, labels, surfaces, oriented }, options);
     const id = ids[0] ?? 0, name = names?.[id] ?? null;
@@ -191,8 +198,15 @@ function knitOne(oc, { positions, labels, surfaces, oriented = false }, { fallba
       if (BUILD.PROF && r?.state) info[`probs_${name}`] = Object.fromEntries(Object.entries(r.state.problems).map(([k, v]) => [k, [...v].sort((x, y) => x - y)]));
       return r;
     } catch (err) {
-      info.exception = String(err?.message ?? err).slice(0, 120);
-      if (globalThis.process?.env?.KNIT_DEBUG) info.exception_stack = String(err?.stack ?? '').split(/\r?\n/).slice(0, 8).join(' | ');
+      info.exception = kernelError(oc, err).slice(0, 120);
+      // the top of the stack, then our own frames below it: a kernel recursion fills the top with wasm frames, and the
+      // JS frames under them say which call went in (node --stack-trace-limit high enough to reach them)
+      if (globalThis.process?.env?.KNIT_DEBUG) {
+        const lines = String(err?.stack ?? '').split(/\r?\n/);
+        const kernel = (l) => l.includes('wasm://') || /\binvoke_\w+ \(/.test(l);
+        info.exception_stack = [...lines.slice(0, 4), `(${lines.filter(kernel).length} kernel frames)`,
+          ...lines.slice(4).filter((l) => !kernel(l)).slice(0, 12)].join(' | ');
+      }
       return null;
     } finally {
       info[`ms_${name}`] = Math.round(performance.now() - t);

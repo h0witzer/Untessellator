@@ -6,6 +6,10 @@
  *
  * Usage:  node test/studioExport.mjs <out dir> <file.stl> [<file.stl> ...] [--dump] [--no-axes] [--repair]
  *
+ * --bodies: the studio's bodies (js/bodies.js findBodies on the welded mesh): each body's triangles turned to face out
+ * (a void's in), each body built on its own, as the studio's export does with several; --dump also writes <name>.bodies
+ * (Int32, a body per triangle).
+ *
  * --repair: the studio's flow when that export is not every face analytic: press Repair (knit/index.js
  * repairGroups with the worker's defaults, every move it keeps applied) and Export STEP again. The STEP is the
  * second export unless it is worse than the first (compareExports), when the studio undoes Repair's changes and
@@ -35,6 +39,7 @@ import { fitRegionAs } from '../js/gaussMap.js';
 import { freeformMerge } from '../js/freeformMerge.js';
 import { loadOcct, knitSolid, repairGroups, writeStep, compareExports } from '../js/knit/index.js';
 import { distNormal } from '../js/knit/geometry.js';
+import { findBodies } from '../js/bodies.js';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const ort = createRequire(import.meta.url)('onnxruntime-node');
@@ -45,6 +50,8 @@ const DUMP = args.includes('--dump');
 const NO_AXES = args.includes('--no-axes');
 const SYNTHETIC = args.includes('--synthetic');
 const REPAIR = args.includes('--repair');
+const BODIES = args.includes('--bodies');
+if (BODIES) args.splice(args.indexOf('--bodies'), 1);
 if (REPAIR) args.splice(args.indexOf('--repair'), 1);
 if (SYNTHETIC) args.splice(args.indexOf('--synthetic'), 1);
 if (NO_AXES) args.splice(args.indexOf('--no-axes'), 1);
@@ -185,13 +192,31 @@ for (const file of FILES) {
       for (const o of u.at) for (let j = 0; j < 3; j++) positions[o + j] = x[j] - d * n[j];
     }
   }
+  // the studio's bodies: welded by exact position, each turned to face out; then built one by one
+  let bodies = null;
+  if (BODIES) {
+    const ids = new Map(), V = [], idx = new Int32Array(owner.length * 3);
+    for (let t = 0; t < owner.length; t++) for (let k = 0; k < 3; k++) {
+      const o = t * 9 + k * 3, key = `${positions[o]},${positions[o + 1]},${positions[o + 2]}`;
+      let id = ids.get(key);
+      if (id === undefined) { ids.set(key, id = V.length / 3); V.push(positions[o], positions[o + 1], positions[o + 2]); }
+      idx[t * 3 + k] = id;
+    }
+    const found = findBodies(idx, Float64Array.from(V));
+    for (let t = 0; t < owner.length; t++) {
+      if (!found.flip[t]) continue;
+      for (let j = 0; j < 3; j++) { const a = t * 9 + 3 + j, b = t * 9 + 6 + j; const x = positions[a]; positions[a] = positions[b]; positions[b] = x; }
+    }
+    bodies = found.bodyOf;
+  }
   if (DUMP) {
+    if (bodies) writeFileSync(join(OUT, `${name}.bodies`), Buffer.from(Int32Array.from(bodies).buffer));
     writeFileSync(join(OUT, `${name}.pos`), Buffer.from(Float32Array.from(positions).buffer));
     writeFileSync(join(OUT, `${name}.fid`), Buffer.from(owner.buffer));
     writeFileSync(join(OUT, `${name}.fits.json`), JSON.stringify({ faces: [...surfaces].map(([id, [type, params]]) => ({ id, type, params })) }));
   }
   const t1 = performance.now();
-  let { solid, report } = knitSolid(oc, { positions, labels: owner, surfaces }, { deadline: DEADLINE, axes: !NO_AXES });
+  let { solid, report } = knitSolid(oc, { positions, labels: owner, surfaces, ...(bodies ? { bodies, oriented: true } : {}) }, { deadline: DEADLINE, axes: !NO_AXES });
   const knitSecs = (performance.now() - t1) / 1000;
   let repaired = {};
   let step = solid ? writeStep(oc, solid) : null;

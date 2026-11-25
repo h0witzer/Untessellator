@@ -25,3 +25,5 @@ test/_*.mjs
 # Link-card legibility previews (brand/cards/render.mjs --preview)
 brand/cards/preview/
 rust/ssi-wasm/target/
+# the report inbox (a Cloudflare Worker) is private: it never goes in this repo
+inbox/

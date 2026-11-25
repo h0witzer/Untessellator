@@ -327,8 +327,8 @@ export function facetFallback(oc, mesh, shape, state, info = {}, deadline = Infi
       const { shape: sh } = buildPolyhedral(oc, mesh);
       const { g, sc } = grade(oc, sh, mesh, {});
       if (better(g, best.g)) best = { g, shape: sh, sc, tier: 'faceted', n: mesh.T.length, area: 1 };
-    } catch {
-      bump(info, 'fallback_exception');
+    } catch (err) {
+      bump(info, err?.code === 'too_many_facets' ? 'faceted_too_many_triangles' : 'fallback_exception');
     }
   }
   info.fallback_secs = Math.round((now() - t0) * 10) / 10;

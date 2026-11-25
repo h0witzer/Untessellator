@@ -37,6 +37,24 @@ export function loadOcct({ onStatus } = {}) {
 }
 
 /**
+ * A readable message for an error out of the kernel. OCCT's exceptions reach JavaScript as pointers (a bare number such
+ * as 24), which opencascade.js decodes into the exception's class and message; a RangeError from inside the kernel is
+ * its stack overflowing.
+ */
+export function kernelError(oc, err) {
+  if (err instanceof RangeError) return 'kernel stack overflow';
+  if (typeof err === 'number' && oc?.OCJS?.getStandard_FailureData) {
+    try {
+      const failure = oc.OCJS.getStandard_FailureData(err);
+      const name = failure.DynamicType().get().Name();
+      const message = failure.GetMessageString();
+      return message ? `${name}: ${message}` : name;
+    } catch { /* not a Standard_Failure */ }
+  }
+  return String(err?.message ?? err);
+}
+
+/**
  * STEP AP214 text for a shape. names: one per solid of `shape` (in its order): the file is then one product, `part`,
  * with each solid a MANIFOLD_SOLID_BREP of that name (XCAF sub-shape names, which CAD programs show as body names).
  * Without names, the plain writer, as before.

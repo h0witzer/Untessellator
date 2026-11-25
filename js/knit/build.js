@@ -17,6 +17,7 @@ import { distNormal, projectOnto, seamAway, unfoldChain, interpolateChain, unit,
   tangentLocus, ontoLocus, cornerOnLocus, exactCurve, evalBSpline } from './geometry.js';
 import { meshTopology, BODY_STRIDE } from './mesh.js';
 import { ssiNow } from './ssi.js';
+import { kernelError } from './occt.js';
 
 const bump = (info, k, n = 1) => { info[k] = (info[k] ?? 0) + n; };
 // BUILD.PROF = {}: ms per build stage, summed over every build (profiling only)
@@ -683,7 +684,7 @@ export function buildTopo(oc, mesh, surfaces, { facetLabels = null, only = null,
   // face, 86 s a build of 00005493_012's 10,969 faces) and moved their corners by up to its 1e-7 mm tolerance.
   // The chords where facets meet curved faces are those faces' edges too, so they are repaired (tolerance,
   // pcurve) with them; the facets then take whatever the repair replaced.
-  let result = shell, ctx = null;
+  let result = shell, ctx = null, finalOf = null;
   if (subShapes(oc, shell, E.FACE).length) {
     // with facets out, the analytic faces are islands: ShapeFix_Shell would orient (or split) each on its own, and
     // the shell with the facets back failed BRepCheck NotConnected (00003840_000). A compound gets the face fixes
@@ -694,10 +695,22 @@ export function buildTopo(oc, mesh, surfaces, { facetLabels = null, only = null,
       builder.MakeCompound(input);
       for (const fc of subShapes(oc, shell, E.FACE)) builder.Add(input, fc);
     }
-    const fix = new oc.ShapeFix_Shape_2(input);
-    fix.Perform(new oc.Message_ProgressRange_1());
-    result = fix.Shape();
-    ctx = fix.Context().get();
+    try {
+      const fix = new oc.ShapeFix_Shape_2(input);
+      fix.Perform(new oc.Message_ProgressRange_1());
+      result = fix.Shape();
+      ctx = fix.Context().get();
+    } catch (err) {
+      // The one pass can fail on a big part: a stack overflow inside OCCT (FPA coal chassis, 8,946 faces round shattered
+      // rivets: it depends on what was repaired before, so the same faces pass in another order) or a kernel exception
+      // on one face (a cylinder bounded by two full circles and a loop: Standard_NoSuchObject). The kernel survives
+      // both, so the faces are repaired again in batches (repairInBatches) and the shell is put back together.
+      bump(info, err instanceof RangeError ? 'shapefix_overflow' : 'shapefix_threw');
+      const facetSet = new Set(facetFaces);
+      const r = repairInBatches(oc, [...faceOf.values()].filter((fc) => !facetSet.has(fc)), info);
+      ({ ctx, finalOf } = r);
+      result = facetFaces.length ? r.compound : connectedShells(oc, builder, r.faces);
+    }
   }
   tp = tick('shapefix', tp);
   if (facetFaces.length) {
@@ -707,7 +720,7 @@ export function buildTopo(oc, mesh, surfaces, { facetLabels = null, only = null,
   }
   const remapped = new Map();
   for (const [f, fc] of faceOf) {
-    const r = ctx ? ctx.Apply_2(fc, E.SHAPE) : fc;
+    const r = finalOf?.get(fc) ?? (ctx ? ctx.Apply_2(fc, E.SHAPE) : fc);
     if (r.IsNull()) { bump(info, 'face_removed_by_repair'); continue; }
     if (r.ShapeType() === E.FACE) remapped.set(f, oc.TopoDS.Face_1(r));
     else if (subShapes(oc, r, E.FACE).length) { remapped.set(f, r); bump(info, 'face_split_by_repair'); }
@@ -779,6 +792,60 @@ export function buildTopo(oc, mesh, surfaces, { facetLabels = null, only = null,
   }
   tick('ratios', tp);
   return { shape: result, faceOf: remapped, info, ratios, boundaryEdges };
+}
+
+export const SHAPEFIX_BATCH = 500;
+
+/**
+ * ShapeFix_Shape over `faces` in batches of SHAPEFIX_BATCH, for when the one pass over all of them threw. Each batch
+ * takes the earlier batches' replacements before its own repair and the later ones after, so an edge two batches
+ * share ends as one edge, as in one pass. A batch that throws is halved, down to single faces; a face that still
+ * throws keeps its build, with the others' replacements, for the checks after to judge. Returns the repaired faces,
+ * their compound, finalOf (each input face -> its repaired shape) and ctx, an Apply_2 that runs every batch's
+ * replacements in turn (for shapes outside the repair: facets, boundary edges).
+ */
+export function repairInBatches(oc, faces, info, batch = SHAPEFIX_BATCH) {
+  const E = enumOf(oc);
+  const builder = new oc.BRep_Builder();
+  const ctxs = [];
+  const applyFrom = (s, from) => { for (let i = from; i < ctxs.length && !s.IsNull(); i++) s = ctxs[i].Apply_2(s, E.SHAPE); return s; };
+  const done = [];                                     // [input face, its shape after its own batch, batches before it]
+  const run = (list) => {
+    const before = ctxs.length;
+    const mine = list.map((fc) => applyFrom(fc, 0));
+    try {
+      const comp = new oc.TopoDS_Compound();
+      builder.MakeCompound(comp);
+      for (const fc of mine) if (!fc.IsNull()) builder.Add(comp, fc);
+      const fix = new oc.ShapeFix_Shape_2(comp);
+      fix.Perform(new oc.Message_ProgressRange_1());
+      const c = fix.Context().get();
+      ctxs.push(c);
+      list.forEach((fc, k) => done.push([fc, mine[k].IsNull() ? mine[k] : c.Apply_2(mine[k], E.SHAPE), before + 1]));
+      bump(info, 'shapefix_batches');
+    } catch {
+      if (list.length === 1) {
+        done.push([list[0], mine[0], before]);
+        bump(info, 'shapefix_face_unrepaired');
+        return;
+      }
+      const mid = list.length >> 1;
+      run(list.slice(0, mid));
+      run(list.slice(mid));
+    }
+  };
+  for (let lo = 0; lo < faces.length; lo += batch) run(faces.slice(lo, lo + batch));
+  const finalOf = new Map();
+  const out = [];
+  for (const [fc, s, from] of done) {
+    const r = applyFrom(s, from);
+    finalOf.set(fc, r);
+    if (!r.IsNull()) out.push(...(r.ShapeType() === E.FACE ? [r] : subShapes(oc, r, E.FACE)));
+  }
+  const compound = new oc.TopoDS_Compound();
+  builder.MakeCompound(compound);
+  for (const fc of out) builder.Add(compound, fc);
+  return { faces: out, compound, finalOf, ctx: { Apply_2: (s) => applyFrom(s, 0) } };
 }
 
 /**
@@ -903,11 +970,27 @@ function addPcurves(oc, builder, edges, faceOf, facets, info, scaleLen) {
 }
 
 /**
+ * The most triangles a faceted solid may have. The kernel's 4 GB heap holds the facets, their check and the STEP
+ * writer's model at about 23 MB per thousand facets (closed spheres, 2026-11-21: 50k 1.1 GB, 100k 2.2 GB, 150k 3.4 GB at
+ * the STEP write, which also costs 2.4 KB of file a facet); past about 170k it runs out (FPA coal chassis, 588k: out of
+ * memory in the check and the writer, after minutes). A browser tab has less to spare than Node, hence the margin.
+ */
+export const FACETED_MAX_TRIANGLES = 120000;
+
+/** The error for a mesh too big to export as facets; studio.js failureText knows its words. */
+export function tooManyFacets(triangles) {
+  return Object.assign(new Error(`too many triangles for a faceted export: ${triangles} (the limit is ${FACETED_MAX_TRIANGLES})`),
+    { code: 'too_many_facets', triangles });
+}
+
+/**
  * The mesh as a solid: a planar face per triangle, one straight edge per paired mesh edge, a vertex per
- * (mesh vertex, body), a shell per body. No repair pass: planes need no stored pcurves.
+ * (mesh vertex, body), a shell per body. No repair pass: planes need no stored pcurves. Past FACETED_MAX_TRIANGLES it
+ * throws tooManyFacets at once rather than fill the kernel's memory.
  */
 export function buildPolyhedral(oc, mesh) {
   const { V, T } = mesh;
+  if (T.length > FACETED_MAX_TRIANGLES) throw tooManyFacets(T.length);
   const builder = new oc.BRep_Builder();
   const shells = new Map();
   const info = {};
@@ -1289,7 +1372,7 @@ export function score(oc, shape, mesh) {
     out.vol_err = mv ? Math.abs(total - mv) / Math.abs(mv) : null;
     out.solid = comp;
   } catch (err) {
-    out.error = String(err?.message ?? err).slice(0, 120);
+    out.error = kernelError(oc, err).slice(0, 120);
   }
   return out;
 }

@@ -92,10 +92,12 @@ page has to be served; opening `index.html` directly from disk leaves it blank.
 
    If the mesh still has problems after the import's repair, the summary in the top bar says so first
    ("1 hole · 16 overlapping pieces"), and **Fix bad areas** lists the mesh fixes before the groups' own:
-   close holes (and take off fins and walls stuck to the surface), join pieces that cut through each other
-   into one solid, remove small loose pieces. Click a fix's name to see where; **Apply** does the ticked
-   ones as one undo step, and your groups come through. **Delete** (<kbd>D</kbd>) brushes triangles out of
-   the mesh by hand.
+   close holes (and take off fins and walls stuck to the surface), remove small loose pieces. Click a fix's
+   name to see where; **Apply** does the ticked ones as one undo step, and your groups come through.
+   **Delete** (<kbd>D</kbd>) brushes triangles out of the mesh by hand.
+
+   A file with several bodies (a 3MF or OBJ with several objects, or parts that were never fused) opens with
+   a **Bodies** list. Each body exports as its own solid in the STEP, under its name in the list.
 5. Press **Export STEP**. The solid it builds appears over the mesh, so you can turn it and check it before
    you save; drag the shutter across the view to compare the mesh, on the left, with the STEP, on the right.
    A card says what you got. If it's a fully analytic solid, press **Save STEP**.
@@ -150,9 +152,9 @@ mesh ─► repair ─► paint face groups ─► fit + type each group ─► 
 
 The trained models ship with Untessellator and run in your browser, so we only learn how they do on
 real parts if you tell us. After a conversion, press the **flag** button next to Export STEP and
-choose what goes in. It does two things:
+choose what goes in. Untessellator builds a report file (`Untessellator-report-….zip`):
 
-1. **Downloads a report file** (`Untessellator-report-….zip`). It records every face group:
+1. **The report file** records every face group:
    - where the group is and how big it is
    - how it was made: the auto-paint seed, what the model predicted and how confident it was, and
      what decided its final type
@@ -163,12 +165,16 @@ choose what goes in. It does two things:
 
    It also holds the groups and surfaces exactly as the export received them. A picture of the view
    and the mesh go in only if you choose them; with the mesh, we can rebuild your export exactly.
-2. **Opens a GitHub issue** with a summary already filled in. Drag the report file into it, say what
-   went wrong, and submit.
+2. **Send it, or save it.** Add a note and, if you want a reply, an email address, then press
+   **Send**. The report goes to a private inbox that only the developer can read, so it doesn't
+   need a GitHub account and isn't public. Reports up to 95 MB fit. **Save the file** downloads it
+   instead and sends nothing.
 
-Nothing is sent until you press Submit, and good results help as much as bad ones. The report file
-describes your part's faces (their positions, axes and radii) even without the mesh, so only attach
-it where you're comfortable sharing that.
+Nothing leaves your browser until you press Send, and good results help as much as bad ones. A sent
+report is deleted 30 days after it arrives, or once its problem is fixed if that takes longer. It's
+kept longer only if you tick "Allow keeping this file to test future versions". The report file
+describes your part's faces (their positions, axes and radii) even without the mesh, so only send it
+where you're comfortable sharing that.
 
 ## How good is it?
 

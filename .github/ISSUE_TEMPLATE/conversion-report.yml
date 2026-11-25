@@ -1,5 +1,5 @@
 name: Conversion report
-description: Tell us how a mesh converted, good or bad. Untessellator's Report button fills in the numbers.
+description: Tell us in public how a mesh converted, good or bad. To send a file privately, use Untessellator's flag button instead.
 title: "Conversion report: "
 labels: ["conversion report"]
 body:
@@ -9,8 +9,8 @@ body:
         Thanks. Reports like this are how we learn where the models and fitters fail on real parts, so
         good results are as useful as bad ones.
 
-        Nothing was sent automatically. If you came from Untessellator's **Report** button, the numbers
-        below were filled in from your run; read them before you submit.
+        This form is public. To send a report file or a mesh privately, press the **flag** button in
+        Untessellator and choose Send: it goes to a private inbox, up to 95 MB, with no GitHub account needed.
   - type: dropdown
     id: result
     attributes:
@@ -49,13 +49,13 @@ body:
     id: numbers
     attributes:
       label: Untessellator's numbers
-      description: Filled in by the Report button. If you came here another way, leave it empty.
+      description: Optional. The summary at the top of a saved report file's report.json, if you have one.
       render: text
   - type: textarea
     id: files
     attributes:
       label: The report file, and screenshots
       description: >-
-        Drag in the Untessellator-report .zip the Report button downloaded. It holds every face group, its
-        fitted surface and what the export did with it, so we can see exactly which faces failed and why.
-        It holds the mesh only if you chose that; this repository is public. Screenshots help too.
+        Screenshots help most. You can also drag in a report file saved with the flag button's Save the
+        file, but this repository is public and GitHub caps files at 25 MB. To send one privately, use
+        Send in Untessellator instead.

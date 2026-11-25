@@ -66,7 +66,7 @@ const EDGE_WALL_TYPES = ['cylinder', 'cone', 'sphere', 'torus'];
 import { buildMeshModel, bodyEdges, outline } from './meshModel.js';
 import { createRenderer, HEAT, NO_LEVEL } from './renderer.js';
 import { GroupStore, typeLabel } from './groups.js';
-import { conversionNumbers, reportUrl, reportJson, placeGroups, binaryStl, fingerprint } from './report.js';
+import { conversionNumbers, reportJson, sendToInbox, INBOX_MAX_BYTES, placeGroups, binaryStl, fingerprint } from './report.js';
 import { zipSync, strToU8 } from 'fflate';
 import { typeRgb } from './palette.js';
 import { createGuide } from './guide.js';
@@ -306,7 +306,7 @@ resultEl.hidden = true;
 shell.stage.append(resultEl);
 let resultSteps = [];
 /** The last step of every problem card: a failure can always be reported (report.js). */
-const REPORT_STEP = { label: 'Report it', detail: 'Downloads a report file and opens a prefilled GitHub issue; nothing is sent until you submit it.', onSelect: () => reportConversion() };
+const REPORT_STEP = { label: 'Report it', detail: 'Choose what to include. Nothing is sent until you press Send.', onSelect: () => reportConversion() };
 // The Ko-fi ask under a clean export's card, for a part of the user's own (never the guide's sample). "Hide for 2 weeks"
 // (or following the link) keeps it off this browser for 14 days; with storage blocked, for this visit only.
 const SUPPORT_URL = 'https://ko-fi.com/derekvanallen';
@@ -328,13 +328,14 @@ const supportHtml = () => `<div class="wb-rsupport">${ui.iconMarkup('heart', { c
 
 /**
  * Show the result card: `title`, a `lead` sentence, `groups` ([id, why] pairs, worst first) and `steps`
- * ([{ label, detail, primary?, onSelect }]). `bad` marks it as a problem, and a problem card always ends with
- * Report it. `support` adds the Ko-fi ask (a clean export's card) unless it was hidden in the last 2 weeks. A new run
- * or a new mesh closes it.
+ * ([{ label, detail, primary?, onSelect }]). `fields` ([{ id, label, placeholder?, value?, multiline?, type? }]) are
+ * text boxes (or, with type 'checkbox', a tick box) above the steps; a step's onSelect gets their values by id. `bad` marks it as a problem, and a problem
+ * card ends with Report it unless `report` is false. `support` adds the Ko-fi ask (a clean export's card) unless it
+ * was hidden in the last 2 weeks. A new run or a new mesh closes it.
  */
-function showResult({ title, lead = '', groups = [], steps = [], bad = false, support = false }) {
+function showResult({ title, lead = '', groups = [], fields = [], steps = [], bad = false, report = bad, support = false }) {
   const SHOWN = 6;
-  if (bad) steps = [...steps, REPORT_STEP];
+  if (report) steps = [...steps, REPORT_STEP];
   resultSteps = steps;
   resultEl.classList.toggle('wb-result--bad', bad);
   resultEl.setAttribute('aria-label', title);
@@ -347,6 +348,11 @@ function showResult({ title, lead = '', groups = [], steps = [], bad = false, su
       <button type="button" class="wb-iconbtn wb-rclose" data-act="close" aria-label="Close" title="Close (the ⚠ marks stay in the list)">✕</button></div>
     ${lead ? `<p class="wb-rlead">${esc(lead)}</p>` : ''}
     ${groups.length ? `<ul class="wb-rgroups">${groups.slice(0, SHOWN).map(row).join('')}</ul>${groups.length > SHOWN ? `<div class="wb-rmore">and ${groups.length - SHOWN} more, marked ⚠ in the list</div>` : ''}` : ''}
+    ${fields.map((f) => (f.type === 'checkbox'
+    ? `<label class="wb-rfield wb-rfield--check"><input data-field="${f.id}" type="checkbox"${f.value ? ' checked' : ''}><span>${esc(f.label)}</span></label>`
+    : `<label class="wb-rfield"><span>${esc(f.label)}</span>${f.multiline
+      ? `<textarea data-field="${f.id}" rows="3" placeholder="${esc(f.placeholder ?? '')}">${esc(f.value ?? '')}</textarea>`
+      : `<input data-field="${f.id}" type="${f.type ?? 'text'}" placeholder="${esc(f.placeholder ?? '')}" value="${esc(f.value ?? '')}">`}</label>`)).join('')}
     ${steps.length ? `<div class="wb-rsteps">${steps.map((s, i) => `<div class="wb-rstep"><button type="button" class="wb-btn wb-small${s.primary ? ' wb-primary' : ''}" data-step="${i}">${esc(s.label)}</button><span>${esc(s.detail)}</span></div>`).join('')}</div>` : ''}
     ${support && !supportHidden() ? supportHtml() : ''}`;
   resultEl.hidden = false;
@@ -436,8 +442,9 @@ resultEl.addEventListener('click', (event) => {
     zoomTo(new Set([id]));
   } else {
     const step = resultSteps[Number(el.dataset.step)];
+    const values = Object.fromEntries([...resultEl.querySelectorAll('[data-field]')].map((f) => [f.dataset.field, f.type === 'checkbox' ? f.checked : f.value]));
     hideResult();
-    step?.onSelect();
+    step?.onSelect(values);
   }
 });
 const fileInput = document.createElement('input');
@@ -1599,6 +1606,8 @@ async function exportStep({ checked = false } = {}) {
         // stopped during the face-path rung: the knitter had finished, so its result is the export (no preview)
         result = { step: error.interim.step, report: error.interim.report, preview: null };
       } else {
+        // too big for the facet floor too (knit/build.js FACETED_MAX_TRIANGLES): a faceted retry would fail the same way
+        if (TOO_MANY_FACETS.test(error.message)) throw error;
         // A single OCCT repair on badly fitting surfaces can run for most of an hour and cannot be
         // interrupted, so the worker is stopped and a fresh one exports the mesh itself. A build that throws
         // can leave the kernel's memory corrupt (its fallback then fails too: "table index is out of bounds"),
@@ -1651,10 +1660,14 @@ async function exportStep({ checked = false } = {}) {
     if (!current.lastExport) { current.lastExport = { failed: error.message }; current.lastExportEdits = current.edits; }
     const why = failureText(error.message);
     say(`Export failed: ${why}`, true);
+    // too big for facets: exporting again fails the same way, so the card says what to change instead
+    const tooBig = TOO_MANY_FACETS.test(error.message);
     showResult({
       title: 'Export failed', bad: true,
-      lead: `${why[0].toUpperCase()}${why.slice(1)}. Nothing was saved. Exporting again usually gets past a one-off kernel failure; if it keeps failing, report it so the run can be replayed.`,
-      steps: [
+      lead: tooBig
+        ? `Nothing was saved. The surfaces did not join, and ${why}. Reduce the triangle count with a decimate tool, then open the mesh again.`
+        : `${why[0].toUpperCase()}${why.slice(1)}. Nothing was saved. Exporting again usually gets past a one-off kernel failure; if it keeps failing, report it so the run can be replayed.`,
+      steps: tooBig ? [] : [
         { label: 'Export again', primary: true, detail: 'Builds the solid from the groups as they are now.', onSelect: () => exportStep({ checked: true }) },
       ],
     });
@@ -1665,10 +1678,19 @@ async function exportStep({ checked = false } = {}) {
 }
 
 /**
- * A failure in words: OCCT's uncaught WebAssembly exceptions reach the worker as a bare number (an exception
- * pointer, such as "24"), which says nothing to the user. The report keeps the raw message.
+ * A failure in words. The worker decodes OCCT's exceptions (knit/occt.js kernelError) into the exception's class and
+ * message; the two a big part meets get plain words, and an undecoded one still arrives as a bare number (an exception
+ * pointer, such as "24"). The report keeps the raw message.
  */
-const failureText = (message) => (/^\d+$/.test(String(message ?? '').trim()) ? `the geometry kernel crashed, code ${message}` : String(message));
+const TOO_MANY_FACETS = /too many triangles for a faceted export: (\d+) \(the limit is (\d+)\)/;
+const failureText = (message) => {
+  const m = String(message ?? '').trim();
+  const big = m.match(TOO_MANY_FACETS);
+  if (big) return `the mesh has ${Number(big[1]).toLocaleString('en-US')} triangles, and a faceted export holds ${Number(big[2]).toLocaleString('en-US')} at most`;
+  if (/Standard_OutOfMemory/.test(m)) return 'the part is too big for the geometry kernel\'s memory';
+  if (/kernel stack overflow/.test(m)) return 'the geometry kernel ran out of stack';
+  return /^\d+$/.test(m) ? `the geometry kernel crashed, code ${m}` : m;
+};
 
 /** A build that ran out of time or failed went out as the mesh: why, what to try, or save it so. */
 function offerAfterFacets(current, step, report) {
@@ -1867,22 +1889,24 @@ async function knitPayload(current) {
 
 /**
  * The Report button: what goes in the report file is the user's choice, since the picture and the mesh show
- * the part. Without a mesh open there is no file, only the issue.
+ * the part. Without a mesh open the file holds only the numbers.
  */
 function reportConversion() {
-  if (!mesh) { sendReport(); return; }
+  if (!mesh) { buildReport(); return; }
   ui.openMenu([
-    { id: 'groups', label: 'Report the face groups and results', onSelect: () => sendReport() },
-    { id: 'picture', label: '…and a picture of the view', onSelect: () => sendReport({ picture: true }) },
-    { id: 'mesh', label: '…and the picture and the mesh (only if you may share it)', onSelect: () => sendReport({ picture: true, withMesh: true }) },
+    { id: 'groups', label: 'Report the face groups and results', onSelect: () => buildReport() },
+    { id: 'picture', label: '…and a picture of the view', onSelect: () => buildReport({ picture: true }) },
+    { id: 'mesh', label: '…and the picture and the mesh (only if you may share it)', onSelect: () => buildReport({ picture: true, withMesh: true }) },
   ], { anchor: toolbar.get('report').parentElement, align: 'right' });
 }
 
+const megabytes = (bytes) => `${(bytes / 1048576).toFixed(bytes < 10 * 1048576 ? 1 : 0)} MB`;
+
 /**
- * Download the report file (report.js) and open the prefilled GitHub issue it goes into. Nothing is sent
- * from here: the user drags the file into the issue, checks it, and submits it or not.
+ * Build the report file (report.js) and show the Send card. Nothing leaves the browser until the user presses
+ * Send, which uploads it to the private inbox (report.js); Save the file downloads it instead.
  */
-async function sendReport({ picture = false, withMesh = false } = {}) {
+async function buildReport({ picture = false, withMesh = false } = {}) {
   if (stroke || autoRun) { say('Finish or cancel (Esc) the stroke or auto-paint first', true); return; }
   const current = mesh;
   const { store } = current ?? {};
@@ -1890,7 +1914,7 @@ async function sendReport({ picture = false, withMesh = false } = {}) {
   // edits made since each result: a result older than the groups is reported as such, never as theirs
   const after = (at) => (current && at != null ? current.edits - at : 0);
   const since = { check: after(current?.lastCheck?.edits), exported: after(current?.lastExportEdits), repair: after(current?.lastRepair?.edits) };
-  const numbers = conversionNumbers({
+  const summary = conversionNumbers({
     since,
     triangles: current?.model.count ?? 0,
     repaired: current?.repair ? repairChanges(current.repair) : [],
@@ -1903,38 +1927,126 @@ async function sendReport({ picture = false, withMesh = false } = {}) {
     exported: current?.lastExport ?? null,
     groupRepair: current?.lastRepair ?? null,
   });
-  const issue = (extra = '') => reportUrl(numbers + extra, { tier: current?.lastExport?.tier, groups: store?.list().length ?? 0, editedSince: since.exported > 0 });
-  if (!current) {
-    window.open(issue(), '_blank', 'noopener');
-    say('Opened a conversion report on GitHub');
-    return;
-  }
+  const page = location.href.split(/[?#]/)[0];
   try {
     say('Building the report…');
-    // The knitter's input exactly as an export would send it, so a reported run can be rebuilt.
-    const payload = await knitPayload(current);
-    const json = reportJson({
-      page: location.href.split(/[?#]/)[0], settings, model: modelLabel, triangles: current.model.count,
-      repair: current.repair, fingerprint: await fingerprint(current.geometry.attributes.position.array),
-      includesMesh: withMesh, autoPaint: current.autoPaint, groups: store.list(),
-      placed: placeGroups(payload.positions, payload.labels), origins: current.origins,
-      check: current.lastCheck, exported: current.lastExport, groupRepair: current.lastRepair ?? null, since,
-    });
-    const files = {
-      'report.json': strToU8(JSON.stringify(json, null, 1)),
-      'part.fid': new Uint8Array(payload.labels.buffer),
-      'part.fits.json': strToU8(JSON.stringify({ faces: payload.surfaces.map(([id, [type, params]]) => ({ id, type, params })) })),
-    };
-    if (picture) files['view.png'] = await captureView();
-    if (withMesh) files['part.stl'] = binaryStl(payload.positions);
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-    const file = `Untessellator-report-${stamp}.zip`;
-    downloadFile(zipSync(files, { level: 6 }), file);
-    window.open(issue(`\nreport file: ${file}`), '_blank', 'noopener');
-    say(`Downloaded ${file}: drag it into the GitHub issue that just opened, check the numbers, then submit it`);
+    let json;
+    const files = {};
+    if (!current) {
+      json = reportJson({ summary, page, settings, model: modelLabel, triangles: 0, fingerprint: null, includesMesh: false,
+        groups: [], placed: new Map(), origins: new Map() });
+    } else {
+      // The knitter's input exactly as an export would send it, so a reported run can be rebuilt.
+      const payload = await knitPayload(current);
+      json = reportJson({
+        summary, page, settings, model: modelLabel, triangles: current.model.count,
+        repair: current.repair, fingerprint: await fingerprint(current.geometry.attributes.position.array),
+        includesMesh: withMesh, autoPaint: current.autoPaint, groups: store.list(),
+        placed: placeGroups(payload.positions, payload.labels), origins: current.origins,
+        check: current.lastCheck, exported: current.lastExport, groupRepair: current.lastRepair ?? null, since,
+      });
+      files['part.fid'] = new Uint8Array(payload.labels.buffer);
+      files['part.fits.json'] = strToU8(JSON.stringify({ faces: payload.surfaces.map(([id, [type, params]]) => ({ id, type, params })) }));
+      if (picture) files['view.png'] = await captureView();
+      if (withMesh) files['part.stl'] = binaryStl(payload.positions);
+    }
+    say('Report ready to send');
+    offerSend({ json, files, picture, withMesh: withMesh && !!current, groups: !!current });
   } catch (error) {
     console.error(error);
     say(`The report failed: ${error.message}`, true);
+  }
+}
+
+/**
+ * The zip: report.json first (the inbox reads it), with the user's note, reply address and permission to keep
+ * the file, if they gave any.
+ */
+function packReport(report, { note = '', contact = '', keep = false } = {}) {
+  report.json.message = note.trim() || contact.trim() || keep ? { note: note.trim(), contact: contact.trim(), keep: !!keep } : null;
+  return zipSync({ 'report.json': strToU8(JSON.stringify(report.json, null, 1)), ...report.files }, { level: 6 });
+}
+
+/**
+ * The Send card: a note, an address for a reply, permission to keep the file as a test (off unless ticked), then
+ * Send or Save the file. `values` refill the boxes. The inbox deletes a file 30 days after it arrives, or once its
+ * issue is closed if that is later, unless the user allowed keeping it.
+ */
+function offerSend(report, { note = '', contact = '', keep = false } = {}) {
+  report.size ??= packReport(report).byteLength;   // compressed, as sent: a mesh often packs to a fraction of its size
+  const size = report.size;
+  const what = report.withMesh ? 'the face groups, a picture and the mesh'
+    : report.picture ? 'the face groups and a picture' : report.groups ? 'the face groups' : 'the browser and settings';
+  showResult({
+    title: 'Send a report',
+    lead: `Includes ${what}${size > 1048576 ? `, about ${megabytes(size)}` : ''}. Only the developer can see it. ` +
+      'It\'s deleted after 30 days, or later if the problem is still open.',
+    fields: [
+      { id: 'note', label: 'Note', multiline: true, value: note, placeholder: 'What went wrong? Where is the mesh from?' },
+      { id: 'contact', label: 'Email', type: 'email', value: contact, placeholder: 'Only if you want a reply' },
+      { id: 'keep', label: 'Allow keeping this file to test future versions', type: 'checkbox', value: keep },
+    ],
+    steps: [
+      { label: 'Send', primary: true, detail: 'Uploads the report.', onSelect: (values) => sendReport(report, values) },
+      { label: 'Save the file', detail: 'Downloads the report file. Nothing is sent.', onSelect: (values) => saveReport(report, values) },
+    ],
+  });
+}
+
+function saveReport(report, values) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const file = `Untessellator-report-${stamp}.zip`;
+  downloadFile(packReport(report, values), file);
+  say(`Downloaded ${file}`);
+}
+
+/** Upload the report, with its progress on the busy card. A failure offers Try again and Save the file. */
+async function sendReport(report, values) {
+  const bytes = packReport(report, values);
+  const save = { label: 'Save the file', detail: 'Downloads the report file. Nothing is sent.', onSelect: () => saveReport(report, values) };
+  if (bytes.byteLength > INBOX_MAX_BYTES) {
+    const withoutMesh = {
+      label: 'Send without the mesh', primary: true, detail: 'Leaves the mesh out and shows the report again.',
+      onSelect: () => {
+        delete report.files['part.stl'];
+        report.json.mesh.included = false;
+        report.withMesh = false;
+        report.size = null;
+        offerSend(report, values);
+      },
+    };
+    showResult({
+      title: 'Report too large',
+      lead: `The report is ${megabytes(bytes.byteLength)}. The limit is ${megabytes(INBOX_MAX_BYTES)}.`,
+      steps: report.withMesh ? [withoutMesh, save] : [save],
+      bad: true,
+      report: false,
+    });
+    return;
+  }
+  const abort = new AbortController();
+  busy.start('Sending the report', { onStop: () => abort.abort() });
+  busy.step(`0 of ${megabytes(bytes.byteLength)}`, 0);
+  try {
+    const id = await sendToInbox(bytes, {
+      signal: abort.signal,
+      onProgress: (share) => busy.step(`${megabytes(share * bytes.byteLength)} of ${megabytes(bytes.byteLength)}`, share),
+    });
+    busy.end();
+    say(`Report sent. Reference ${id}`);
+    showResult({ title: 'Report sent', lead: `Reference ${id}. Thank you.` });
+  } catch (error) {
+    busy.end();
+    if (error.name === 'AbortError') { say('Report not sent'); offerSend(report, values); return; }
+    console.error(error);
+    say(`Report not sent: ${error.message}`, true);
+    showResult({
+      title: 'Report not sent',
+      lead: `The upload failed (${error.message}). Try again, or save the file.`,
+      steps: [{ label: 'Try again', primary: true, detail: 'Uploads the report again.', onSelect: () => sendReport(report, values) }, save],
+      bad: true,
+      report: false,
+    });
   }
 }
 
@@ -1996,7 +2108,7 @@ function offerDoubts({ groups, mesh: meshDoubt }) {
         { label: 'Fix by hand', detail: 'Outlines them. A group spanning two faces: repaint it with the bucket. A narrow curve: set its type under Fit as, or merge it into its neighbor.', onSelect: () => showDoubts() },
       ] : []),
       ...(meshDoubt ? [
-        { label: 'Fix the mesh', primary: !n, detail: 'Closes its holes and takes off fins and walls stuck to it, as one undo step; Fix bad areas lists each. Separate bodies stay separate (join them in the Bodies list).', onSelect: () => applyMeshFixes() },
+        { label: 'Fix the mesh', primary: !n, detail: 'Closes its holes and takes off fins and walls stuck to it, as one undo step; Fix bad areas lists each. Separate bodies stay separate.', onSelect: () => applyMeshFixes() },
         { label: 'Show where', detail: 'Outlines the bad edges in amber and zooms to them; again for the next spot.', onSelect: () => showMeshFix('holes') },
       ] : []),
       { label: 'Export anyway', detail: n ? 'Builds the solid as it is: where these faces fail, you can still save with them as flat facets.' : 'Builds what it can: the file will be an open shell, not a solid.', onSelect: () => exportStep({ checked: true }) },
@@ -3137,7 +3249,7 @@ function zoomToSpot(i) {
  */
 let fixWorker = null, fixSeq = 0;
 const fixWaiting = new Map();
-const ALL_STEPS = { pieces: true, holes: true, join: false };   // bodies join only when asked (the Bodies list)
+const ALL_STEPS = { pieces: true, holes: true };
 function runMeshFixes(current, steps, extra = {}) {
   if (!fixWorker) {
     fixWorker = new Worker(new URL('./meshFixWorker.js', import.meta.url), { type: 'module' });
@@ -3185,7 +3297,7 @@ async function applyMeshFixes() {
   const list = meshFixList(current);
   const ticked = list.filter((f) => !fixes.unchecked.has(f.id));
   if (!ticked.length) return;
-  const steps = { pieces: false, holes: false, join: false };
+  const steps = { pieces: false, holes: false };
   for (const f of ticked) steps[f.step] = true;
   const all = list.every((f) => steps[f.step]);
   busy.start('Fixing the mesh', { onStop: null });
@@ -3198,7 +3310,7 @@ async function applyMeshFixes() {
   say(`${ticked.map((f) => f.title).join(' · ')}: done (one undo step)`);
 }
 
-/** Show where a mesh fix works: the problem edges (holes), the loose pieces, or the whole part (a join). */
+/** Show where a mesh fix works: the problem edges (holes) or the loose pieces. */
 function showMeshFix(step) {
   if (!mesh) return;
   leavePreview();
@@ -3475,32 +3587,6 @@ function deleteBodies(ids) {
   say(`Deleted ${what} (one undo step: Ctrl+Z brings ${names.length === 1 ? 'it' : 'them'} back)`);
 }
 
-/** Union bodies `ids` into one (Manifold, in the mesh fix worker), as one undo step. */
-async function joinBodies(ids) {
-  if (!mesh || stroke || autoRun || ids.length < 2) return;
-  if (busy.onStop) { say('Stop the export first (Esc), or let it finish', true); return; }
-  const current = mesh;
-  const names = ids.map((b) => current.bodyNames[b]);
-  const mark = Int32Array.from(current.model.bodyOf, (b) => (ids.includes(b) ? b : -1));
-  busy.start(`Joining ${names.join(' + ')}`, { onStop: null });
-  progress(`Joining ${plural(ids.length, 'body', 'bodies')}…`);
-  let r;
-  try {
-    r = await runMeshFixes(current, { pieces: false, holes: false, join: true }, { joinBodies: mark });
-  } finally {
-    busy.end();
-  }
-  if (mesh !== current) return;
-  if (r.error) { say(`Could not join them: ${r.error}`, true); return; }
-  if (r.join?.refused) {
-    say(`Could not join them: ${plural(r.join.refused, 'body is', 'bodies are')} not closed, so the union cannot take ${r.join.refused === 1 ? 'it' : 'them'} (Fix bad areas closes holes first)`, true);
-    return;
-  }
-  if (!r.positions || (r.join?.joined ?? 0) < 2) { say('Nothing to join', true); return; }
-  replaceMesh(r.positions, r.src, `Join ${names.join(' + ')}`);
-  say(`Joined ${names.join(' + ')} into one body (one undo step)`);
-}
-
 /** A body's export result, in a few words with a verdict dot. */
 function bodyResultCell(res) {
   if (!res) return '';
@@ -3537,7 +3623,6 @@ function bodiesHtml() {
   const bar = picked.length ? `<div class="wb-selbar wb-bodybar"><span class="wb-n">${picked.length === 1 ? esc(mesh.bodyNames[picked[0]]) : `${picked.length} bodies`}</span>
       <button type="button" class="wb-btn wb-small" data-act="body-zoom">Zoom to</button>
       <button type="button" class="wb-btn wb-small" data-act="body-solo" title="Hide every other body (view only)">Show only</button>
-      ${picked.length > 1 ? '<button type="button" class="wb-btn wb-small" data-act="body-join" title="Union them into one body; one undo step">Join</button>' : ''}
       ${picked.length < model.bodies.length
         ? `<button type="button" class="wb-btn wb-small" data-act="body-delete" title="Take ${picked.length === 1 ? 'it' : 'them'} out of the mesh, with ${picked.length === 1 ? 'its' : 'their'} groups (Delete); one undo step">Delete</button>`
         : '<button type="button" class="wb-btn wb-small" disabled title="Every body is picked: keep at least one">Delete</button>'}
@@ -3847,7 +3932,6 @@ panelEl.addEventListener('click', (event) => {
   else if (d.act === 'body-zoom') zoomToBodies([...bodySel]);
   else if (d.act === 'body-solo') { mesh.hiddenBodies = new Set(mesh.model.bodies.map((_, b) => b).filter((b) => !bodySel.has(b))); applyHidden(); refreshPanel(); }
   else if (d.act === 'body-showall') showAllBodies();
-  else if (d.act === 'body-join') joinBodies([...bodySel].sort((a, b) => a - b));
   else if (d.act === 'body-delete') deleteBodies([...bodySel].sort((a, b) => a - b));
   else if (d.act === 'body-clear') { bodySel = new Set(); edgesDirty = true; requestRender(); refreshPanel(); }
   else if (d.act === 'fix-find') findFixes();
@@ -4109,7 +4193,7 @@ canvas.addEventListener('wheel', (event) => {
 }, { passive: false });
 
 window.addEventListener('keydown', (event) => {
-  if (event.target instanceof HTMLInputElement) return;
+  if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return;
   noteModifiers(event);
   const mod = event.ctrlKey || event.metaKey;
   const key = event.key.toLowerCase();

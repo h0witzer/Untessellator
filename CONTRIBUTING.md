@@ -99,7 +99,7 @@ types and merges on them, and each change it keeps becomes an undo step the user
 
 | Path | What it is |
 |---|---|
-| `index.html`, `js/studio/` | The web page: paint face groups on a mesh, export a STEP solid. `js/studio/report.js` builds the Report button's report file and prefilled issue |
+| `index.html`, `js/studio/` | The web page: paint face groups on a mesh, export a STEP solid. `js/studio/report.js` builds the Report button's report file and sends it to the inbox |
 | `js/paintCore.js`, `js/paintTool.js` | One click becomes one face group. `paintCore` has no model runtime and runs the same in Node and in the browser, so the harnesses measure what ships |
 | `js/autoPaint.js` | Paints a whole part, best seed first |
 | `js/regionGrow.js`, `js/edgeWall.js`, `js/cutFill.js`, `js/mergeRegions.js`, `js/freeformMerge.js` | Growth, learned face boundaries, min-cut fills, crumb merging, freeform grouping |
@@ -197,8 +197,9 @@ them. The 300-part Onshape set (ABC's own Onshape exports) is the real-exporter 
 **Make builder gates deterministic.** Repair has a time budget, so its solids depend on machine
 load. Compare changes to it with `test/knit.mjs --repair --budget 100000` and a few workers.
 
-**Real parts come in as conversion reports.** Untessellator's flag button opens an issue labelled
-`conversion report`, with a report file attached by the user. `node test/reportReplay.mjs <report.zip>`
+**Real parts come in as conversion reports.** Untessellator's flag button sends a report file to the
+inbox (a Cloudflare Worker kept outside this repo), which opens an issue for it in a private repo with a download link. Reports
+are private, so they never become public fixtures without the sender's say. `node test/reportReplay.mjs <report.zip>`
 reads one. It prints every group that went wrong and the step it went wrong at: the model's seed and
 prediction, the typing, the fit, the export check, or the kernel and repair loop. When the mesh is
 included, it rebuilds the export locally. Turn each shareable mesh that fails into a fixture, with a

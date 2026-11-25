@@ -231,6 +231,14 @@ body { background: var(--wb-bg); color: var(--wb-text); font: 14.5px/1.45 var(--
 .wb-rstep { display: grid; grid-template-columns: 138px minmax(0, 1fr); gap: 10px; align-items: center; font-size: 12px; line-height: 1.35; color: var(--wb-muted); }
 .wb-rstep .wb-btn { width: 100%; color: var(--wb-text); }
 .wb-rstep .wb-btn.wb-primary { color: var(--wb-accent-ink); }
+/* text boxes on a card (the report's note and email): the search box's sunk fill and cut corners, no border */
+.wb-rfield { display: grid; gap: 4px; font-size: 12px; color: var(--wb-muted); }
+.wb-rfield input, .wb-rfield textarea { width: 100%; box-sizing: border-box; border: 0; background: var(--wb-sunk); padding: 7px 11px; font: inherit; font-size: 13px; color: var(--wb-text); border-radius: 0; clip-path: var(--btn-cut); }
+.wb-rfield textarea { resize: vertical; min-height: 58px; }
+.wb-rfield input::placeholder, .wb-rfield textarea::placeholder { color: var(--wb-faint); }
+.wb-rfield input:focus-visible, .wb-rfield textarea:focus-visible { outline: 2px solid var(--wb-accent); outline-offset: -2px; }
+.wb-rfield--check { display: flex; align-items: flex-start; gap: 8px; cursor: pointer; }
+.wb-rfield--check input { width: auto; flex: none; margin: 1px 0 0; padding: 0; clip-path: none; accent-color: var(--wb-accent); }
 /* the Ko-fi ask under a clean export's card (studio.js supportHtml): a quiet row, the heart in the logo's pink */
 .wb-rsupport { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; border-top: 1px solid var(--wb-line); padding-top: 9px; font-size: 12px; color: var(--wb-muted); }
 .wb-rsupport-text { flex: 1 1 180px; min-width: 0; line-height: 1.35; }
