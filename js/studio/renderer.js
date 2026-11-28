@@ -104,7 +104,7 @@ export function createRenderer(canvas) {
 
   let mesh = null;
   let heatOn = false;
-  const bands = { edges: null, active: null, hover: null };
+  const bands = { edges: null, active: null, hover: null, guide: null };
   let pickTarget = null;
   let pickDirty = true;
   let lastMvp = null;
@@ -283,7 +283,7 @@ export function createRenderer(canvas) {
       heatOn = on;
     },
 
-    /** Replace one of the band sets ('edges', 'active', 'hover') with segment endpoints, or clear it. */
+    /** Replace one of the band sets ('edges', 'active', 'hover', 'guide') with segment endpoints, or clear it. */
     setBands(name, ends) {
       const old = bands[name];
       if (old) {
@@ -350,6 +350,14 @@ export function createRenderer(canvas) {
           if (!bands[name]) continue;
           const style = { ...bandStyle(tone, 'faceBorder', { ratio, hidden }), dash: [0, 0] };
           drawBand(gl, bandProgram, bands[name], mvp, size, style);
+        }
+      }
+      // The hovered surface's axis, ring or centre, in white so it reads as construction apart from the amber borders:
+      // mostly inside the body, so its hidden side is dashed but strong, not the faint show-through of a border
+      if (bands.guide) {
+        for (const hidden of [true, false]) {
+          const style = { ...bandStyle('preHighlight', 'faceBorder', { ratio, hidden }), colour: [1, 1, 1], alpha: hidden ? 0.7 : 0.95 };
+          drawBand(gl, bandProgram, bands.guide, mvp, size, style);
         }
       }
     },
