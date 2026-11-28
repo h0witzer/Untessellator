@@ -669,6 +669,7 @@ async function openFile(file) {
     renderer.updateColours(colours, 0, model.count - 1);
     renderer.setBands('active', null);
     renderer.setBands('hover', null);
+  renderer.setBands('guide', null);
     edgesDirty = true;
     legendDirty = true;
     legend.hidden = !settings.deviation;
@@ -3418,6 +3419,7 @@ function swapMesh(target) {
   renderer.setShading(settings.smooth);
   renderer.setBands('active', null);
   renderer.setBands('hover', null);
+  renderer.setBands('guide', null);
   recolor();
   edgesDirty = true;
   legendDirty = true;
@@ -4087,7 +4089,68 @@ function setHover(key, triangle = -1) {
     }
   }
   renderer.setBands('hover', ends);
+  renderer.setBands('guide', key?.startsWith('g') && mesh ? surfaceGuide(Number(key.slice(1))) : null);
   requestRender();
+}
+
+const GUIDE_RING = 96;     // segments in a torus's spine circle
+
+/**
+ * The lines that show group `id`'s fitted surface: a cylinder's or cone's axis over the group's length and a little past, a
+ * torus's spine circle (the ring its tube's centre runs round), a sphere's centre as a small cross. Segment ends,
+ * six numbers each, in model space as the fit is; null for any other type or no fit.
+ */
+function surfaceGuide(id) {
+  const { store, model } = mesh;
+  const group = store.groups.get(id);
+  const fit = group?.fit;
+  if (!fit?.params || fit.type !== group.type) return null;
+  const p = fit.params;
+  const unit = (v) => { const l = Math.hypot(...v); return l > 0 ? v.map((c) => c / l) : null; };
+  if (fit.type === 'cylinder' || fit.type === 'cone') {
+    const ax = unit(p.axis), o = fit.type === 'cylinder' ? p.axisPoint : p.apex;
+    if (!ax) return null;
+    const P = model.positions;
+    let lo = Infinity, hi = -Infinity;
+    for (const t of store.triangles(id)) {
+      for (let k = t * 9; k < t * 9 + 9; k += 3) {
+        const s = (P[k] - o[0]) * ax[0] + (P[k + 1] - o[1]) * ax[1] + (P[k + 2] - o[2]) * ax[2];
+        if (s < lo) lo = s;
+        if (s > hi) hi = s;
+      }
+    }
+    if (!(hi >= lo)) return null;
+    const pad = 0.1 * (hi - lo) + (fit.type === 'cylinder' ? 0.02 * p.radius : 0);
+    lo -= pad; hi += pad;
+    return new Float32Array([0, 1, 2].map((i) => o[i] + lo * ax[i]).concat([0, 1, 2].map((i) => o[i] + hi * ax[i])));
+  }
+  if (fit.type === 'torus') {
+    const ax = unit(p.axis), c = p.center, R = p.majorRadius;
+    if (!ax || !(R > 0)) return null;
+    const seed = Math.abs(ax[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
+    const e1 = unit([ax[1] * seed[2] - ax[2] * seed[1], ax[2] * seed[0] - ax[0] * seed[2], ax[0] * seed[1] - ax[1] * seed[0]]);
+    const e2 = [ax[1] * e1[2] - ax[2] * e1[1], ax[2] * e1[0] - ax[0] * e1[2], ax[0] * e1[1] - ax[1] * e1[0]];
+    const at = (k) => {
+      const a = (2 * Math.PI * k) / GUIDE_RING, ca = R * Math.cos(a), sa = R * Math.sin(a);
+      return [0, 1, 2].map((i) => c[i] + ca * e1[i] + sa * e2[i]);
+    };
+    const ends = new Float32Array(GUIDE_RING * 6);
+    for (let k = 0; k < GUIDE_RING; k++) ends.set([...at(k), ...at(k + 1)], k * 6);
+    return ends;
+  }
+  if (fit.type === 'sphere') {
+    const c = p.center;
+    const h = Math.min(0.2 * p.radius, 0.04 * model.radius);
+    if (!(h > 0)) return null;
+    const ends = new Float32Array(18);
+    for (let i = 0; i < 3; i++) {
+      const a = [...c], b = [...c];
+      a[i] -= h; b[i] += h;
+      ends.set([...a, ...b], i * 6);
+    }
+    return ends;
+  }
+  return null;
 }
 
 function updateHover(point) {
